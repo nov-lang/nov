@@ -1333,8 +1333,24 @@ pub fn fullMatch(self: Ast, node: Node.Index) ?full.Match {
 }
 
 fn matchCapture(self: Ast, node: Node.Index) ?TokenIndex {
-    const next = self.nodes.items(.main_token)[node] + 1;
-    return if (self.tokens.items(.tag)[next] == .pipe) next + 1 else null;
+    const data = &self.nodes.items(.data)[node];
+    const value: *const [1]Node.Index = @ptrCast(&data.lhs);
+    const values = if (self.nodes.items(.tag)[node] == .match_case_one)
+        value[0..@intFromBool(data.lhs != 0)]
+    else blk: {
+        const extra = self.extraData(data.lhs, Node.SubRange);
+        break :blk self.extra_data[extra.start..extra.end];
+    };
+    for (values) |pattern| {
+        if (self.nodes.items(.tag)[pattern] != .enum_literal) continue;
+        var bracket = self.lastToken(pattern) + 1;
+        while (self.tokens.items(.tag)[bracket] == .newline) : (bracket += 1) {}
+        if (self.tokens.items(.tag)[bracket] != .l_bracket) continue;
+        var binding = bracket + 1;
+        while (self.tokens.items(.tag)[binding] == .newline) : (binding += 1) {}
+        return binding;
+    }
+    return null;
 }
 
 pub fn fullMatchCase(self: Ast, node: Node.Index) ?full.MatchCase {

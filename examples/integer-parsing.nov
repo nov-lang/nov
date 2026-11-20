@@ -11,11 +11,11 @@ let main: () = {
 
 let signedError: (input: str, expected: Error) -> bool = match string.parseInt(input) {
     .ok => false
-    .err => |error| error == expected
+    .err[error] => error == expected
 }
 let unsignedError: (input: str, expected: Error) -> bool = match string.parseUint(input) {
     .ok => false
-    .err => |error| error == expected
+    .err[error] => error == expected
 }
 
 @[test]

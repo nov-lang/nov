@@ -1,0 +1,95 @@
+let std = @import("std")
+
+let main: () = {
+    let result: std.Result(int, str) = .ok[42]
+    match result {
+        .ok[value] => @println("Value:", value)
+        .err[error] => @println("Error:", error)
+    }
+}
+
+@[test]
+let result_option_and_nested_payload_bindings: () = {
+    let success: std.Result(int, str) = .ok[7]
+    let failure: std.Result(int, str) = .err["failed"]
+    let describe = (result: std.Result(int, str)) -> str {
+        match result {
+            .ok[value] => "value:{value}"
+            .err[error] => "error:{error}"
+        }
+    }
+    @assert(describe(success) == "value:7" and describe(failure) == "error:failed")
+    let nested: std.Option(std.Result(int, str)) = .some[success]
+    let number = match nested {
+        .some[inner] => match inner {
+            .ok[value] => value
+            .err => -1
+        }
+        .none => 0
+    }
+    @assert(number == 7)
+}
+
+let Message = union {
+    first: int,
+    second: int,
+    empty,
+}
+
+@[test]
+let bindings_are_prong_local_and_optional: () = {
+    let describe = (message: Message) -> int {
+        match message {
+            .first[value] => value
+            .second[value] => value + 1
+            .empty => 0
+        }
+    }
+    @assert(describe(.first[3]) == 3 and describe(.second[3]) == 4)
+    @assert(describe(.empty[]) == 0)
+    let ignored = match Message.first[99] {
+        .first => 1
+        _ => 0
+    }
+    @assert(ignored == 1)
+}
+
+@[test]
+let payload_arrays_keep_value_copy_semantics: () = {
+    let original = [1, 2]
+    let payload: std.Option([]int) = .some[original]
+    let mut extracted = match payload {
+        .some[values] => values
+        .none => []
+    }
+    extracted[0] = 9
+    @assert(original == [1, 2])
+    @assert(payload == std.Option([]int).some[[1, 2]])
+    @assert(extracted == [9, 2])
+}
+
+@[test]
+let function_payloads_and_unevaluated_queries: () = {
+    let mut calls = 0
+    let payload: std.Option(() -> int) = .some[
+        () -> int {
+            calls += 1
+            calls
+        }]
+    let query: @TypeOf(
+        match payload {
+            .some[callable] => callable()
+            .none => 0
+        }
+    ) = 0
+    @assert(query == 0 and calls == 0)
+    let first = match payload {
+        .some[callable] => callable()
+        .none => 0
+    }
+    let second = match payload {
+        .some[callable] => callable()
+        .none => 0
+    }
+    @assert(first == 1 and second == 2 and calls == 2)
+}

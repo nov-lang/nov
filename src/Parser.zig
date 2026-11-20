@@ -1128,10 +1128,9 @@ fn parseMatchExpr(self: *Parser) Error!Node.Index {
     });
 }
 
-// TODO: rework to support new syntax
-/// MatchProng <- MatchCase EQUALARROW MatchCasePayload? AssignExpr
-/// MatchCasePayload <- PIPE AMPERSAND? IDENTIFIER PIPE
+/// MatchProng <- MatchCase EQUALARROW AssignExpr
 /// MatchCase <- MatchItem (COMMA MatchItem)* COMMA?
+/// MatchPayload <- DOT IDENTIFIER LBRACKET IDENTIFIER RBRACKET
 fn parseMatchProng(self: *Parser) Error!Node.Index {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
@@ -1148,10 +1147,6 @@ fn parseMatchProng(self: *Parser) Error!Node.Index {
         return null_node;
     }
     const arrow_token = try self.expectToken(.equal_arrow);
-    if (self.eatToken(.pipe) != null) {
-        _ = try self.expectToken(.identifier);
-        _ = try self.expectToken(.pipe);
-    }
 
     const items = self.scratch.items[scratch_top..];
     switch (items.len) {
@@ -1177,6 +1172,25 @@ fn parseMatchProng(self: *Parser) Error!Node.Index {
 
 /// MatchItem <- Expr ((DOTDOT / DOTDOTEQUAL) Expr)?
 fn parseMatchItem(self: *Parser) Error!Node.Index {
+    const bracket: ?TokenIndex = if (self.token_tags[self.tok_i] == .period and
+        self.token_tags[self.tok_i + 1] == .identifier)
+    blk: {
+        var next = self.tok_i + 2;
+        while (self.token_tags[next] == .newline) : (next += 1) {}
+        break :blk if (self.token_tags[next] == .l_bracket) next else null;
+    } else null;
+    if (bracket) |open| {
+        const period = self.nextToken();
+        const tag = self.nextToken();
+        self.tok_i = open + 1;
+        self.eatNewLines();
+        _ = try self.expectToken(.identifier);
+        self.eatNewLines();
+        _ = try self.expectToken(.r_bracket);
+        // Keep the variant pattern separate from the binding. Match accessors
+        // recover the binding from these validated tokens, without extra nodes.
+        return self.addNode(.{ .tag = .enum_literal, .main_token = tag, .data = .{ .lhs = period, .rhs = undefined } });
+    }
     const expr = try self.parseExprStrict();
     if (expr == null_node) {
         return null_node;
@@ -2950,6 +2964,48 @@ test "bitwise binaries retain shared precedence and reject compound assignments"
         var result = try parse(std.testing.allocator, source);
         defer result.deinit(std.testing.allocator);
         try std.testing.expect(result.errors.len != 0);
+    }
+}
+
+test "match bracket captures preserve variant patterns binding spans and OOM" {
+    const source = "let f:(u:U)->int=match u{.ok\n[\nvalue\n]=>value\n.err[error]=>0\n.none=>1}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    const cases = ast.fullMatch(node).?.ast.cases;
+    try std.testing.expectEqual(@as(usize, 3), cases.len);
+    const first = ast.fullMatchCase(cases[0]).?.ast;
+    try std.testing.expectEqual(@as(usize, 1), first.values.len);
+    try std.testing.expectEqual(Node.Tag.enum_literal, ast.nodes.items(.tag)[first.values[0]]);
+    try std.testing.expectEqualStrings(".ok", ast.getNodeSource(first.values[0]));
+    try std.testing.expectEqualStrings("value", ast.tokenSlice(first.capture_token.?));
+    try std.testing.expect(first.capture_token.? < first.arrow_token);
+    try std.testing.expectEqualStrings("error", ast.tokenSlice(ast.fullMatchCase(cases[1]).?.ast.capture_token.?));
+    try std.testing.expectEqual(null, ast.fullMatchCase(cases[2]).?.ast.capture_token);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    // Constructors outside a match still contain an expression, not a binding.
+    var constructor = try parse(std.testing.allocator, "let value=U.ok[1+2]");
+    defer constructor.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), constructor.errors.len);
+}
+
+test "match bracket captures reject legacy pipes and nonbinding payload patterns" {
+    for ([_][:0]const u8{
+        "let f=match u{.ok=>|value|value\n_=>0}",
+        "let f=match u{.ok[value]=>|other|other\n_=>0}",
+        "let f=match u{.ok[]=>0\n_=>0}",
+        "let f=match u{.ok[1]=>0\n_=>0}",
+        "let f=match u{.ok[a,b]=>0\n_=>0}",
+        "let f=match u{.ok[mut value]=>0\n_=>0}",
+        "let f=match u{.ok[&value]=>0\n_=>0}",
+        "let f=match u{.ok[.some[value]]=>0\n_=>0}",
+        "let f=match u{.ok[value=>value\n_=>0}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        for (ast.errors) |err| try std.testing.expect(ast.tokens.items(.start)[err.token] <= source.len);
     }
 }
 

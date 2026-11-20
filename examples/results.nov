@@ -16,8 +16,8 @@ let describe: (value: uint) -> Result(str, str) = {
 
 let report: (value: uint) = {
     let message = match describe(value) {
-        .ok => |text| text
-        .err => |error| "Error: {error}"
+        .ok[text] => text
+        .err[error] => "Error: {error}"
     }
     @println(message)
 }

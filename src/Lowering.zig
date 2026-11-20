@@ -475,11 +475,11 @@ const demand_result_source =
     \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
     \\let Self=@This()
     \\@[public]
-    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok[v] => v
     \\.err=>fallback}
     \\@[public]
-    \\let unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v
-    \\.err=>|e|fallback(e)}
+    \\let unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok[v] => v
+    \\.err[e] => fallback(e)}
     \\}
 ;
 
@@ -638,7 +638,7 @@ test "generic structs late cycles expanding type arguments and layout depth reta
 }
 
 test "generic methods reject inexact types leaked bindings and invalid concrete bodies" {
-    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=G(int,str)\n";
+    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok[v] => v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok[v] => v\n.err[e] => fallback(e)}\n}\nlet R=G(int,str)\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f:(r:R)->int=r.unwrapOr(true)", .tag = .literal_type_mismatch },
@@ -652,7 +652,7 @@ test "generic methods reject inexact types leaked bindings and invalid concrete 
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:(T:int)={}\n}\nlet B=Bad(int)\nlet use:()=B.m(0)", .tag = .unsupported_shadowing },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:()={let T:int=1\n}\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .unsupported_shadowing },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[noreturn]\nlet m:()->T=@panic(\"bad\")\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .noreturn_result },
-        .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[stringify]\nlet toString:(self:@This())->T=match self{.ok=>|v|v}\n}\nlet B=Bad(int)\nlet f:(b:B)=@println(b)", .tag = .invalid_to_string },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[stringify]\nlet toString:(self:@This())->T=match self{.ok[v] => v}\n}\nlet B=Bad(int)\nlet f:(b:B)=@println(b)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(r:G(A,str),b:B)->A=r.unwrapOr(b)", .tag = .expression_type_mismatch },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
@@ -715,7 +715,7 @@ test "generic method bodies retain type parameters in annotations ascriptions an
 }
 
 test "generic method tables reset between analyses without changing canonical identity" {
-    var module = try Module.init(std.testing.allocator, "methods.nov", "let G:(T:type)->type=union{ok:T,\nlet get:(self:@This())->T=match self{.ok=>|v|v}\n}\nlet I=int\nlet A=G(I)\nlet B=G(int)\nlet C=G(bool)\nlet run:(a:A,b:B,c:C)->int={@println(c.get())\na.get()+B.get(b)}");
+    var module = try Module.init(std.testing.allocator, "methods.nov", "let G:(T:type)->type=union{ok:T,\nlet get:(self:@This())->T=match self{.ok[v] => v}\n}\nlet I=int\nlet A=G(I)\nlet B=G(int)\nlet C=G(bool)\nlet run:(a:A,b:B,c:C)->int={@println(c.get())\na.get()+B.get(b)}");
     defer module.deinit();
     var first = try lower(&module);
     defer first.deinit();
@@ -825,7 +825,7 @@ test "union array payloads contextual and empty constructors under OOM" {
 test "union array payloads match value copies under OOM" {
     try testUnionArrayPayloadsOom(
         \\let O:(T:type)->type=union{some:T,none,}
-        \\let matched:(o:O([]u8))->u8=match o{.some=>|xs|{let mut copy=xs
+        \\let matched:(o:O([]u8))->u8=match o{.some[xs] => {let mut copy=xs
         \\copy[0]=9
         \\copy[0]}
         \\.none=>0}
@@ -877,7 +877,7 @@ test "value payloads functions contextual templates captures propagation and exp
         \\let plain:()->U=.callback[id]
         \\let apply:(o:O(F))->O(int)={let f=o.!
         \\.some[f(2)]}
-        \\let read:(u:U)->int=match u{.callback=>|f|f(3)
+        \\let read:(u:U)->int=match u{.callback[f] => f(3)
         \\.empty=>0}
         \\let main:()={let mut o=make(4)
         \\let r=&o
@@ -906,7 +906,7 @@ test "value payloads ranges aliases exact unsigned inclusive propagation and reu
         \\let b:Unsigned=@as(uint,0)..=@as(uint,3)
         \\let u:U=.unsigned[b]
         \\let copy=u
-        \\let n=match copy{.unsigned=>|r|{let mut total:uint=0
+        \\let n=match copy{.unsigned[r] => {let mut total:uint=0
         \\loop v in r {total+=v}
         \\total}
         \\_=>@as(uint,0)}
@@ -992,7 +992,7 @@ test "nested unions plain nominal aliases and explicit constructors under OOM" {
         \\let Alias=Inner
         \\let Outer=union{inner:Alias,empty,}
         \\let make:()->Outer=Outer.inner[Alias.value[1]]
-        \\let read:(x:Outer)->int=match x{.inner=>|inner|match inner{.value=>|n|n
+        \\let read:(x:Outer)->int=match x{.inner[inner] => match inner{.value[n] => n
         \\.empty=>0}
         \\.empty=>0}
     );
@@ -1031,7 +1031,7 @@ test "nested unions array payload capture and value copies under OOM" {
         \\let I=union{values:[][]int,empty,}
         \\let U=union{inner:I,empty,}
         \\let make:()->U=.inner[.values[[[1],[2]]]]
-        \\let read:(u:U)->int=match u{.inner=>|inner|match inner{.values=>|xs|{let mut copy=xs
+        \\let read:(u:U)->int=match u{.inner[inner] => match inner{.values[xs] => {let mut copy=xs
         \\copy[0]=[9]
         \\copy[0][0]}
         \\.empty=>0}
@@ -1110,7 +1110,7 @@ test "nested unions reject capture mutation and inner unknown tags under OOM" {
     try testNestedUnionRejected(
         \\let I=union{values:[]int,}
         \\let U=union{inner:I,}
-        \\let f:(u:U)=match u{.inner=>|inner|match inner{.values=>|xs|{xs[0]=1}}}
+        \\let f:(u:U)=match u{.inner[inner] => match inner{.values[xs] => {xs[0]=1}}}
     , .immutable_assignment);
     try testNestedUnionRejected(
         \\let O:(T:type)->type=union{some:T,none,}
@@ -1221,7 +1221,7 @@ test "storable fields closure snapshots shared cells union copies and exact repl
         \\let mut total:uint=0
         \\loop i in r.bounds {total+=i}
         \\@assert(a==3 and b==4 and total==6)
-        \\match saved{.values=>|v|@assert(v[0][0]==1)
+        \\match saved{.values[v] => @assert(v[0][0]==1)
         \\.none=>@assert(false)}}
     );
 }
@@ -1481,7 +1481,7 @@ test "anonymous structs storable callbacks ranges unions nested arrays and copie
         \\let copy=state
         \\state.nested.values=[[9,2]]
         \\let x=state.callback(1)
-        \\let y=match copy.payload{.some=>|values|values[0]
+        \\let y=match copy.payload{.some[values] => values[0]
         \\.none=>0}
         \\@println(x,y,copy.nested.values)
         \\let mut total:uint=0
@@ -1952,7 +1952,7 @@ test "union array payloads reject cyclic layouts exact mismatches and mutable ca
         .{ .source = "let U=union{some:[]u8,}\nlet f:()->U=.some[[256]]", .tag = .literal_out_of_range },
         .{ .source = "let U=union{some:[]u8,}\nlet f:(xs:[]int)->U=.some[xs]", .tag = .expression_type_mismatch },
         .{ .source = "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:R(int,[]u8))->R(int,[]int)=.ok[r.!]", .tag = .propagation_error_mismatch },
-        .{ .source = "let U=union{some:[]int,}\nlet f:(u:U)=match u{.some=>|xs|{xs[0]=1}}", .tag = .immutable_assignment },
+        .{ .source = "let U=union{some:[]int,}\nlet f:(u:U)=match u{.some[xs] => {xs[0]=1}}", .tag = .immutable_assignment },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "union-array-errors.nov", case.source);
         defer module.deinit();
@@ -2149,9 +2149,9 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{ok:int,\nlet constant:int=1\n}", .tag = .unsupported_declaration },
 
         .{ .source = "let U=union{ok:int,\n@[stringify]\nlet toString:(u:U)->bool=true\n}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },
-        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n}", .tag = .match_missing_variants },
+        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok[n] => n}", .tag = .match_missing_variants },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}", .tag = .match_covered_union_prong },
-        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n\n_=>n}", .tag = .unknown_name },
+        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok[n] => n\n_=>n}", .tag = .unknown_name },
         .{ .source = "let U=union{ok:i8,}\nlet f:()->U=.ok[128]", .tag = .literal_out_of_range },
         .{ .source = "let U=union{ok:u128,}\nlet f:()->U=.ok[340282366920938463463374607431768211456]", .tag = .literal_out_of_range },
     }) |case| {
@@ -3458,7 +3458,7 @@ fn testImportProgram(allocator: std.mem.Allocator) !Sema {
         \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
         \\let Self=@This()
         \\@[public]
-        \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+        \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok[v] => v
         \\.err=>fallback}
         \\@[public]
         \\let label:(self:Self)->str=prefix+helper()
@@ -3674,7 +3674,7 @@ test "compilation namespace aliases direct generic applications and repeated dia
         \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
         \\let Self=@This()
         \\@[public]
-        \\let get:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+        \\let get:(self:Self,fallback:T)->T=match self{.ok[v] => v
         \\.err=>fallback}
         \\}
     );

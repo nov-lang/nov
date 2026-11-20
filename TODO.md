@@ -60,6 +60,13 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Union match payload bindings use `.variant[name] => expression`, replacing the
+removed `=> |name|` form. Bindings remain immutable, prong-local, by-value and
+single-name; omit brackets to ignore a payload and for payloadless variants.
+Nested/ref patterns and `_` payload bindings remain unsupported. Constructors
+outside patterns still use `.variant[expression]`. Result/Option and examples
+use the new syntax; this is a breaking syntax change without a compatibility alias.
+
 Structural value equality and explicit nominal equality hooks are delivered.
 Default `==` / `!=` require exact operand types; direct comparisons also support
 exact mixed-type equality hooks. Arrays compare length then elements,
@@ -1668,7 +1675,7 @@ let getName: (s: str) -> str = {
     match s {
         ; "Foo".. => TODO idk
         ; .."Bar" => TODO idk
-        "Hello, ".. => |name| name ; no this is the full string? how to catch just the end?
+        ; Prefix/suffix payload binding syntax remains undecided.
         _ => "Unknown"
     }
 }

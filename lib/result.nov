@@ -25,8 +25,8 @@ let Result: (T: type, E: type) -> type = union {
 
     @[public]
     let mapErr: (self: Self, convert: (E) -> `F) -> Result(T, `F) = match self {
-        .ok => |value| .ok[value]
-        .err => |error| .err[convert(error)]
+        .ok[value] => .ok[value]
+        .err[error] => .err[convert(error)]
     }
 
     @[public]
@@ -37,13 +37,13 @@ let Result: (T: type, E: type) -> type = union {
 
     @[public]
     let unwrapOr: (self: Self, fallback: T) -> T = match self {
-        .ok => |value| value
+        .ok[value] => value
         .err => fallback
     }
 
     @[public]
     let unwrapOrElse: (self: Self, fallback: (E) -> T) -> T = match self {
-        .ok => |value| value
-        .err => |error| fallback(error)
+        .ok[value] => value
+        .err[error] => fallback(error)
     }
 }

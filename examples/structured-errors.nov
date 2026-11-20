@@ -41,8 +41,8 @@ let describe: (name: str) -> Result(str, LookupError) = .ok[lookup(name).!.descr
 
 let report: (name: str) = {
     let message = match describe(name) {
-        .ok => |text| text
-        .err => |error| match error.kind {
+        .ok[text] => text
+        .err[error] => match error.kind {
             .not_found => "Error: {error}"
             _ => @panic("Unexpected error: {error}")
         }

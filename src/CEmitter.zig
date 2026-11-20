@@ -3423,10 +3423,10 @@ const positional_fields_program =
     \\ record.0+=[[4]]
     \\ @assert(saved.0[0][0]==1 and @len(saved.0)==2)
     \\ @assert(record.0[0][0]==8 and @len(record.0)==3)
-    \\ let mut extracted=match record.1{.some=>|value|value
+    \\ let mut extracted=match record.1{.some[value] => value
     \\ .none=>[[0]]}
     \\ extracted[0]=[7]
-    \\ let again=match saved.1{.some=>|value|value
+    \\ let again=match saved.1{.some[value] => value
     \\ .none=>[[0]]}
     \\ @assert(again[0][0]==1 and again[0][1]==2)
     \\ @assert(extracted[0][0]==7 and source[0][0]==9)
@@ -4543,10 +4543,10 @@ const rune_program =
     \\let opt:Option(rune)=.some[r.value]
     \\let res:Result(rune,str)=.ok[saved.value]
     \\@println(match opt {
-    \\.some=>|v| v
+    \\.some[v] => v
     \\.none=>'x'
     \\},match res {
-    \\.ok=>|v| v
+    \\.ok[v] => v
     \\.err=>'x'
     \\})
     \\let mut a:[]Rune=['A',seed,'😀']
@@ -4893,7 +4893,7 @@ test "global storage source integration nested initializers rooted entry paramet
         \\let step:()->int={count+=1
         \\callback()}
         \\let echo:(argument:str)->str={@assert(state.rows[0][1]=="b" and state.rows[1][0]=="c")
-        \\@assert(match variant {.row=>|r|r.label=="union" and r.rows[0][0]=="d" and r.rows[1][1]=="f"
+        \\@assert(match variant {.row[r] => r.label=="union" and r.rows[0][0]=="d" and r.rows[1][1]=="f"
         \\.none=>false})
         \\argument}
         \\let value:()->str={let saved=state
@@ -5073,7 +5073,7 @@ const array_default_program =
     \\values[1]=changed
     \\@assert(values[0].rows[0][0]==9 and values[1].rows[0][0]==8 and values[2].rows[0][0]==1)
     \\let wrapped:U=.value[R.[]]
-    \\@assert(match wrapped{.value=>|r|r.rows[0][1]==2
+    \\@assert(match wrapped{.value[r] => r.rows[0][1]==2
     \\.none=>false})
     \\let callbacks=G(()->int).[]
     \\let records=G(R).[]
@@ -5400,10 +5400,10 @@ const storable_arrays_program =
     \\ unions[0]=.none[]
     \\ unions+=[.row[Row.[values=old]]]
     \\ loop &u in unions {u.* =.none[]}
-    \\ let mut extracted=match saved[0] {.row=>|r|r.values
+    \\ let mut extracted=match saved[0] {.row[r] => r.values
     \\ _=>[]}
     \\ extracted[0]=["different"]
-    \\ if match saved[0] {.row=>|r|r.values[0][0]!="new!"
+    \\ if match saved[0] {.row[r] => r.values[0][0]!="new!"
     \\ _=>true} {@panic("union active payload snapshot")}
     \\ let mut ordinary=callbacks()
     \\ ordinary+=[inc]
@@ -5503,7 +5503,7 @@ test "storable arrays precise backing descriptors survive source release" {
 test "storable arrays recursive runtime allocation failures" {
     for ([_][]const u8{
         "let main:()={let a:[][]int=[[1]]\nlet b=a\n@println(b[0][0],a[0][0])}",
-        "let R=struct{a:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:[]U=[.some[R.[a=[[1]]]],.none[]]\nlet b=a\n@println(match b[0] {.some=>|r|r.a[0][0]\n.none=>0},@len(a))}",
+        "let R=struct{a:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:[]U=[.some[R.[a=[[1]]]],.none[]]\nlet b=a\n@println(match b[0] {.some[r] => r.a[0][0]\n.none=>0},@len(a))}",
         "let main:()={let mut n:int=1\nlet f=()->int {n+=1\nn}\nlet a=[f]\nlet b=a\n@println(b[0](),a[0]())}",
     }) |source| {
         const library = try emitSource(source, null);
@@ -5522,7 +5522,7 @@ test "storable arrays recursive runtime allocation failures" {
 test "storable arrays forged reused nested and active union payloads detach recursive backing" {
     for ([_]struct { source: []const u8, path: []const u8 }{
         .{ .source = "let main:()={let seed:[]int=[1]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(@len(a),seed[0],a[0][0])}", .path = "data" },
-        .{ .source = "let R=struct{a:[]int,}\nlet U=union{some:R,none,}\nlet main:()={let seed:U=.some[R.[a=[1]]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(@len(a),match seed {.some=>|r|r.a[0]\n.none=>0},match a[0] {.some=>|r|r.a[0]\n.none=>0})}", .path = "f0.f0.data" },
+        .{ .source = "let R=struct{a:[]int,}\nlet U=union{some:R,none,}\nlet main:()={let seed:U=.some[R.[a=[1]]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(@len(a),match seed {.some[r] => r.a[0]\n.none=>0},match a[0] {.some[r] => r.a[0]\n.none=>0})}", .path = "f0.f0.data" },
     }) |case| {
         var module = try Module.init(test_gpa, "forged-storable.nov", case.source);
         defer module.deinit();
@@ -5609,7 +5609,7 @@ test "storable arrays individual elements retain nominal printing contracts" {
         \\}
         \\let U=union{some:R,none,
         \\ @[stringify]
-        \\ let toString:(u:U)->str=match u {.some=>|r|"{r}"
+        \\ let toString:(u:U)->str=match u {.some[r] => "{r}"
         \\ .none=>"none"}
         \\}
         \\let main:()={let a:[]Alias=[.first,.second]
@@ -5864,8 +5864,8 @@ test "constructor shorthand keeps contextual and qualified union enum payload gr
         \\ let factory=()->U {U.item[.ready]}
         \\ let a:U=.item[.ready]
         \\ let b=factory()
-        \\ @println(match a {.item=>|k|k==K.ready
-        \\ .none=>false}, match b {.item=>|k|k==K.ready
+        \\ @println(match a {.item[k] => k==K.ready
+        \\ .none=>false}, match b {.item[k] => k==K.ready
         \\ .none=>false},ready)
         \\}
     );
@@ -5894,7 +5894,7 @@ const closure_types_program =
     \\  @println(flag,rune_value,kind==K.second,callback(r.n),a[0].s)
     \\  match u {
     \\   .none=>s
-    \\   .some=>|v| s+v.s
+    \\   .some[v] => s+v.s
     \\  }
     \\ }
     \\}
@@ -6543,8 +6543,8 @@ test "closures trace shared function cycles and keep propagation scoped" {
         \\ }
         \\ loop success in [true,false] {
         \\  match transform(success) {
-        \\   .ok=>|value| @println(value)
-        \\   .err=>|error| @println(error)
+        \\   .ok[value] => @println(value)
+        \\   .err[error] => @println(error)
         \\  }
         \\ }
         \\}
@@ -6632,12 +6632,12 @@ const generic_union_program =
     \\    .ok[n == 7]
     \\}
     \\let describe: (r: TextResult) -> str = match r {
-    \\    .ok => |s| "ok:" + s
-    \\    .err => |s| "err:" + s
+    \\    .ok[s] => "ok:" + s
+    \\    .err[s] => "err:" + s
     \\}
     \\let describeBool: (r: Reversed) -> str = match r {
-    \\    .ok => |b| "bool:{b}"
-    \\    .err => |s| "err:" + s
+    \\    .ok[b] => "bool:{b}"
+    \\    .err[s] => "err:" + s
     \\}
     \\let main: () = {
     \\    @println(describe(transform(true)), describe(transform(false)))
@@ -6674,10 +6674,10 @@ const enum_program =
     \\    k=initial
     \\    let e=copy(Error.[message="hel"+"lo"])
     \\    @println(k,"{saved}",Kind.eql(k,.not_found),saved!=k,e.kind,e.message,e.valid,e.code)
-    \\    @println(match pass(){.ok=>|n|"{n}"
-    \\        .err=>|kind|"{kind}"})
-    \\    @println(match structured(){.ok=>|n|"{n}"
-    \\        .err=>|err|"{err.kind}:{err.message}"})
+    \\    @println(match pass(){.ok[n] => "{n}"
+    \\        .err[kind] => "{kind}"})
+    \\    @println(match structured(){.ok[n] => "{n}"
+    \\        .err[err] => "{err.kind}:{err.message}"})
     \\}
 ;
 
@@ -6696,7 +6696,7 @@ const instance_program =
     \\    let eql:(left:K,right:K)->bool=left==right
     \\}
     \\let U=union{record:R,empty,
-    \\    let text:(value:U)->str=match value{.record=>|r|r.text()
+    \\    let text:(value:U)->str=match value{.record[r] => r.text()
     \\        .empty=>"empty"}
     \\}
     \\let make:(label:str)->R={@println(label)
@@ -6711,7 +6711,7 @@ const instance_program =
     \\    let k=K.x
     \\    @println(k.eql(.x),K.y.eql(k))
     \\    let u=U.record[make("payload")]
-    \\    @println(u.text(),match u{.record=>|record|record.next(number(),make("capture")).text()
+    \\    @println(u.text(),match u{.record[record] => record.next(number(),make("capture")).text()
     \\        .empty=>"bad"})
     \\}
 ;
@@ -6748,8 +6748,8 @@ test "instance calls skip later effects on receiver return panic propagation and
         \\let main:()={
         \\    @println(returned())
         \\    @println(argument())
-        \\    @println(match propagated(){.ok=>|s|s
-        \\        .err=>|e|e})
+        \\    @println(match propagated(){.ok[s] => s
+        \\        .err[e] => e})
     ;
     const Case = struct { tail: []const u8, output: []const u8, message: []const u8 };
     for ([_]Case{
@@ -7068,18 +7068,18 @@ const record_payload_program =
     \\let run:(good:bool)->Output={let file=make(good).!
     \\    @println(use(file,"x"+"y"))
     \\    .ok[file.valid]}
-    \\let show:(r:Output)->str=match r{.ok=>|b|"{b}"
-    \\    .err=>|e|"{e.message}:{e.detail}:{e.code}"}
+    \\let show:(r:Output)->str=match r{.ok[b] => "{b}"
+    \\    .err[e] => "{e.message}:{e.detail}:{e.code}"}
     \\let copy:(u:U)->U=u
     \\let main:()={@println(show(run(true)),show(run(false)))
     \\    let mut u=U.ok[File.[name="c"+"d",extra="e"+"f",n=9]]
     \\    let saved=copy(u)
     \\    loop i in 0..4 {u=if i == 0 {saved} else if i == 1 {.err[Error.[message="g"+"h",detail="i"+"j",code=2]]} else {.none[]}
     \\        let value:U=loop{break u}
-    \\        @println(match value{.ok=>|f|use(f,"k"+"l")
-    \\            .err=>|e|e.message+e.detail
+    \\        @println(match value{.ok[f] => use(f,"k"+"l")
+    \\            .err[e] => e.message+e.detail
     \\            .none=>"none"})}
-    \\    @println(match saved{.ok=>|f|use(f,"m"+"n")
+    \\    @println(match saved{.ok[f] => use(f,"m"+"n")
     \\        .err=>@panic("wrong error")
     \\        .none=>@panic("wrong none")})}
 ;
@@ -7156,7 +7156,7 @@ const option_propagation_program =
     \\let copy=item
     \\item=Item.[s="new"+"!"]
     \\.some[Item.[s=copy.s+item.s]]}
-    \\let show:(o:Text)=@println(match o{.some=>|s|s
+    \\let show:(o:Text)=@println(match o{.some[s] => s
     \\.none=>"none"})
     \\let main:()={show(rhs())
     \\show(args())
@@ -7166,7 +7166,7 @@ const option_propagation_program =
     \\show(unit(O(void).none[]))
     \\let item=records(O(Item).some[Item.[s="old"+"!"]])
     \\let noise="collect"+"!"
-    \\@println(match item{.some=>|r|r.s
+    \\@println(match item{.some[r] => r.s
     \\.none=>"BAD"},noise)
     \\@println(match records(O(Item).none[]){.some=>"BAD"
     \\.none=>"none"})}
@@ -7200,7 +7200,7 @@ test "Option propagation source free IR and every compiler allocation failure" {
 
 test "Option propagation none skips allocations and some reports runtime OOM" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let O:(T:type)->type=union{{some:T,none,}}\nlet make:()->O(str)={s}\nlet run:()->O(str)=.some[make().!+\"!\"]\nlet main:()=@println(match run(){{.some=>|s|s\n.none=>\"none\"}})", .{if (allocate) ".some[\"a\"+\"b\"]" else ".none[]"});
+        const source = try std.fmt.allocPrint(test_gpa, "let O:(T:type)->type=union{{some:T,none,}}\nlet make:()->O(str)={s}\nlet run:()->O(str)=.some[make().!+\"!\"]\nlet main:()=@println(match run(){{.some[s] => s\n.none=>\"none\"}})", .{if (allocate) ".some[\"a\"+\"b\"]" else ".none[]"});
         defer test_gpa.free(source);
         const program = try arrayTestProgram(source);
         defer test_gpa.free(program);
@@ -7212,7 +7212,7 @@ test "Option propagation none skips allocations and some reports runtime OOM" {
 
 test "record payload propagation allocates only evaluated strings and handles OOM" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:str,}}\nlet make:()->G(int,R)=.err[R.[s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err=>|r|r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:str,}}\nlet make:()->G(int,R)=.err[R.[s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err[r] => r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -7236,7 +7236,7 @@ test "record payload captures stay rooted through terminal panic and skip later 
         \\let run:()->G(bool,R)=.ok[use(fail().!,later())]
         \\let suffix:()->str="x"+"y"
         \\let main:()=match run(){.ok=>@panic("bad success")
-        \\    .err=>|r|@panic("{r.s}:{r.t}:"+suffix())}
+        \\    .err[r] => @panic("{r.s}:{r.t}:"+suffix())}
     ;
 
     const c = try arrayTestProgram(source);
@@ -7261,7 +7261,7 @@ test "record payload IR owns source and emission survives every allocation failu
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_payload_output, "");
-    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:str,}\nlet main:()={let u=G(R).ok[R.[s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:str,}\nlet main:()={let u=G(R).ok[R.[s=\"a\"+\"b\"]]\n@println(match u{.ok[r] => r.s})}"});
 }
 
 test "printing uses annotated format but ignores ordinary toString" {
@@ -7310,7 +7310,7 @@ const record_interpolation_program =
     \\let U=union{item:str,none,
     \\    @[stringify]
     \\    let toString:(u:U)->str={@print("U")
-    \\        match u{.item=>|s|"union:"+s
+    \\        match u{.item[s] => "union:"+s
     \\            .none=>"none"}}
     \\}
     \\let UnionAlias=U
@@ -7338,7 +7338,7 @@ test "record interpolation captures errors for panic and keeps nested payload ow
         \\}
         \\let fail:()->G(int,Error)=.err[Error.[message="not "+"found",detail="fi"+"le"]]
         \\let main:()=match fail(){.ok=>@panic("unexpected")
-        \\    .err=>|err|@panic("Error: {err}")}
+        \\    .err[err] => @panic("Error: {err}")}
     ;
     const c = try arrayTestProgram(source);
     defer test_gpa.free(c);
@@ -7361,8 +7361,8 @@ test "record interpolation skips converters and later placeholders on propagated
         \\@[noreturn]
         \\let stop:()=@panic("stop")
         \\let terminal:()->str="{stop()}{missing}"
-        \\let main:()={@println(match run(){.ok=>|s|s
-        \\    .err=>|s|s})
+        \\let main:()={@println(match run(){.ok[s] => s
+        \\    .err[s] => s})
         \\    @print(terminal())}
     ;
     const c = try arrayTestProgram(source);
@@ -7448,9 +7448,9 @@ const generic_struct_program =
     \\arr += [Box(str).[value="tail"+"!"]]
     \\let ok:O(Box(str))=.some[copy[0]]
     \\let err:R(Box(str),Box(str))=.err[copy[1]]
-    \\@println(copy[0],arr[0],arr[-1],match option(ok){.some=>|v|v.value
-    \\.none=>0},match result(err){.ok=>|v|"BAD"
-    \\.err=>|v|v.value})
+    \\@println(copy[0],arr[0],arr[-1],match option(ok){.some[v] => v.value
+    \\.none=>0},match result(err){.ok[v] => "BAD"
+    \\.err[v] => v.value})
     \\}
 ;
 const generic_struct_output = "1 3 new! 3 <<ab>> 7 true true default\n<xy> <z!> <tail!> 4 new!\n";
@@ -7593,10 +7593,10 @@ const generic_method_program =
     \\let Result:(T:type,E:type)->type=union{
     \\ok:T,err:E,
     \\let Self=@This()
-    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok[v] => v
     \\.err=>fallback}
-    \\let unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{.ok=>|v|v
-    \\.err=>|e|fallback(e)}
+    \\let unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{.ok[v] => v
+    \\.err[e] => fallback(e)}
     \\let forward:(self:Self,fallback:T)->T=Self.sibling(self,fallback)
     \\let sibling:(self:Self,fallback:T)->T=unwrapOr(self,fallback)
     \\let recur:(self:Self,fallback:T,n:int)->T=if n == 0 {self.forward(fallback)} else {recur(self,fallback,n - 1)}
@@ -7660,7 +7660,7 @@ test "generic methods preserve formatter identity and roots under forced collect
 test "generic methods root allocated record payload copies across later arguments" {
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,
-        \\let unwrapOr:(self:@This(),fallback:T)->T=match self{.ok=>|v|v
+        \\let unwrapOr:(self:@This(),fallback:T)->T=match self{.ok[v] => v
         \\.err=>fallback}
         \\}
         \\let Pair=struct{s:str,n:int,}
@@ -7688,8 +7688,8 @@ test "generic method terminal branches and noreturn methods retain void annotati
     const source =
         \\let G:(T:type)->type=union{ok:T,err:str,
         \\let Self=@This()
-        \\let get:(self:Self)->T=match self{.ok=>|v|{return v}
-        \\.err=>|e|@panic(e)}
+        \\let get:(self:Self)->T=match self{.ok[v] => {return v}
+        \\.err[e] => @panic(e)}
         \\@[noreturn]
         \\let halt:(self:Self,message:str)->void=@panic(message)
         \\let stop:(self:Self)->T={Self.halt(self,"stopped")}
@@ -7707,7 +7707,7 @@ test "generic method terminal branches and noreturn methods retain void annotati
 
 test "generic callback methods allocate only in selected ordinary bodies and report runtime OOM" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,\nlet unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{{.ok=>|v|v\n.err=>|e|fallback(e)}}\n}}\nlet R=G(str,str)\nlet cb:(e:str)->str={s}\nlet main:()={{let r:R=.err[\"err\"]\n@println(r.unwrapOrElse(cb))}}", .{if (allocate) "e+\"!\"" else "e"});
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,\nlet unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{{.ok[v] => v\n.err[e] => fallback(e)}}\n}}\nlet R=G(str,str)\nlet cb:(e:str)->str={s}\nlet main:()={{let r:R=.err[\"err\"]\n@println(r.unwrapOrElse(cb))}}", .{if (allocate) "e+\"!\"" else "e"});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -7724,11 +7724,11 @@ const demand_void_result_program =
     \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
     \\let Self=@This()
     \\@[public]
-    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok[v] => v
     \\.err=>fallback}
     \\@[public]
-    \\let unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v
-    \\.err=>|e|fallback(e)}
+    \\let unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok[v] => v
+    \\.err[e] => fallback(e)}
     \\}
     \\let Unit=Result(void,str)
     \\let Empty=Result(int,void)
@@ -7740,10 +7740,10 @@ const demand_void_result_program =
     \\let remap:(b:bool)->Result(bool,void)=.ok[makeEmpty(b).! == 5]
     \\let both:()->Both=.err[]
     \\let main:()={
-    \\@println(match run(true){.ok=>|v|v
+    \\@println(match run(true){.ok[v] => v
     \\.err=>0})
     \\@println(match run(false){.ok=>"bad"
-    \\.err=>|e|e})
+    \\.err[e] => e})
     \\@println(makeEmpty(true).unwrapOr(9),makeEmpty(false).unwrapOr(9))
     \\@println(match remap(false){.ok=>"bad"
     \\.err=>"empty"},match both(){.ok=>"bad"
@@ -7777,7 +7777,7 @@ test "demand generic method body worklist discovers new containers callbacks and
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,
         \\let Self=@This()
-        \\let identity:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+        \\let identity:(self:Self,fallback:T)->T=match self{.ok[v] => v
         \\.err=>fallback}
         \\let get:(self:Self,fallback:T)->T=identity(self,fallback)
         \\@[stringify]
@@ -7836,18 +7836,18 @@ test "generic propagation preserves once only evaluation short circuit returns a
         \\let remap:()->G(bool,void)=.ok[emptyError().! == 0]
         \\let terminal:()->R=R.ok[{return .ok[9]}].!
         \\let main:()={
-        \\    @println(match sum(false){.ok=>|v|"{v}"
-        \\        .err=>|s|s},match sum(true){.ok=>|v|"{v}"
-        \\        .err=>|s|s})
-        \\    @println(match lazy(false){.ok=>|b|"{b}"
-        \\        .err=>|s|s},match lazy(true){.ok=>|b|"{b}"
-        \\        .err=>|s|s})
-        \\    @println(match fromUnit(true){.ok=>|v|"{v}"
-        \\        .err=>|s|s},match fromUnit(false){.ok=>|v|"{v}"
-        \\        .err=>|s|s})
+        \\    @println(match sum(false){.ok[v] => "{v}"
+        \\        .err[s] => s},match sum(true){.ok[v] => "{v}"
+        \\        .err[s] => s})
+        \\    @println(match lazy(false){.ok[b] => "{b}"
+        \\        .err[s] => s},match lazy(true){.ok[b] => "{b}"
+        \\        .err[s] => s})
+        \\    @println(match fromUnit(true){.ok[v] => "{v}"
+        \\        .err[s] => s},match fromUnit(false){.ok[v] => "{v}"
+        \\        .err[s] => s})
         \\    @println(match remap(){.ok=>"bad"
-        \\        .err=>"empty"},match terminal(){.ok=>|v|"{v}"
-        \\        .err=>|s|s})
+        \\        .err=>"empty"},match terminal(){.ok[v] => "{v}"
+        \\        .err[s] => s})
         \\}
     ;
     const c = try arrayTestProgram(source);
@@ -7869,8 +7869,8 @@ test "generic success string stays rooted across later allocating arguments and 
         \\        break 3}
         \\    .ok[n]
         \\}
-        \\let main:()=@println(match run(){.ok=>|v|"{v}"
-        \\    .err=>|e|e})
+        \\let main:()=@println(match run(){.ok[v] => "{v}"
+        \\    .err[e] => e})
     ;
     const c = try arrayTestProgram(source);
     defer test_gpa.free(c);
@@ -7879,7 +7879,7 @@ test "generic success string stays rooted across later allocating arguments and 
 
 test "generic error propagation itself allocates nothing and payload OOM remains checked" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet make:()->G(int,str)=.err[{s}]\nlet run:()->G(bool,str)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"bad\"\n.err=>|e|e}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet make:()->G(int,str)=.err[{s}]\nlet run:()->G(bool,str)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"bad\"\n.err[e] => e}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -8065,7 +8065,7 @@ test "panic branches operands and terminal arguments preserve selected effects" 
         .{ .body = "@println(pick(false), returning(), breaking(), continuing())", .stdout = "A1 returned 7 2\n", .stderr = "", .code = 0 },
         .{ .body = "@println(pick(true), side())" },
         .{ .body = "@println(both(true), side())" },
-        .{ .body = "@println(match U.err[\"stop\"] {.ok => |n| n\n.err => |e| @panic(e)}, side())" },
+        .{ .body = "@println(match U.err[\"stop\"] {.ok[n] => n\n.err[e] => @panic(e)}, side())" },
         .{ .body = "@println(match true {true => @panic(\"stop\")\nfalse => @panic(\"other\")}, side())" },
         .{ .body = "@println(@panic(\"stop\") + side())" },
         .{ .body = "@println(-@panic(\"stop\"))" },
@@ -8073,7 +8073,7 @@ test "panic branches operands and terminal arguments preserve selected effects" 
         .{ .body = "@println(@panic(\"stop\") == @panic(\"other\"))" },
         .{ .body = "@println(if false {@panic(\"wrong\")} else {arg()})", .stdout = "A1\n", .stderr = "", .code = 0 },
         .{ .body = "@println(match false {true => @panic(\"wrong\")\nfalse => arg()})", .stdout = "A1\n", .stderr = "", .code = 0 },
-        .{ .body = "@println(match U.ok[7] {.ok => |n| n\n.err => |e| @panic(e)})", .stdout = "7\n", .stderr = "", .code = 0 },
+        .{ .body = "@println(match U.ok[7] {.ok[n] => n\n.err[e] => @panic(e)})", .stdout = "7\n", .stderr = "", .code = 0 },
         .{ .body = "@println(arg() + @panic(\"stop\"), side())", .stdout = "A" },
         .{ .body = "@println(f(arg(), @panic(\"stop\"), side()))", .stdout = "A" },
         .{ .body = "@println(@panic(\"stop\")(side()))" },
@@ -8132,18 +8132,18 @@ const union_program =
     \\    @[stringify]
     \\    let toString: (u: Alias) -> str = describe(u)
     \\    let describe: (u: U) -> str = match u {
-    \\        .ok => |v| "n:{v}"
-    \\        .err => |s| s + "!"
-    \\        .none => |unit| {let v: void = unit
+    \\        .ok[v] => "n:{v}"
+    \\        .err[s] => s + "!"
+    \\        .none[unit] => {let v: void = unit
     \\            "none"}
-    \\        .flag => |b| "b:{b}"
+    \\        .flag[b] => "b:{b}"
     \\    }
     \\}
     \\let id: (u: U) -> Alias = u
     \\let make: () -> str = {@print("S")
     \\    "hé\0" + "x"}
     \\let choose: (u: U) -> int = match u {
-    \\    .ok => |n| n
+    \\    .ok[n] => n
     \\    _ => -1
     \\}
     \\let main: () = {
@@ -8153,7 +8153,7 @@ const union_program =
     \\    u = .none[]
     \\    @println(copy, u, U.flag[true], Alias.ok[number])
     \\    let s = match copy {
-    \\        .err => |s| {u = .err["new" + "value"]
+    \\        .err[s] => {u = .err["new" + "value"]
     \\            s}
     \\        _ => "unexpected"
     \\    }
@@ -8183,7 +8183,7 @@ test "union copies share immutable owners and zero inactive fields" {
 }
 
 test "union extraction checks the active tag even in forged well typed IR" {
-    var module = try Module.init(test_gpa, "checked-union.nov", "let U=union{ok:int,none,}\nlet get:(u:U)->int=match u{.ok=>|v|v\n_=>0}\nlet main:()=@println(get(.none[]))");
+    var module = try Module.init(test_gpa, "checked-union.nov", "let U=union{ok:int,none,}\nlet get:(u:U)->int=match u{.ok[v] => v\n_=>0}\nlet main:()=@println(get(.none[]))");
     defer module.deinit();
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
@@ -8702,7 +8702,7 @@ test "nestedunion Option Result captures source free managed arrays forced GC O0
         \\ let saved=value
         \\ let capture=()->OR {saved}
         \\ let replace=(){value=.none[]}
-        \\ let mut rows=match value {.some=>|r|match r {.ok=>|a|a
+        \\ let mut rows=match value {.some[r] => match r {.ok[a] => a
         \\ .err=>@as([][]str,[])}
         \\ .none=>@as([][]str,[])}
         \\ let row=&rows[0]
@@ -8710,7 +8710,7 @@ test "nestedunion Option Result captures source free managed arrays forced GC O0
         \\ replace()
         \\ @assert(match value {.none=>true
         \\ .some=>false})
-        \\ @assert(match capture() {.some=>|r|match r {.ok=>|a|a[0][0]=="ab"
+        \\ @assert(match capture() {.some[r] => match r {.ok[a] => a[0][0]=="ab"
         \\ .err=>false}
         \\ .none=>false})
         \\ let reversed:RO=.ok[.some[[["c"+"d"]]]]
@@ -8814,7 +8814,7 @@ test "array union payload captures references and shared closure environments fo
         \\ let saved=value
         \\ let snapshot=()->U {saved}
         \\ let replace=(){value=.none[]}
-        \\ let mut rows=match value {.some=>|a|a
+        \\ let mut rows=match value {.some[a] => a
         \\ .none=>@as([][]str,[])}
         \\ let row=&rows[0]
         \\ row.*[0]="changed"
@@ -8825,9 +8825,9 @@ test "array union payload captures references and shared closure environments fo
         \\ count}
         \\ let functions:F=.some[[f]]
         \\ let copied=functions
-        \\ let first=match functions {.some=>|a|a
+        \\ let first=match functions {.some[a] => a
         \\ .none=>@as([]()->int,[])}
-        \\ let second=match copied {.some=>|a|a
+        \\ let second=match copied {.some[a] => a
         \\ .none=>@as([]()->int,[])}
         \\ @assert(first[0]()==1 and second[0]()==2 and count==2)
         \\ @println(snapshot())
@@ -8859,7 +8859,7 @@ test "array union payload source free inactive copies OOM and invalid runtime ta
 
 test "union payload integer storage preserves every backend width and boundary" {
     const source = "let U=union{a:i8,b:u8,c:i16,d:u16,e:i32,f:u32,g:i64,h:u64,}\n" ++
-        "let show:(u:U)=match u{.a=>|v|@print(v)\n.b=>|v|@print(v)\n.c=>|v|@print(v)\n.d=>|v|@print(v)\n.e=>|v|@print(v)\n.f=>|v|@print(v)\n.g=>|v|@print(v)\n.h=>|v|@print(v)}\n" ++
+        "let show:(u:U)=match u{.a[v] => @print(v)\n.b[v] => @print(v)\n.c[v] => @print(v)\n.d[v] => @print(v)\n.e[v] => @print(v)\n.f[v] => @print(v)\n.g[v] => @print(v)\n.h[v] => @print(v)}\n" ++
         "let main:()={show(.a[-128])\n@print(\" \")\nshow(.b[255])\n@print(\" \")\nshow(.c[-32768])\n@print(\" \")\nshow(.d[65535])\n@print(\" \")\nshow(.e[-2147483648])\n@print(\" \")\nshow(.f[4294967295])\n@print(\" \")\nshow(.g[-9223372036854775808])\n@print(\" \")\nshow(.h[18446744073709551615])\n@println()}";
     const c = try arrayTestProgram(source);
     defer test_gpa.free(c);
@@ -8868,9 +8868,9 @@ test "union payload integer storage preserves every backend width and boundary" 
 
 test "union payload allocation failure panics but skipped payloads allocate nothing" {
     for ([_]struct { body: []const u8, allocates: bool }{
-        .{ .body = "@println(match U.none[] {.s=>|s|s\n.none=>\"ok\"})", .allocates = false },
-        .{ .body = "let u:U=if true {.none[]} else {.s[\"a\"+\"b\"]}\n@println(match u {.s=>|s|s\n.none=>\"ok\"})", .allocates = false },
-        .{ .body = "let u=U.s[\"a\"+\"b\"]\n@println(match u {.s=>|s|s\n.none=>\"ok\"})", .allocates = true },
+        .{ .body = "@println(match U.none[] {.s[s] => s\n.none=>\"ok\"})", .allocates = false },
+        .{ .body = "let u:U=if true {.none[]} else {.s[\"a\"+\"b\"]}\n@println(match u {.s[s] => s\n.none=>\"ok\"})", .allocates = false },
+        .{ .body = "let u=U.s[\"a\"+\"b\"]\n@println(match u {.s[s] => s\n.none=>\"ok\"})", .allocates = true },
     }) |case| {
         const source = try std.fmt.allocPrint(test_gpa, "let U=union{{s:str,none,}}\nlet main:()={{{s}\n}}", .{case.body});
         defer test_gpa.free(source);
@@ -8971,7 +8971,7 @@ const field_mutation =
     \\    }
     \\    @println(r.x, n, early().x, early().y)
     \\    @println(match propagate(.none[]) {.some => false
-    \\        .none => true}, match propagate(.some[2]) {.some => |v| v
+    \\        .none => true}, match propagate(.some[2]) {.some[v] => v
     \\        .none => 0})
     \\}
 ;
@@ -9843,7 +9843,7 @@ test "array concatenation source free recursive copies operand effects and queri
         \\@assert(doubled[0][0]==1 and doubled[3][0]==9)
         \\let unions:[]U=[.row[result[0]]]+[.none[]]
         \\let copied=unions+[]
-        \\@assert(match copied[0]{.row=>|r| r.items[0]=="ab"
+        \\@assert(match copied[0]{.row[r] => r.items[0]=="ab"
         \\.none=>false})
         \\let count=(){events+=1
         \\events}
@@ -11085,17 +11085,17 @@ test "array reverse actual stdlib source free recursive copies forced GC O0 O3 a
 const integer_parsing_stdlib_source_free =
     \\let std=@import("std")
     \\let signedAccept:(input:str,expected:int)->bool=match std.string.parseInt(input){
-    \\.ok=>|value| value==expected
+    \\.ok[value] => value==expected
     \\.err=>false}
     \\let unsignedAccept:(input:str,expected:uint)->bool=match std.string.parseUint(input){
-    \\.ok=>|value| value==expected
+    \\.ok[value] => value==expected
     \\.err=>false}
     \\let signedReject:(input:str,overflow:bool)->bool=match std.string.parseInt(input){
     \\.ok=>false
-    \\.err=>|error| if overflow {error==.overflow} else {error==.invalidInput}}
+    \\.err[error] => if overflow {error==.overflow} else {error==.invalidInput}}
     \\let unsignedReject:(input:str,overflow:bool)->bool=match std.string.parseUint(input){
     \\.ok=>false
-    \\.err=>|error| if overflow {error==.overflow} else {error==.invalidInput}}
+    \\.err[error] => if overflow {error==.overflow} else {error==.invalidInput}}
     \\let make:()->str="["+"-42"+"]"
     \\let view:(input:str)->bool=signedAccept(input[1..-1],-42)
 ;
@@ -11292,7 +11292,7 @@ const string_byte_stdlib_source_free =
     \\let decode: (bytes: []u8) -> str = std.string.fromBytes(bytes).unwrapOr("rejected")
     \\let accepts: (bytes: []u8) -> bool = match std.string.fromBytes(bytes) {
     \\    .ok => true
-    \\    .err => |error| match error { .invalidUtf8 => false }
+    \\    .err[error] => match error { .invalidUtf8 => false }
     \\}
     \\let retainedText: () -> str = {
     \\    let bytes = std.string.toBytes("prefix:" + "é😀\0:suffix")
@@ -11738,7 +11738,7 @@ const array_find_last_source_free =
     \\let choose: (items: [][]str) -> []str = {
     \\    let found = std.array.findLast(items, (row: []str) -> bool {row[0] != "skip!"})
     \\    let garbage = "force" + " collection"
-    \\    match found {.some => |row| row
+    \\    match found {.some[row] => row
     \\        .none => []}
     \\}
 ;
@@ -12235,7 +12235,7 @@ test "iteration continuations source free controls terminal else propagation MAX
         \\    let picked: int = loop x in [3] : { break x } {} else { @panic("BAD terminal else") }
         \\    @assert(picked == 3)
         \\    match propagate() { .ok => @panic("BAD result")
-        \\        .err => |e| @assert(e == "error")
+        \\        .err[e] => @assert(e == "error")
         \\    }
         \\    let mut count: int = 0
         \\    loop x in @as(u64, 18446744073709551615)..=18446744073709551615 : {
@@ -12706,11 +12706,11 @@ test "iteration loop effects preserve return propagation exhaustion and outer co
         \\let copied:()->str={let a=["a"+"b"]
         \\    loop &s in a {return s.*} else {"empty"}}
         \\let main:()={@println(early(),copied())
-        \\    @println(match refs(true){.some=>|n|n
-        \\        .none=>0},match refs(false){.some=>|n|n
+        \\    @println(match refs(true){.some[n] => n
+        \\        .none=>0},match refs(false){.some[n] => n
         \\        .none=>0})
-        \\    @println(match values(true){.some=>|s|s
-        \\        .none=>"none"},match values(false){.some=>|s|s
+        \\    @println(match values(true){.some[s] => s
+        \\        .none=>"none"},match values(false){.some[s] => s
         \\        .none=>"none"})
         \\    let mut n:int=0
         \\    loop n<3 : n+=1 {loop x in {continue} {@print("bad")}}
@@ -16117,7 +16117,7 @@ test "cross source generic reexports retain defining scope under forced GC after
             \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
             \\let Self=@This()
             \\@[public]
-            \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+            \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok[v] => v
             \\.err=>fallback}
             \\@[public]
             \\let message:(self:Self)->str=prefix+helper()
@@ -16185,10 +16185,10 @@ const nested_record_program =
     \\let copied=r.box
     \\r.box.other.s="changed"+"!"
     \\@println(r,copied.inner.s,copied.other.s)
-    \\@println(match propagate(true){.ok=>|v|"{v}"
-    \\.err=>|v|"{v}"},match propagate(false){.ok=>|v|"{v}"
-    \\.err=>|v|"{v}"})
-    \\@println(match option(.some[saved]){.some=>|v|"{v}"
+    \\@println(match propagate(true){.ok[v] => "{v}"
+    \\.err[v] => "{v}"},match propagate(false){.ok[v] => "{v}"
+    \\.err[v] => "{v}"})
+    \\@println(match option(.some[saved]){.some[v] => "{v}"
     \\.none=>"none"},match option(.none[]){.some=>"BAD"
     \\.none=>"none"},saved)
     \\if false{let skipped=deep("BAD")
@@ -16299,7 +16299,7 @@ test "nested records propagation shares immutable strings and skips allocations 
     for ([_]bool{ false, true }) |allocate| {
         const source = try std.fmt.allocPrint(test_gpa, "let R:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet Outer=struct{{middle:Middle,}}\nlet Middle=struct{{leaf:Leaf,}}\nlet Leaf=struct{{s:str,}}\n" ++
             "let make:()->R(int,Outer)=.err[Outer.[middle=Middle.[leaf=Leaf.[s={s}]]]]\n" ++
-            "let run:()->R(bool,Outer)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"BAD\"\n.err=>|r|r.middle.leaf.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+            "let run:()->R(bool,Outer)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"BAD\"\n.err[r] => r.middle.leaf.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -16353,9 +16353,9 @@ const managed_array_program =
     \\@println(r[0].inner.s,r[-1].inner.s,@len(r),original[0].other)
     \\let option:O(Outer)=.some[r[0]]
     \\let result:R(Outer,Outer)=.ok[original[0]]
-    \\@println(match option{.some=>|v|v.inner.s
-    \\.none=>"BAD"},match result{.ok=>|v|v.inner.s
-    \\.err=>|v|v.other})
+    \\@println(match option{.some[v] => v.inner.s
+    \\.none=>"BAD"},match result{.ok[v] => v.inner.s
+    \\.err[v] => v.other})
     \\let empty:[]Outer=[]
     \\let empty2:[]str=[]
     \\let again:[]Outer=[]
@@ -16521,7 +16521,7 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
         .output = "2\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(@len(a))}\n.none=>{}\n}}",
+        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\nmatch u {\n.node[t] => {let mut a=t.items\na+=a\n@println(@len(a))}\n.none=>{}\n}}",
         .allocations = 9,
         .output = "2\n",
     },
@@ -16533,7 +16533,7 @@ const last_use_cases = [_]struct { source: []const u8, allocations: usize, outpu
     .{ .source = "let main:()={let mut a=[1]\na=[2]\nlet b=a\n@println(b[0])}", .allocations = 2, .output = "2\n" },
     .{ .source = "let main:()={let a=[1]\nlet mut earlier=a\nlet mut last=a\nearlier[0]=7\nlast[0]=9\n@println(earlier[0],last[0])}", .allocations = 4, .output = "7 9\n" },
     .{ .source = "let R=struct{values:[][]int,}\nlet main:()={let a=R.[values=[[1],[2]]]\nlet b=a\nlet c=b\n@println(c.values[0][0])}", .allocations = 3, .output = "1\n" },
-    .{ .source = "let R=struct{values:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:U=.some[R.[values=[[1],[2]]]]\nlet b=a\nlet c=b\nlet value=match c{.some=>|r|r.values[0][0]\n.none=>0}\n@println(value)}", .allocations = 3, .output = "1\n" },
+    .{ .source = "let R=struct{values:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:U=.some[R.[values=[[1],[2]]]]\nlet b=a\nlet c=b\nlet value=match c{.some[r] => r.values[0][0]\n.none=>0}\n@println(value)}", .allocations = 3, .output = "1\n" },
     .{ .source = "let main:()={let a=[1]\nlet mut b=a\nb[0]=9\n@println(a[0],b[0])}", .allocations = 3, .output = "1 9\n" },
     .{ .source = "let main:()={let mut a=[1]\nlet read=()->int{a[0]}\nlet mut b=a\nb[0]=9\n@println(read(),b[0])}", .allocations = 5, .output = "1 9\n" },
     .{ .source = "let main:()={let mut a=[1]\nlet p=&a\nlet b=p.*\n@println(b[0])}", .allocations = 2, .output = "1\n" },
@@ -17284,7 +17284,7 @@ const array_fields_program =
     \\let mut looped=loop {break saved}
     \\looped.leaf.values[0]=50
     \\let u=U.some[saved]
-    \\let mut payload=match u {.some=>|v|v
+    \\let mut payload=match u {.some[v] => v
     \\.none=>tree()}
     \\payload.leaf.values[0]=60
     \\@println(immutable().leaf.values[0],snapshot().leaf.values[0],read.leaf.values[0],a.leaf.values[0],a.leaf.values[1],@len(a.leaf.values))
@@ -17313,10 +17313,10 @@ test "array fields two managed union alternatives copy capture and match under f
         \\let capture:(u:U)->()->U={let frozen=identity(u)
         \\()->U {frozen}}
         \\let show:(u:U)={match u {
-        \\.left=>|p|{let mut changed=p
+        \\.left[p] => {let mut changed=p
         \\changed.values[-1]=99
         \\@println("L",p.values[0],p.values[-1],p.text,changed.values[-1])}
-        \\.right=>|p|{let mut changed=p
+        \\.right[p] => {let mut changed=p
         \\let mut item=changed.items[0]
         \\item.values[-1]=88
         \\changed.items[0]=item
@@ -17462,7 +17462,7 @@ test "array fields insertion replacement and append backing pointers detach at o
         \\let seed=Leaf.[values=[1,2],text="shared"+"!"]
         \\let tree=Tree.[leaf=seed,records=[seed,seed]]
         \\let wrapped=Wrapped.node[tree]
-        \\match wrapped {.node=>|snapshot|{
+        \\match wrapped {.node[snapshot] => {
         \\let mut inserted=[snapshot,snapshot]
         \\inserted[-1]=tree
         \\inserted += [tree,tree]
@@ -18100,7 +18100,7 @@ const general_borrow_program =
     \\let mut o:O(str)=.none[]
     \\let ro=&o
     \\ro.* =.some["yes"+"!"]
-    \\@println(match option(ro.*){.some=>|v|v
+    \\@println(match option(ro.*){.some[v] => v
     \\.none=>"bad"})
     \\let mut a:[]int=[1,2]
     \\let ra=&a

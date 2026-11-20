@@ -23,7 +23,7 @@ let ascending: (a: int, b: int) -> bool = a < b
 let descending: (a: int, b: int) -> bool = a > b
 let by_key: (a: Row, b: Row) -> bool = a.key < b.key
 let payload_key: (value: Payload) -> int = match value {
-    .row => |row| row.key
+    .row[row] => row.key
     .none => 0
 }
 

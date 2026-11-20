@@ -13,7 +13,7 @@ let TextResult = std.Result(str, Utf8Error)
 
 let expectValid: (bytes: []u8, expected: str) = {
     let text = match std.string.fromBytes(bytes) {
-        .ok => |value| value
+        .ok[value] => value
         .err => {
             @panic("valid UTF-8 rejected")
         }
@@ -29,7 +29,7 @@ let expectValid: (bytes: []u8, expected: str) = {
 let expectInvalid: (bytes: []u8) = {
     match std.string.fromBytes(bytes) {
         .ok => @panic("invalid UTF-8 accepted")
-        .err => |error| match error {
+        .err[error] => match error {
             .invalidUtf8 => {}
         }
     }
@@ -217,7 +217,7 @@ let propagation_error_matching_and_first_class_wrappers: () = {
     @assert(decorate(bytes).unwrapOr("bad") == "[é]")
     match decorate([0xFF]) {
         .ok => @panic("propagation accepted invalid UTF-8")
-        .err => |error| {
+        .err[error] => {
             let typed: Utf8Error = error
             match typed {
                 .invalidUtf8 => {}
@@ -235,7 +235,7 @@ let main: () = {
     @println("Independent snapshot:", text)
     match std.string.fromBytes(bytes) {
         .ok => @panic("expected invalid UTF-8")
-        .err => |error| @println("Invalid UTF-8:", error)
+        .err[error] => @println("Invalid UTF-8:", error)
     }
     let nul = "a\0b"
     @println("NUL: {@len(std.string.toBytes(nul))} bytes, {@len(nul)} scalars")

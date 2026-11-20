@@ -139,7 +139,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .union_needs_type => try writer.writeAll("contextual union constructor needs an expected union type"),
             .match_missing_variants => try writer.writeAll("enum or union match must cover every variant or end with a wildcard (_)"),
             .match_covered_union_prong => try writer.writeAll("union match prong is already covered by earlier prongs"),
-            .invalid_match_capture => try writer.writeAll("payload capture requires a single union variant pattern and an immutable named binding"),
+            .invalid_match_capture => try writer.writeAll("payload capture requires .variant[name] for one union variant and an immutable named binding"),
             .unsupported_attribute => try writer.writeAll("unsupported, misplaced or duplicate attribute; @[public] requires an immutable declaration, @[noreturn] requires a function"),
             .invalid_test_declaration => try writer.writeAll("@[test] requires an ordinary immutable top-level function with a body, no arguments to the attribute, and no export, extern or noreturn attribute"),
             .invalid_test_signature => try writer.writeAll("test function must have type () -> void"),

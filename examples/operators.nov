@@ -197,7 +197,7 @@ let Amount = union {
     none,
 
     let number: (self: Amount) -> int = match self {
-        .value => |value| value
+        .value[value] => value
         .none => 0
     }
     @[operator(.add)]

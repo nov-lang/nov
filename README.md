@@ -1466,10 +1466,15 @@ checked semantically through 128 bits, while reachable C layouts require
 - Construct with `Value.number[7]`, or `.number[7]` under an expected union type.
   A payloadless variant uses `Value.empty[]` or contextual `.empty[]`. Payloads
   have exact types and evaluate once. Bare payloads never implicitly become unions.
-- Match one union subject with `.number => |n| ...`, `.text => |s| ...`, and
-  `.empty => ...`. Captures are immutable and private to their prong; omit the
-  capture when unused. Every variant must be covered, or use a final `_`.
-  Unknown variants, repeated/covered prongs and missing variants diagnose.
+- Match one union subject with `.number[n] => ...`, `.text[s] => ...`, and
+  `.empty => ...`. Brackets bind the payload to one immutable name, private to
+  that prong; omit the brackets when the payload is unused, including payloadless
+  variants such as `.empty`. Nested payload patterns, reference captures and `_` bindings
+  are not implemented. The former `=> |name|` syntax is removed, not an alias.
+  Every variant must be covered, or use a final `_`.
+  Unknown variants, repeated/covered prongs and missing variants diagnose. See
+  [`examples/match-payloads.nov`](examples/match-payloads.nov) for Result/Option,
+  nested matches, payload copies and unevaluated query examples.
 - Assignment, arguments, returns and control-flow results copy the tag and active
   payload, recursively detaching direct array payloads and arrays in record payloads;
   strings share immutable backing storage. C emission uses a tag and separate
@@ -1553,7 +1558,7 @@ let Tree = union(NodeKind) {
 
     let sum: (self: *mut Tree) -> int = match self {
         .empty => 0
-        .node => |n| n.value + n.left.sum() + n.right.sum()
+        .node[n] => n.value + n.left.sum() + n.right.sum()
     }
 }
 let mut leaf = Tree.empty[]
@@ -1568,7 +1573,7 @@ let Number = union {
     ;;; Converts a Number to an int
     let toRaw: (self: Number) -> int = {
         match self {
-            .raw => |raw| return raw
+            .raw[raw] => return raw
             .text => ... ; TODO: parseInt
         }
     }
@@ -1998,7 +2003,7 @@ let Result: (T: type, E: type) -> type = union {
 
     @[public]
     let unwrapOr: (self: Self, fallback: T) -> T = match self {
-        .ok => |value| value ; catch the value and return it
+        .ok[value] => value ; bind the payload and return it
         .err => fallback
     }
 
@@ -2006,8 +2011,8 @@ let Result: (T: type, E: type) -> type = union {
     ; only evaluated when needed
     @[public]
     let unwrapOrElse: (self: Self, fallback: (E) -> T) -> T = match self {
-        .ok => |value| value
-        .err => |err| fallback(err)
+        .ok[value] => value
+        .err[err] => fallback(err)
     }
 }
 
@@ -2017,8 +2022,8 @@ let my_err: MyResult = .err["my error string"]
 
 ; error handling
 let file = match File.open("file.txt") {
-    .ok => |f| f
-    .err => |err| match err.kind {
+    .ok[f] => f
+    .err[err] => match err.kind {
         .not_found => {
             ; do something
         }
@@ -2037,7 +2042,7 @@ let Option: (T: type) -> type = union {
     @[public]
     let unwrapOrElse: (self: @This(), fallback: () -> T) -> T = {
         match self {
-            .some => |value| value
+            .some[value] => value
             .none => fallback()
         }
     }
@@ -2482,23 +2487,17 @@ loop arr in arr_arr.* {
 
 ```
 
-The following functional/bind syntax is a separate future proposal, not executable
-reference syntax (use `std.array` helpers for delivered higher-order operations):
+Use ordinary function expressions with `std.array` helpers for higher-order
+traversal; closures do not use pipe-delimited parameters:
 
 ```nov
-; functional way, I think
-arr_arr.map(|arr| {
-    arr.map(|word| word + " " |> @print)
-    @println
-}
-
-; with monad bind operator
-; type annotation is optional
-arr_arr >>= |arr: []str| {
-    arr >>= |word| word + " " |> @print
+std.array.each(arr_arr, (arr) {
+    std.array.each(arr, (word) { @print("{word} ") })
     @println()
-}
+})
 ```
+
+A broader bind operator remains a separate future proposal.
 
 ## Slice
 

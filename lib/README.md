@@ -165,7 +165,10 @@ See `examples/storable-fields.nov` for a runnable example and six tests.
 
 ## Result
 
-`Result(T, E)` has variants `ok: T` and `err: E`.
+`Result(T, E)` has variants `ok: T` and `err: E`. Match payloads with
+`.ok[value] => ...` and `.err[error] => ...`; bindings are immutable and local
+to their prong. Omit brackets when ignoring a payload. The former pipe-delimited
+capture syntax is no longer accepted.
 
 - `value.isOk()` / `value.isErr()` report the active variant as a bool, without
   inspecting or unwrapping its payload. They also work with void payloads.
@@ -192,7 +195,8 @@ constructed and propagated without requesting `unwrapOr`.
 
 `Option(T)` has variants `some: T` and payloadless `none`. Construct it explicitly
 with `Option(uint).some[21]`, or use `.some[21]` / `.none[]` under an expected
-Option type. Exhaustive matches can capture the `some` payload or handle `none`.
+Option type. Exhaustive matches use `.some[value] => ...` to bind the payload
+and `.none => ...` for absence.
 
 - `value.isSome()` / `value.isNone()` report the active variant as a bool, without
   inspecting or unwrapping its payload. `some[false]` is still present; these methods

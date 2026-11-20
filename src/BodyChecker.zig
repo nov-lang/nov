@@ -6968,7 +6968,7 @@ const flow_query_cases = [_]struct { expression: []const u8, terminal: bool, che
     .{ .expression = "loop @as(bool,{return true}) {}", .terminal = true },
     .{ .expression = "loop false{}else{return true}", .terminal = true },
     .{ .expression = "match true{true=>{return true}\nfalse=>{return false}}", .terminal = true },
-    .{ .expression = "{let u:U=.ok[R.[]]\nmatch u{.ok=>|r|r.stop()\n.err=>@panic(\"err\")}}", .terminal = true },
+    .{ .expression = "{let u:U=.ok[R.[]]\nmatch u{.ok[r] => r.stop()\n.err=>@panic(\"err\")}}", .terminal = true },
     .{ .expression = "{let r=R.[]\nr.stop()}", .terminal = true },
     .{ .expression = "make().stop()", .terminal = true },
     .{ .expression = "{let r=make()\nr.stop()}", .terminal = true },
@@ -8330,15 +8330,15 @@ test "union constructors captures and coverage diagnose exact scalar boundaries"
         .{ .source = "let f:()->U=U[]", .tag = .invalid_union_constructor },
         .{ .source = "let f:()->U=.missing[]", .tag = .unknown_field },
         .{ .source = "let f:()={let x=.ok[1]\n}", .tag = .union_needs_type },
-        .{ .source = "let f:(u:U)->int=match u{.ok=>|v|v}", .tag = .match_missing_variants },
+        .{ .source = "let f:(u:U)->int=match u{.ok[v] => v}", .tag = .match_missing_variants },
         .{ .source = "let f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}", .tag = .match_covered_union_prong },
         .{ .source = "let f:(u:U)->int=match u{_=>0\n.none=>1}", .tag = .match_covered_union_prong },
         .{ .source = "let f:(u:U)->int=match u{.ok=>0\n.err=>0\n.none=>0\n.flag=>0\n_=>0}", .tag = .match_covered_union_prong },
-        .{ .source = "let f:(u:U)->int=match u{.ok=>|v|v\n_=>v}", .tag = .unknown_name },
-        .{ .source = "let f:(u:U)->void=match u{.ok=>|v|{v=2}\n_=>{}}", .tag = .immutable_assignment },
-        .{ .source = "let f:(u:U)->int=match u{.ok=>|u|0\n_=>0}", .tag = .unsupported_shadowing },
-        .{ .source = "let f:(u:U)->int=match u{_=>|v|0}", .tag = .invalid_match_capture },
-        .{ .source = "let f:(u:U)->int=match u{.ok|.err=>|v|0\n_=>0}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f:(u:U)->int=match u{.ok[v] => v\n_=>v}", .tag = .unknown_name },
+        .{ .source = "let f:(u:U)->void=match u{.ok[v] => {v=2}\n_=>{}}", .tag = .immutable_assignment },
+        .{ .source = "let f:(u:U)->int=match u{.ok[u] => 0\n_=>0}", .tag = .unsupported_shadowing },
+        .{ .source = "let f:(u:U)->int=match u{.ok[_] => 0\n_=>0}", .tag = .invalid_match_capture },
+        .{ .source = "let f:(u:U)->int=match u{.ok|.err[v] => 0\n_=>0}", .tag = .unsupported_match_pattern },
         .{ .source = "let f:(u:U)->int=match u{.bad=>0\n_=>0}", .tag = .unknown_field },
         .{ .source = "let f:(u:U)->int=match u,u{_,_=>0}", .tag = .unsupported_match_subject },
         .{ .source = "let f:(u:U)->int=u.ok", .tag = .unsupported_body_expression },
@@ -8362,12 +8362,12 @@ test "union constructors captures and coverage diagnose exact scalar boundaries"
 
 test "union captures infer branch types without leaking and preserve contextual constructors" {
     for ([_][]const u8{
-        "let f:(u:U)->int=match u{.ok=>|n|n\n.err=>0\n.none=>0}",
-        "let f:(u:U)={let n=match u{.ok=>|n|n\n_=>0}\n@println(n)}",
-        "let f:(u:U)->U=match u{.ok=>|n|.ok[n]\n_=>.none[]}",
-        "let f:(u:U)->int=match u{.ok=>|n|{return n}\n_=>1}",
-        "let f:(u:U)->int=match u{.ok=>|n|match u{.ok=>|m|n+m\n_=>n}\n_=>0}",
-        "let f:(u:U)={let n=match u{.ok=>0\n.err=>0\n.none=>|v|{let unit:void=v\n@as(int,1)}}\n@println(n)}",
+        "let f:(u:U)->int=match u{.ok[n] => n\n.err=>0\n.none=>0}",
+        "let f:(u:U)={let n=match u{.ok[n] => n\n_=>0}\n@println(n)}",
+        "let f:(u:U)->U=match u{.ok[n] => .ok[n]\n_=>.none[]}",
+        "let f:(u:U)->int=match u{.ok[n] => {return n}\n_=>1}",
+        "let f:(u:U)->int=match u{.ok[n] => match u{.ok[m] => n+m\n_=>n}\n_=>0}",
+        "let f:(u:U)={let n=match u{.ok=>0\n.err=>0\n.none[v] => {let unit:void=v\n@as(int,1)}}\n@println(n)}",
     }) |body| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let U=union{ok:int,err:str,none,}\n", body });
         defer std.testing.allocator.free(source);
@@ -8770,7 +8770,7 @@ test "string scalar indexing has exact rune inference through contexts construct
         \\    @assert(text()[-1]=='z')
         \\    @println(sum,bytes[0],branch,matched,looped,a[0][1],@len(s))
         \\    let wrapped:U=U.text[s]
-        \\    @println(match wrapped {.text=>|v|v[0]})
+        \\    @println(match wrapped {.text[v] => v[0]})
         \\    take(inferred)==G(str).[value=s].byte(i)
         \\}
     ;
@@ -8885,7 +8885,7 @@ test "string slicing semantic types inference and rejection" {
         \\    let matched=match b {true=>s[..]
         \\        false=>view}
         \\    let looped=loop {break s[..]}
-        \\    @println(a[0],chosen,matched,looped,match u {.text=>|v|v[..]})
+        \\    @println(a[0],chosen,matched,looped,match u {.text[v] => v[..]})
         \\    G(str).[value=s].cut()}
     );
     defer module.deinit();
@@ -10167,7 +10167,7 @@ test "local shadowing reports both declarations and locals do not leak to other 
 test "rune frontend supports scalar boundaries matches printing and borrows" {
     for ([_][]const u8{
         "let Rune = rune\nlet identity: (x: Rune) -> Rune = x\nlet f: () -> rune = {let callback: (rune) -> rune = identity\nlet value = 'é'\ncallback(@as(Rune, value))}",
-        "let R = struct{value: rune = 'é',}\nlet U = union{value: rune,}\nlet f: () -> rune = {let r = R.[]\nlet u: U = .value[r.value]\nmatch u {.value => |v| v}}",
+        "let R = struct{value: rune = 'é',}\nlet U = union{value: rune,}\nlet f: () -> rune = {let r = R.[]\nlet u: U = .value[r.value]\nmatch u {.value[v] => v}}",
         "let f: (r: rune) -> rune = match r {'é' | '\\xE9' => '😀'\n_ => r}",
         "let f: () -> bool = {let mut r = 'a'\nr = 'é'\nlet b = &r\nb.* = '😀'\nb.* == '😀'}",
         "let f: () -> rune = {let mut xs: []rune = ['a', 'é']\nxs[0] = '😀'\nlet b = &xs[1]\nb.* = '\\0'\nb.*}",

@@ -153,7 +153,7 @@ test "enums reject inexact types arithmetic ordering conversions captures and in
         .{ .source = "let f:(k:Kind)->bool=match k{k.not_found=>true\n_=>false}", .tag = .unsupported_match_pattern },
         .{ .source = "let R=struct{x:Kind,}\nlet f:(k:Kind,r:R)->bool=match k{r.x=>true\n_=>false}", .tag = .unsupported_match_pattern },
         .{ .source = "let K=enum{x,\nlet method:()->Kind=.io\n}\nlet f:(k:Kind)->bool=match k{K.method=>true\n_=>false}", .tag = .unsupported_match_pattern },
-        .{ .source = "let f:(k:Kind)->bool=match k{.not_found=>|x|true\n_=>false}", .tag = .invalid_match_capture },
+        .{ .source = "let f:(k:Kind)->bool=match k{.not_found[x] => true\n_=>false}", .tag = .invalid_match_capture },
         .{ .source = "let f:(k:Kind)->bool=match k{.not_found=>true\n_=>1}", .tag = .literal_type_mismatch },
         .{ .source = "let f:(Kind:Kind)={}", .tag = .unsupported_shadowing },
         .{ .source = "let f:()={let Kind:Kind=.io\n}", .tag = .unsupported_shadowing },

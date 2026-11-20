@@ -68,19 +68,19 @@ let match_and_success_error_propagation: () = {
     let propagated = forward(bad)
     let mut errors = match propagated {
         .ok => @as([]str, [])
-        .err => |items| items
+        .err[items] => items
     }
     errors[0] = "changed"
     @assert(
         match bad {
             .ok => false
-            .err => |items| items[0] == "bad!"
+            .err[items] => items[0] == "bad!"
         }
     )
     @assert(
         match propagated {
             .ok => false
-            .err => |items| items[0] == "bad!"
+            .err[items] => items[0] == "bad!"
         }
     )
 }
@@ -93,7 +93,7 @@ let nested_strings_and_arrays_of_unions: () = {
     let items: []Payload = [payload, .numbers[[1, 2]], .none[]]
     words[0] = ["source"]
     let mut extracted = match payload {
-        .words => |rows| rows
+        .words[rows] => rows
         .numbers => @as([][]str, [])
         .none => @as([][]str, [])
     }
@@ -238,7 +238,7 @@ let main: () = {
         "Error:",
         match forward(bad) {
             .ok => @as([]str, [])
-            .err => |items| items
+            .err[items] => items
         }
     )
 }

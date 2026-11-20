@@ -19,7 +19,7 @@ let Option: (T: type) -> type = union {
 
     @[public]
     let map: (self: Self, convert: (T) -> `U) -> Option(`U) = match self {
-        .some => |value| .some[convert(value)]
+        .some[value] => .some[convert(value)]
         .none => .none[]
     }
 
@@ -31,13 +31,13 @@ let Option: (T: type) -> type = union {
 
     @[public]
     let unwrapOr: (self: Self, fallback: T) -> T = match self {
-        .some => |value| value
+        .some[value] => value
         .none => fallback
     }
 
     @[public]
     let unwrapOrElse: (self: Self, fallback: () -> T) -> T = match self {
-        .some => |value| value
+        .some[value] => value
         .none => fallback()
     }
 }

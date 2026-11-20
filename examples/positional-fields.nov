@@ -44,12 +44,12 @@ let snapshots: () = {
     @assert(saved.0[0][0] == 1 and @len(saved.0) == 2)
     @assert(record.0[0][0] == 8 and @len(record.0) == 3)
     let mut extracted = match record.1 {
-        .some => |value| value
+        .some[value] => value
         .none => [[0]]
     }
     extracted[0] = [7]
     let again = match saved.1 {
-        .some => |value| value
+        .some[value] => value
         .none => [[0]]
     }
     @assert(again[0][0] == 1 and again[0][1] == 2)

@@ -424,8 +424,24 @@ test "generic union signatures instantiations and propagation format idempotentl
 }
 
 test "unions constructors captures and payloadless variants format idempotently" {
-    try expectFormatted("let U=union{ok:int,err:str,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.err=>0\n.none=>1}\nlet g:()->U=.none[]", "let U = union {\n    ok: int,\n    err: str,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .err => 0\n    .none => 1\n}\nlet g: () -> U = .none[]\n");
-    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}"});
+    try expectFormatted("let U=union{ok:int,err:str,none,}\nlet f:(u:U)->int=match u{.ok[v] => v\n.err=>0\n.none=>1}\nlet g:()->U=.none[]", "let U = union {\n    ok: int,\n    err: str,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok[v] => v\n    .err => 0\n    .none => 1\n}\nlet g: () -> U = .none[]\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok[v] => v\n.none=>0}"});
+}
+
+test "match bracket captures preserve comments and reject removed syntax" {
+    try expectFormatted("let f:(u:U)=match u{.ok[ value ]=>@println(value)\n.err[error]=>@println(error)\n.none=>{}}", "let f: (u: U) = match u {\n    .ok[value] => @println(value)\n    .err[error] => @println(error)\n    .none => {}\n}\n");
+    for ([_][:0]const u8{
+        "let f=match u{.ok[; capture\nvalue]=>value\n_=>0}",
+        "let f=match u{.ok ; variant\n[\nvalue]=>value\n_=>0}",
+        "let f=match u{.ok[\nvalue ; binding\n]=>value\n_=>0}",
+        "let f=match u{.ok[value],true=>value\n_=>0}",
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+    try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, "let f=match u{.ok=>|value|value\n_=>0}"));
 }
 
 test "test attributes and assert arguments format and survive OOM" {
@@ -1074,7 +1090,7 @@ test "stringify formatting preserves argument free attributes and arbitrary meth
 }
 
 test "record interpolation formatting preserves captures aliases conversions and allocation cleanup" {
-    const source = "let Alias=Error\nlet Error=struct{s:str,\n@[stringify]\nlet toString:(e:Alias)->str=e.s\n}\nlet U=union{err:Error,}\nlet f:(u:U)=match u{.err=>|err|@panic(\"Error: {err}\")}\nlet g:(e:Alias)->str=\"{e} {Error.toString(e)} {e}\"";
+    const source = "let Alias=Error\nlet Error=struct{s:str,\n@[stringify]\nlet toString:(e:Alias)->str=e.s\n}\nlet U=union{err:Error,}\nlet f:(u:U)=match u{.err[err] => @panic(\"Error: {err}\")}\nlet g:(e:Alias)->str=\"{e} {Error.toString(e)} {e}\"";
     const formatted = try format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
     try expectFormatted(source, formatted);

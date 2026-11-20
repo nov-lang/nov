@@ -81,13 +81,13 @@ let payload_and_control_flow: () = {
     let original = tree()
     let wrapped = Payload.some[original]
     let mut extracted = match wrapped {
-        .some => |value| value
+        .some[value] => value
         .none => tree()
     }
     extracted.records = [leaf(9)]
     extracted.leaf.values[0] = 8
     let again = match wrapped {
-        .some => |value| value
+        .some[value] => value
         .none => tree()
     }
     @assert(again.leaf.values[0] == 1 and again.records[0].values[0] == 3)

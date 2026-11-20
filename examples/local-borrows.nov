@@ -68,7 +68,7 @@ let main: () = {
     resultView.* = .count[7]
     @println(
         match resultView.* {
-            .count => |number| number
+            .count[number] => number
             .empty => @as(uint, 0)
         }
     )

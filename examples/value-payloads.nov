@@ -27,8 +27,8 @@ let Custom = union {
 
     @[stringify]
     let format: (value: Custom) -> str = match value {
-        .function => |callback| "callback:{callback(4)}"
-        .range => |range| {
+        .function[callback] => "callback:{callback(4)}"
+        .range[range] => {
             let mut count = 0
             loop n in range {
                 count += 1
@@ -90,7 +90,7 @@ let callable_constructors_match_and_propagation: () = {
     let copy = echo(plain)
     @assert(
         match copy {
-            .function => |callback| callback(5) == 6
+            .function[callback] => callback(5) == 6
             .none => false
         }
     )
@@ -100,14 +100,14 @@ let callable_constructors_match_and_propagation: () = {
     @assert(
         match callResult(bad) {
             .ok => false
-            .err => |message| message == "missing"
+            .err[message] => message == "missing"
         }
     )
     let nested = nestedLayer(.some[good])
     @assert(
         match nested {
-            .some => |inner| match inner {
-                .ok => |callback| callback(8) == 9
+            .some[inner] => match inner {
+                .ok[callback] => callback(8) == 9
                 .err => false
             }
             .none => false
@@ -126,7 +126,7 @@ let escaping_shared_cells_and_overwritten_owner: () = {
     }
     @assert(owner.isNone() and @len(pressure) == 256)
     let callback = match copy {
-        .some => |function| function
+        .some[function] => function
         .none => increment
     }
     @assert(callback(1) == 1)
@@ -162,7 +162,7 @@ let creation_snapshots_and_later_copies: () = {
     let copied = rows
     @assert(
         match copied[0][0] {
-            .function => |callback| callback(2) == 3
+            .function[callback] => callback(2) == 3
             .none => false
         }
     )
@@ -179,7 +179,7 @@ let range_copies_exact_bounds_and_inclusive_max: () = {
     end = 9
     owner = .signed[start..=end]
     let range = match saved {
-        .signed => |value| value
+        .signed[value] => value
         .unsigned => @as(int, 0)..0
         .none => @as(int, 0)..0
     }
@@ -200,13 +200,13 @@ let range_copies_exact_bounds_and_inclusive_max: () = {
     let mut unsignedCount = 0
     loop edge in edges {
         match edge {
-            .signed => |value| {
+            .signed[value] => {
                 loop n in value {
                     @assert(n == signedMax)
                     signedCount += 1
                 }
             }
-            .unsigned => |value| {
+            .unsigned[value] => {
                 loop n in value {
                     @assert(n == unsignedMax)
                     unsignedCount += 1
@@ -291,7 +291,7 @@ let find_and_map_function_and_range_results: () = {
     @assert(
         match errorFunction {
             .ok => false
-            .err => |callback| callback() == "saved"
+            .err[callback] => callback() == "saved"
         }
     )
     let none: Option(int) = .none[]

@@ -164,7 +164,7 @@ let functions_ranges_and_unions: () = {
     payload.* = .count[7]
     @assert(
         match payload.* {
-            .count => |n| n == 7
+            .count[n] => n == 7
             .empty => false
         }
     )

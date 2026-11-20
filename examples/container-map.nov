@@ -63,7 +63,7 @@ let result_variants_and_shared_captures: () = {
     @assert(
         match unchanged {
             .ok => false
-            .err => |error| error == "missing"
+            .err[error] => error == "missing"
         }
     )
     let converted: Result(int, uint) = bad.mapErr(
@@ -76,7 +76,7 @@ let result_variants_and_shared_captures: () = {
     @assert(
         match converted {
             .ok => false
-            .err => |error| error == 7
+            .err[error] => error == 7
         }
     )
     let untouched = Result(int, str).mapErr(
@@ -118,7 +118,7 @@ let result_variants_and_shared_captures: () = {
     @assert(
         match canonicalDefault {
             .ok => false
-            .err => |error| error == 42
+            .err[error] => error == 42
         }
     )
 }
@@ -215,18 +215,18 @@ let record_payloads_and_recursive_array_copies: () = {
     @assert(
         match mappedError {
             .ok => false
-            .err => |error| error.values[1][0] == 3
+            .err[error] => error.values[1][0] == 3
         }
     )
     let mut errorCopy = match propagatedError {
         .ok => fallback
-        .err => |error| error
+        .err[error] => error
     }
     errorCopy.values[0] = [6]
     @assert(
         match propagatedError {
             .ok => false
-            .err => |error| error.values[0][0] == 1
+            .err[error] => error.values[0][0] == 1
         }
     )
     @assert(good.unwrapOr(fallback).values[0][0] == 1)
@@ -289,7 +289,7 @@ let inactive_callbacks_and_chained_maps: () = {
     @assert(
         match unchanged {
             .ok => false
-            .err => |error| error == "mapped:bad"
+            .err[error] => error == "mapped:bad"
         }
     )
 }
@@ -328,7 +328,7 @@ let chained_container_operations: () = {
     @assert(
         match original {
             .ok => false
-            .err => |error| error == "original"
+            .err[error] => error == "original"
         }
     )
     let failure: Result(int, str) = .ok[0]
@@ -336,7 +336,7 @@ let chained_container_operations: () = {
     @assert(
         match changed {
             .ok => false
-            .err => |error| error == "nonpositive"
+            .err[error] => error == "nonpositive"
         }
     )
     @assert(calls == 4)
@@ -425,7 +425,7 @@ let main: () = {
     @println(
         match error {
             .ok => "unexpected success"
-            .err => |message| message
+            .err[message] => message
         }
     )
 }

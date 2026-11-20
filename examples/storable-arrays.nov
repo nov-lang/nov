@@ -101,7 +101,7 @@ let union_active_payload_copies: () = {
     let saved = items
     source.values[0] = "source"
     let mut extracted = match items[0] {
-        .row => |row| row
+        .row[row] => row
         .text => Row.[ values = [] ]
         .none => Row.[ values = [] ]
     }
@@ -110,21 +110,21 @@ let union_active_payload_copies: () = {
     extracted.values[0] = "later"
     @assert(
         match saved[0] {
-            .row => |row| row.values[0] == "old!"
+            .row[row] => row.values[0] == "old!"
             .text => false
             .none => false
         }
     )
     @assert(
         match items[0] {
-            .row => |row| row.values[0] == "new"
+            .row[row] => row.values[0] == "new"
             .text => false
             .none => false
         }
     )
     @assert(
         match saved[1] {
-            .text => |text| text == "hello"
+            .text[text] => text == "hello"
             .row => false
             .none => false
         }

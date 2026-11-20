@@ -96,7 +96,7 @@ let Outcome = union {
     @[operator(.equal)]
     let equal: (left: Outcome, right: Outcome) -> bool = {
         let number: (item: Outcome) -> int = match item {
-            .value => |value| value
+            .value[value] => value
             .empty => 0
         }
         number(left) == number(right)

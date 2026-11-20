@@ -6,14 +6,14 @@ let openFile: (path: str) -> Result(File, File.Error) = {
 
     ; the .! operator does the same as
     ; let file = match File.open(path) {
-    ;     .ok => |f| f
-    ;     .err => |err| return .err[err]
+    ;     .ok[f] => f
+    ;     .err[err] => return .err[err]
     ; }
 
     ; we can also handle specific errors differently
     ; let file = match File.open(path) {
-    ;     .ok => |f| f
-    ;     .err => |err| match err.kind {
+    ;     .ok[f] => f
+    ;     .err[err] => match err.kind {
     ;         .not_found => {
     ;             ; do something
     ;         },
@@ -26,8 +26,8 @@ let openFile: (path: str) -> Result(File, File.Error) = {
 
 let main: () -> void = {
     let file = match openFile("file.txt") {
-        .ok => |f| f
-        .err => |err| @panic("Error: {err}") ; can't return error from main
+        .ok[f] => f
+        .err[err] => @panic("Error: {err}") ; can't return error from main
     }
 
     ; TODO: write file to stdout

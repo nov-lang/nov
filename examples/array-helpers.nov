@@ -150,7 +150,7 @@ let recursive_array_record_and_union_copies: () = {
     unions[0] = .none[]
     @assert(
         match kept[0] {
-            .row => |value| value.values[0][0] == 1
+            .row[value] => value.values[0][0] == 1
             .none => false
         }
     )

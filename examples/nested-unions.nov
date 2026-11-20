@@ -36,8 +36,8 @@ let Envelope = union {
 let echo: (value: Outer) -> Outer = value
 
 let words: (value: Outer) -> [][]str = match value {
-    .inner => |inner| match inner {
-        .some => |rows| rows
+    .inner[inner] => match inner {
+        .some[rows] => rows
         .none => @as([][]str, [])
     }
     .none => @as([][]str, [])
@@ -67,12 +67,12 @@ let twoResults: (value: Result(Result(int, str), str)) -> Result(int, str) = {
 let contextual_constructors_and_single_layer_matches: () = {
     let value: Outer = .inner[.some[[["hello"], []]]]
     let bound: Inner = match value {
-        .inner => |inner| inner
+        .inner[inner] => inner
         .none => .none[]
     }
     @assert(
         match bound {
-            .some => |rows| rows[0][0] == "hello" and @len(rows[1]) == 0
+            .some[rows] => rows[0][0] == "hello" and @len(rows[1]) == 0
             .none => false
         }
     )
@@ -103,13 +103,13 @@ let propagation_preserves_each_family_layer: () = {
     @assert(
         match twoResults(.ok[.err["inner"]]) {
             .ok => false
-            .err => |error| error == "inner"
+            .err[error] => error == "inner"
         }
     )
     @assert(
         match twoResults(.err["outer"]) {
             .ok => false
-            .err => |error| error == "outer"
+            .err[error] => error == "outer"
         }
     )
 }
@@ -137,14 +137,14 @@ let recursive_array_storage_is_independent: () = {
     let saved = wrapped
     source[0] = ["again"]
     let mut errors = match saved.unwrapOr(.ok[[]]) {
-        .ok => |rows| rows
-        .err => |rows| rows
+        .ok[rows] => rows
+        .err[rows] => rows
     }
     errors[0] = ["detached"]
     @assert(
         match wrapped.unwrapOr(.ok[[]]) {
             .ok => false
-            .err => |rows| rows[0][0] == "changed"
+            .err[rows] => rows[0][0] == "changed"
         }
     )
 }
@@ -189,7 +189,7 @@ let mapping_and_search_produce_nested_unions: () = {
     @assert(
         match mapped {
             .ok => false
-            .err => |inner| inner.unwrapOr(0) == 3
+            .err[inner] => inner.unwrapOr(0) == 3
         }
     )
     let present: Option(int) = .some[4]
