@@ -1,0 +1,191 @@
+let std = @import("std")
+
+let Vector = struct {
+    x: f64,
+    y: f64,
+
+    @[operator(.mul)]
+    let scale: (vector: Vector, factor: f64) -> Vector = .[ x = vector.x * factor, y = vector.y * factor ]
+    @[operator(.mul)]
+    let scaleLeft: (factor: f64, vector: Vector) -> Vector = vector * factor
+    @[operator(.mul)]
+    let dot: (left: Vector, right: Vector) -> f64 = left.x * right.x + left.y * right.y
+    @[operator(.neg)]
+    let negativeSum: (vector: Vector) -> f64 = -vector.x - vector.y
+    @[operator(.equal)]
+    let equalsScalar: (vector: Vector, scalar: f64) -> bool = vector.x == scalar and vector.y == scalar
+    @[operator(.equal)]
+    let scalarEquals: (scalar: f64, vector: Vector) -> bool = vector == scalar
+    @[operator(.less_than)]
+    let lessScalar: (vector: Vector, scalar: f64) -> bool = vector.x < scalar
+    @[operator(.less_than)]
+    let scalarLess: (scalar: f64, vector: Vector) -> bool = scalar < vector.x
+}
+
+let main: () = {
+    let vector = Vector.[ x = 1.0, y = 2.0 ]
+    @println("Scaled:", vector * 2.0)
+    @println("Dot:", vector * vector)
+    @println("Scalar on left:", 2.0 * vector)
+}
+
+@[test]
+let mixed_signatures_and_distinct_results: () = {
+    let vector = Vector.[ x = 1.0, y = 2.0 ]
+    @assert(vector * 2.0 == Vector.[ x = 2.0, y = 4.0 ])
+    @assert(2.0 * vector == Vector.[ x = 2.0, y = 4.0 ])
+    @assert(vector * vector == 5.0 and -vector == -3.0)
+    let dot: @TypeOf(vector * vector) = 5.0
+    let scaled: @TypeOf(vector * 2.0) = vector * 2.0
+    @assert(dot == 5.0 and scaled == Vector.[ x = 2.0, y = 4.0 ])
+}
+
+@[test]
+let mixed_equality_preserves_structural_equality: () = {
+    let vector = Vector.[ x = 2.0, y = 2.0 ]
+    @assert(vector == 2.0 and 2.0 == vector)
+    @assert(vector != 3.0 and 3.0 != vector)
+    @assert(vector == .[ x = 2.0, y = 2.0 ])
+    @assert(vector != .[ x = 2.0, y = 3.0 ])
+    @assert([vector] == [Vector.[ x = 2.0, y = 2.0 ]])
+    @assert(vector in [Vector.[ x = 2.0, y = 2.0 ]])
+    let query: @TypeOf(vector == .[ x = 2.0, y = 2.0 ]) = true
+    @assert(query)
+}
+
+@[test]
+let mixed_ordering_resolves_reversed_signatures: () = {
+    let vector = Vector.[ x = 2.0, y = 0.0 ]
+    @assert(vector < 3.0 and vector > 1.0)
+    @assert(1.0 < vector and 3.0 > vector)
+    @assert(vector <= 2.0 and 2.0 >= vector)
+    let mut seen: []int = []
+    let left = () -> Vector {
+        seen += [1]
+        vector
+    }
+    let right = () -> f64 {
+        seen += [2]
+        1.0
+    }
+    @assert(left() > right())
+    @assert(seen == [1, 2])
+}
+
+@[test]
+let compound_results_and_snapshots: () = {
+    let mut vector = Vector.[ x = 1.0, y = 2.0 ]
+    vector *= {
+        vector = Vector.[ x = 99.0, y = 99.0 ]
+        2.0
+    }
+    @assert(vector == Vector.[ x = 2.0, y = 4.0 ])
+    let mut items = [vector]
+    items[0] *= 2.0
+    @assert(items[0] == Vector.[ x = 4.0, y = 8.0 ])
+    let reference = &vector
+    reference.* *= 3.0
+    @assert(vector == Vector.[ x = 6.0, y = 12.0 ])
+}
+
+let multiply: (left: `A, right: `B) -> `C = left * right
+let Box: (T: type) -> type = struct {
+    value: T,
+
+    @[operator(.add)]
+    let add: (box: @This(), value: T) -> T = box.value + value
+    @[operator(.add)]
+    let addLeft: (value: T, box: @This()) -> T = value + box.value
+}
+
+@[test]
+let generic_containers_functions_and_callbacks: () = {
+    let vector = Vector.[ x = 1.0, y = 2.0 ]
+    @assert(multiply(vector, vector) == 5.0)
+    @assert(multiply(2.0, vector) == Vector.[ x = 2.0, y = 4.0 ])
+    @assert(Box(int).[ value = 3 ] + 4 == 7)
+    @assert(4 + Box(int).[ value = 3 ] == 7)
+    @assert(Box(str).[ value = "a" ] + "b" == "ab")
+    let doubled = std.array.map(
+        [vector],
+        (item) {
+            item * 2.0
+        }
+    )
+    @assert(doubled == [Vector.[ x = 2.0, y = 4.0 ]])
+    let dot: @TypeOf(multiply(vector, vector)) = 5.0
+    @assert(dot == 5.0)
+}
+
+let Deferred = struct {
+    value: int,
+
+    @[operator(.add)]
+    let add: (left: Deferred, right: int) -> () -> int = () {
+        left.value + right
+    }
+}
+let combine: (left: `T, right: `U) -> () -> `R = left + right
+let Sink = struct {
+    write: (int),
+
+    @[operator(.add)]
+    let send: (sink: Sink, value: int) = sink.write(value)
+}
+
+@[test]
+let function_and_void_results: () = {
+    let deferred = Deferred.[ value = 3 ]
+    let run = combine(deferred, 4)
+    @assert(run() == 7)
+    let query: @TypeOf(combine(deferred, 4)) = () -> int {
+        9
+    }
+    @assert(query() == 9)
+    let mut total = 0
+    let sink = Sink.[
+        write = (value: int) {
+            total += value
+        }
+    ]
+    sink + 2
+    sink + 3
+    @assert(total == 5)
+}
+
+let Offset = struct {
+    base: uint,
+
+    @[operator(.add)]
+    let plus: (offset: Offset, value: u8) -> str = "{offset.base}:{value}"
+}
+let Choice = enum {
+    first,
+    second,
+}
+let Label = struct {
+    prefix: str,
+
+    @[operator(.add)]
+    let plus: (label: Label, choice: Choice) -> str = "{label.prefix}:{choice}"
+}
+
+@[test]
+let unique_parameter_context_and_unevaluated_queries: () = {
+    let offset = Offset.[ base = 7 ]
+    @assert(offset + 2 == "7:2")
+    let query: @TypeOf(offset + 2) = "query"
+    @assert(query == "query")
+    let label = Label.[ prefix = "pick" ]
+    @assert(label + .second == "pick:Choice.second")
+    let choiceQuery: @TypeOf(label + .second) = "query"
+    @assert(choiceQuery == "query")
+    let mut calls = 0
+    let make = () -> Vector {
+        calls += 1
+        Vector.[ x = 1.0, y = 2.0 ]
+    }
+    let dot: @TypeOf(make() * make()) = 0.0
+    @assert(dot == 0.0 and calls == 0)
+    @assert(make() * make() == 5.0 and calls == 2)
+}

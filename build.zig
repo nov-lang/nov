@@ -147,6 +147,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
     addArrayValueHelperCliTests(b, exe, trivial_tests, "trivial.nov", @embedFile("examples/trivial.nov"), "Swapped: 2 1\nIdentity: 2\nConstant: 2\nFlipped: 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
     test_step.dependOn(trivial_tests);
+    const mixed_operator_tests = b.step("test-cli-mixed-operators", "Run exact mixed-signature operator overload CLI tests");
+    addMixedOperatorCliTests(b, exe, mixed_operator_tests);
+    test_step.dependOn(mixed_operator_tests);
     const operator_tests = b.step("test-cli-operators", "Run nominal operator overload CLI tests");
     addOperatorCliTests(b, exe, operator_tests);
     test_step.dependOn(operator_tests);
@@ -1359,6 +1362,83 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
     }
 }
 
+fn addMixedOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "mixed-operators.nov", @embedFile("examples/mixed-operators.nov"), "Scaled: Vector[ x: 2, y: 4 ]\nDot: 5\nScalar on left: Vector[ x: 2, y: 4 ]\n", "PASS mixed_signatures_and_distinct_results\nPASS mixed_equality_preserves_structural_equality\nPASS mixed_ordering_resolves_reversed_signatures\nPASS compound_results_and_snapshots\nPASS generic_containers_functions_and_callbacks\nPASS function_and_void_results\nPASS unique_parameter_context_and_unevaluated_queries\n7 passed; 0 failed; 7 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("units.nov",
+        \\@[public]
+        \\let Value=struct{n:int,
+        \\@[public]
+        \\@[operator(.add)]
+        \\let plus:(a:Value,b:int)->Value=.[n=a.n+b]
+        \\@[public]
+        \\@[operator(.add)]
+        \\let text:(a:int,b:Value)->str="{a}:{b.n}"
+        \\@[public]
+        \\@[operator(.mul)]
+        \\let product:(a:Value,b:Value)->int=a.n*b.n
+        \\}
+        \\@[public]
+        \\let Secret=struct{n:int,
+        \\@[operator(.mul)]
+        \\let product:(a:int,b:Secret)->int=a*b.n
+        \\}
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let units=@import("units.nov")
+        \\let Alias=units.Value
+        \\let add:(a:`A,b:`B)->`C=a+b
+        \\let main:()={let value=Alias.[n=3]
+        \\@assert(add(value,2)==Alias.[n=5])
+        \\@assert(add(2,value)=="2:3")
+        \\@assert(value*value==9)
+        \\@println("imported mixed operators")}
+        \\
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "imported.nov", "--lib-dir" });
+        run.addDirectoryArg(library);
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("imported mixed operators\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_]struct { source: []const u8, diagnostic: []const u8 }{
+        .{ .source = "let S=struct{\n@[operator(.add)]\nlet first:(a:S,b:int)->S=a\n@[operator(.add)]\nlet second:(a:S,b:int)->int=1\n}\nlet main:()={}", .diagnostic = "duplicate" },
+        .{ .source = "let Alias=int\nlet S=struct{\n@[operator(.add)]\nlet first:(a:S,b:Alias)->int=1\n@[operator(.add)]\nlet second:(a:S,b:int)->int=2\n}\nlet main:()={}", .diagnostic = "duplicate" },
+        .{ .source = "let A=struct{\n@[operator(.add)]\nlet first:(a:A,b:B)->int=1\n}\nlet B=struct{\n@[operator(.add)]\nlet second:(a:A,b:B)->bool=true\n}\nlet main:()={let value:int=A.[]+B.[]\n}", .diagnostic = "ambiguous" },
+        .{ .source = "let S=struct{\n@[operator(.mul)]\nlet dot:(a:S,b:S)->int=1\n}\nlet main:()={let mut value=S.[]\nvalue*=S.[]\n}", .diagnostic = "expected type" },
+        .{ .source = "let S=struct{\n@[operator(.add)]\nlet add:(a:S,b:u8)->S=a\n}\nlet main:()={let n:u16=1\nlet value=S.[]+n\n}", .diagnostic = "not supported" },
+        .{ .source = "let units=@import(\"units.nov\")\nlet main:()={let value=2*units.Secret.[n=3]\n}", .diagnostic = "imported methods require @[public]" },
+        .{ .source = "let S=struct{\n@[operator(.add)]\nlet add:(a:S,b:int)->int=b\n}\nlet main:()={let value=1+S.[]\n}", .diagnostic = "not supported" },
+        .{ .source = "let S=struct{\n@[operator(.equal)]\nlet equal:(a:S,b:int)->bool=true\n}\nlet main:()=@println(1 in [S.[]])", .diagnostic = "literal does not match the annotated type" },
+        .{ .source = "let Box:(T:type)->type=struct{\n@[operator(.add)]\nlet first:(a:@This(),b:T)->int=1\n@[operator(.add)]\nlet second:(a:@This(),b:int)->int=2\n}\nlet main:()={let value=Box(int).[]\n}", .diagnostic = "duplicate" },
+    }, 0..) |case, i| {
+        const path = b.fmt("bad-mixed-operator-{d}.nov", .{i});
+        _ = fixtures.add(path, case.source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            reject.expectStdErrMatch(case.diagnostic);
+            test_step.dependOn(&reject.step);
+        }
+    }
+}
+
 fn addOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     addArrayValueHelperCliTests(b, exe, test_step, "operators.nov", @embedFile("examples/operators.nov"), "Sum: 17\nNegative: -5\nOrdering: true false\nCompound: 17\n", "PASS arithmetic_negation_and_bitwise\nPASS derived_ordering_and_sort\nPASS compound_local_field_element_and_reference_targets\nPASS snapshots_and_compound_rhs_replacement\nPASS generic_hooks_inferred_callbacks_and_queries\nPASS enum_union_and_contextual_literals\nPASS operand_evaluation_precedes_reversed_ordering\n7 passed; 0 failed; 7 total\n");
     const fixtures = b.addWriteFiles();
@@ -1407,7 +1487,7 @@ fn addOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *
         "let S=struct{\n@[operator(.add)]\nlet bad:(a:S)->S=a\n}\nlet main:()={}",
         "let S=struct{\n@[operator(.neg)]\nlet bad:(a:S,b:S)->S=a\n}\nlet main:()={}",
         "let S=struct{\n@[operator(.less_than)]\nlet bad:(a:S,b:S)->S=a\n}\nlet main:()={}",
-        "let S=struct{\n@[operator(.mul)]\nlet bad:(a:S,b:S)->int=1\n}\nlet main:()={}",
+        "let S=struct{\n@[operator(.mul)]\nlet bad:(a:int,b:int)->int=1\n}\nlet main:()={}",
         "let S=struct{}\nlet main:()={let x=S.[]+S.[]\n}",
         "let models=@import(\"models.nov\")\nlet main:()={let x= -models.Value.[n=1]\n}",
         "let models=@import(\"models.nov\")\nlet global=models.Value.[n=1]+models.Value.[n=2]\nlet main:()={}",

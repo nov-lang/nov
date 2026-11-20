@@ -37,15 +37,23 @@ records require the same exact structural type. `!=` negates the same equality
 operation; `value in array` uses it for each candidate, stopping at the first
 match. Strings compare bytes/length, including NUL; floats use IEEE equality
 (NaN unequal even to itself, signed zeroes equal), also when nested.
-Functions/closures, references and ranges have no default equality.
+Functions/closures, references and ranges have no default equality. Direct
+`==` / `!=` also support exact mixed-type hooks; membership still requires the
+needle's exact element type. Same-type structural equality remains unless an
+exact `(Self, Self)` hook replaces it; unrelated mixed equality hooks do not
+block that fallback.
 
-A nominal struct, union or enum can replace its comparison with an ordinary
-immutable non-generic method with a body, marked `@[operator(.equal)]` and typed
-exactly `(T, T) -> bool`. Generic containers may use `@This()` methods. The method
-name is arbitrary. Hooks apply recursively to nested values and membership, and
-can stop traversal before otherwise noncomparable contents. Imported hooks need
-`@[public]`: invalid or inaccessible explicit hooks diagnose rather than falling
-back. Only one overload per operator per nominal container is allowed; the
+A nominal struct, union or enum can declare an ordinary immutable non-generic
+method with a body marked `@[operator(.equal)]`, typed exactly `(A, B) -> bool`.
+At least one parameter must be the exact owner type, including concrete generic
+arguments; generic containers may use `@This()`. An exact self/self hook applies
+recursively to nested values and membership, and can stop traversal before
+otherwise noncomparable contents. Imported matching hooks need `@[public]`:
+a matching private hook diagnoses rather than being ignored. Invalid concrete
+signatures and inaccessible matching nested hooks diagnose rather than falling
+back. Within an owner, one hook per operator and ordered parameter signature is
+allowed; return types cannot distinguish duplicates. Method names are arbitrary
+but must be distinct because ordinary function names are not overloaded. The
 attribute takes one literal tag, cannot repeat, and excludes test/noreturn/extern/export.
 Enum match patterns always use raw tag identity, not the hook.
 
@@ -55,30 +63,41 @@ is not interchangeable. `Operator` declares exactly `equal`, `less_than`, `add`,
 `sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`, `index_mut`, `neg`,
 `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`.
 
-Overloading is in progress beyond equality: implemented hooks are
-`less_than(T, T) -> bool`, `add`/`sub`/`mul`/`div`/`rem` and
-`bit_and`/`bit_or`/`bit_xor` with `(T, T) -> T`, and `neg(T) -> T`.
-These use the same ordinary immutable non-generic methods with bodies, arbitrary
-names, canonical tags and public visibility rules as equality. `T` must be the
-exact enclosing nominal struct/union/enum, including concrete generic arguments;
-`@This()` is allowed. Reference arguments and general mixed operand/result types
-are not supported. Invalid concrete signatures reject even when unused.
+Mixed operand/result hooks are supported: `equal`/`less_than` take `(A, B)` and
+return `bool`; `add`/`sub`/`mul`/`div`/`rem` and `bit_and`/`bit_or`/`bit_xor` take
+`(A, B)` and return any ordinary non-reference type, including `void`. Unary
+`neg(Self)` allows the same return types. These use the same method, canonical-tag
+and visibility rules as equality, with at least one exact owner parameter.
+Reference operands and returns are unsupported in this batch; lifetime support
+is deferred. Invalid concrete signatures reject even when unused.
+
+Binary lookup searches both nominal operand owners for exact ordered parameter
+matches, selecting a unique hook or diagnosing ambiguity without an owner
+preference. No implicit conversions are used. Untyped literals receive unique
+hook parameter context where possible; expected return types never dispatch.
 
 Only `less_than` is needed: `a > b` uses `less_than(b, a)`, `a <= b` uses
 `!less_than(b, a)`, and `a >= b` uses `!less_than(a, b)`, with no independent tags.
+Mixed `>` and `<=` therefore look up the reversed `(B, A)` signature; `>=` uses
+the normal `(A, B)` signature, negated. Source operands still evaluate and are
+snapshotted once left to right before reversal.
 This is boolean-negation derivation, not floating-point partial-order semantics;
 hook authors define the order, and there is no default structural ordering.
-`+=`, `-=`, `*=`, `/=` and `%=` derive from the binary hooks and preserve pre-RHS
+`+=`, `-=`, `*=`, `/=` and `%=` derive from binary hooks whose result must exactly
+match the LHS type: `Vector *= float` may use `mul(Vector, float) -> Vector`, but
+`mul(Vec, Vec) -> float` cannot implement `Vec *= Vec`. Compounds preserve pre-RHS
 LHS/target snapshots like builtins; their final store may overwrite RHS
 reassignment. Operands evaluate once, left to right. Hooks are ordinary calls
 that may allocate, mutate or panic; readonly `@TypeOf` validates without running
-hooks or publishing specializations. Equality and membership are unchanged.
+hooks or publishing specializations. Direct mixed equality and exact-element-type
+membership follow the rules above.
 
 `shl`, `shr`, `try`, `deref`, `deref_mut`, `index` and `index_mut` remain reserved
 and diagnose unsupported overloads; no shifts are implemented. There is no
 separate inequality hook. See [`examples/operators.nov`](../examples/operators.nov)
 for seven tests covering a scalar `Number`, generics, compound targets,
-evaluation/snapshots, and enum/union hooks.
+evaluation/snapshots, and enum/union hooks. See
+[`examples/mixed-operators.nov`](../examples/mixed-operators.nov) for mixed operators.
 See [Value equality](../README.md#value-equality) and
 [Operator Overloading](../README.md#operator-overloading) for the full contract.
 

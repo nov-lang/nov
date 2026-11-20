@@ -72,13 +72,13 @@ fn testOperatorDiagnostics(allocator: std.mem.Allocator) !void {
     defer module.deinit();
     const first = module.getDeclaration(module.lookup("first").?).?.name_span;
     const second = module.getDeclaration(module.lookup("second").?).?.name_span;
-    for ([_]Module.Diagnostic.Tag{ .invalid_operator_declaration, .duplicate_operator, .invalid_operator_signature, .unsupported_operator }) |tag| {
-        try module.diagnostics.append(allocator, .{ .tag = tag, .span = second, .related = if (tag == .duplicate_operator) first else null });
+    for ([_]Module.Diagnostic.Tag{ .invalid_operator_declaration, .duplicate_operator, .ambiguous_operator, .invalid_operator_signature, .unsupported_operator }) |tag| {
+        try module.diagnostics.append(allocator, .{ .tag = tag, .span = second, .related = if (tag == .duplicate_operator or tag == .ambiguous_operator) first else null });
     }
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
     renderModule(&module, &out.writer) catch return error.OutOfMemory;
-    for ([_][]const u8{ "@[operator(Operator)]", "only one overload per operator", "(SelfType, SelfType) -> bool", "neg (SelfType) -> SelfType", "unsupported operator overload; shl/shr (shifts)", "supported tags: equal, less_than, add, sub, mul, div, rem, bit_and, bit_or, bit_xor, neg", "operators.nov:1:5: note:" }) |text| {
+    for ([_][]const u8{ "@[operator(Operator)]", "same ordered parameter types", "operator overload is ambiguous for these operand types", "other matching overload is here", "equal/less_than must return bool", "neg takes one SelfType parameter", "unsupported operator overload; shl/shr (shifts)", "supported tags: equal, less_than, add, sub, mul, div, rem, bit_and, bit_or, bit_xor, neg", "operators.nov:1:5: note:" }) |text| {
         try std.testing.expect(std.mem.indexOf(u8, out.written(), text) != null);
     }
 }
@@ -168,8 +168,9 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_stringify_declaration => try writer.writeAll("@[stringify] requires an ordinary immutable container method with a body, takes no arguments, cannot be repeated, and cannot be combined with test, noreturn, extern or export"),
             .duplicate_stringifier => try writer.writeAll("only one @[stringify] method is allowed per container"),
             .invalid_operator_declaration => try writer.writeAll("@[operator(Operator)] requires one literal std.builtin.Operator tag and an ordinary immutable non-generic container method with a body; cannot be repeated or combined with test, noreturn, extern or export"),
-            .duplicate_operator => try writer.writeAll("only one overload per operator is allowed per nominal container"),
-            .invalid_operator_signature => try writer.writeAll("@[operator] method must be accessible with exact signature: equal/less_than (SelfType, SelfType) -> bool; add/sub/mul/div/rem/bit_and/bit_or/bit_xor (SelfType, SelfType) -> SelfType; neg (SelfType) -> SelfType; imported methods require @[public]"),
+            .duplicate_operator => try writer.writeAll("duplicate operator overload with the same ordered parameter types in this nominal container; return types do not distinguish overloads"),
+            .ambiguous_operator => try writer.writeAll("operator overload is ambiguous for these operand types"),
+            .invalid_operator_signature => try writer.writeAll("@[operator] method requires exact non-reference operand types: binary hooks take two parameters, at least one exactly SelfType; neg takes one SelfType parameter; equal/less_than must return bool; other hooks may return any ordinary non-reference function result, including void; imported methods require @[public]"),
             .unsupported_operator => try writer.writeAll("unsupported operator overload; shl/shr (shifts), try, deref/deref_mut and index/index_mut are deferred; supported tags: equal, less_than, add, sub, mul, div, rem, bit_and, bit_or, bit_xor, neg"),
             .duplicate_name => try writer.print("duplicate declaration '{s}'", .{source.slice(diagnostic.span).?}),
             .unknown_name => try writer.print("unknown name '{s}'", .{source.slice(diagnostic.span).?}),
@@ -233,7 +234,8 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         const note: ?[]const u8 = switch (diagnostic.tag) {
             .borrow_conflict, .borrow_escape => "borrow originates here",
             .duplicate_name => "first declaration here",
-            .duplicate_operator => "first overload of this operator here",
+            .duplicate_operator => "first overload with these parameter types here",
+            .ambiguous_operator => "other matching overload is here",
             .duplicate_export_name => "first export of this symbol here",
             .conflicting_foreign_signature => "first declaration of this foreign symbol here",
             .value_cycle, .type_alias_cycle => "declaration in this cycle",

@@ -61,57 +61,78 @@ results. See `examples/array-fields.nov`.
 ## Current delivered status
 
 Structural value equality and explicit nominal equality hooks are delivered.
-`==` / `!=` require exact operand types: arrays compare length then elements,
+Default `==` / `!=` require exact operand types; direct comparisons also support
+exact mixed-type equality hooks. Arrays compare length then elements,
 records compare fields, unions compare active tags and payloads, and enums compare
 raw tags by default. Nominal structs/unions/enums require exact identity, including
 generic arguments; anonymous records require the same exact structural type.
 Recursive traversal uses nested hooks and short-circuits at the first difference.
-Array membership uses the same equality. Floats retain IEEE semantics (NaN unequal,
-signed zeroes equal), including inside aggregates. Functions/closures, references
+Array membership uses the same equality but still requires the needle's exact
+element type; mixed direct equality does not broaden membership. Same-type
+structural equality remains unless an exact `(Self, Self)` hook replaces it;
+unrelated mixed equality hooks do not block it. Floats retain IEEE semantics
+(NaN unequal, signed zeroes equal), including inside aggregates. Functions/closures, references
 and ranges have no default equality; enclosing nominal hooks can stop structural
 traversal before noncomparable contents.
 
 `@[operator(.equal)]` or a literal qualified canonical
 `std.builtin.Operator.equal` selects an ordinary immutable non-generic nominal
-method with a body and exact `(T, T) -> bool` signature. Generic containers may
-use `@This()` methods. One overload per operator per nominal container is allowed;
-duplicate/malformed attributes and test/noreturn/extern/export combinations reject.
+method with a body and exact `(A, B) -> bool` signature. At least one parameter
+must be the exact nominal owner type, including concrete generic arguments;
+generic containers may use `@This()` methods. Within each owner, one hook per
+operator and ordered parameter signature is allowed; return types cannot
+distinguish duplicates. Methods need distinct names because ordinary function
+names are not overloaded. Duplicate/malformed attributes and
+test/noreturn/extern/export combinations reject.
 Qualified arguments must resolve to the canonical builtin enum, not another enum
 with a matching tag. Private visibility is honored; imported hooks require
-`@[public]`, and invalid/inaccessible nested hooks diagnose rather than falling
-back. `!=` negates equality; it has no separate hook. Enum match patterns always
-use raw identity, bypassing hooks. `std.builtin.Operator` exposes exactly `equal`,
+`@[public]`. A matching private imported hook diagnoses rather than being ignored;
+invalid concrete signatures and inaccessible matching nested hooks also diagnose
+rather than falling back. `!=` negates equality; it has no separate hook.
+Enum match patterns always use raw identity, bypassing hooks. `std.builtin.Operator` exposes exactly `equal`,
 `less_than`, `add`, `sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`,
 `index_mut`, `neg`, `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`.
 
-Operator overloading is in progress beyond equality. Implemented:
-- `less_than(T, T) -> bool`;
-- `add`, `sub`, `mul`, `div`, `rem`, `bit_and`, `bit_or`, `bit_xor`: `(T, T) -> T`;
-- `neg(T) -> T`.
+Mixed operand/result operator hooks are delivered for:
+- `equal`, `less_than`: `(A, B) -> bool`;
+- `add`, `sub`, `mul`, `div`, `rem`, `bit_and`, `bit_or`, `bit_xor`: `(A, B) -> R`;
+- `neg`: `(Self) -> R`.
 
 These hooks follow the same ordinary immutable non-generic method-with-body,
-arbitrary-name, canonical-tag and public-visibility rules. `T` is the exact
-owning nominal struct/union/enum; concrete hooks on generic containers may use
-`@This()`. No reference arguments or general mixed operand/result types are
-supported. Invalid concrete signatures reject even when unused.
+canonical-tag and public-visibility rules. At least one parameter is the exact
+owning nominal struct/union/enum; the other binary parameter may differ. `R` may
+be any ordinary non-reference return type, including `void`. Reference operands
+and returns are unsupported in this batch; lifetime support is deferred.
+Invalid concrete signatures reject even when unused.
+
+Both nominal operand owners are searched for exact ordered parameter matches.
+A unique hook is selected; multiple matches diagnose ambiguity with no owner
+preference. No implicit conversions are used. Untyped literals receive unique
+hook parameter context where possible; expected return types never dispatch.
 
 Only `less_than` is required: `a > b` is `less_than(b, a)`, `a <= b` is
 `!less_than(b, a)`, and `a >= b` is `!less_than(a, b)`; no independent tags exist.
+For mixed operands, `>` and `<=` look up the reversed `(B, A)` signature; `>=`
+uses the normal `(A, B)` signature, negated. Source operands are still evaluated
+and snapshotted once left to right before argument reversal.
 This boolean-negation derivation is not floating-point partial-order semantics.
 Hook authors are responsible for their order; there is no default structural
 ordering. `+=`, `-=`, `*=`, `/=` and `%=` derive from the corresponding binary
-hooks. Operands evaluate once, left to right; compound assignment preserves the
-pre-RHS LHS value and target snapshots like builtins, and may overwrite an RHS
+hooks, with a result exactly matching the LHS type: `Vector *= float` may use
+`mul(Vector, float) -> Vector`, while `mul(Vec, Vec) -> float` cannot implement
+`Vec *= Vec`. Operands evaluate once, left to right; compound assignment preserves
+the pre-RHS LHS value and target snapshots like builtins, and may overwrite an RHS
 reassignment. Hooks are ordinary calls that may allocate, mutate or panic.
 Readonly `@TypeOf` validates without running hooks or publishing specializations.
-Existing equality and membership behavior is unchanged.
+Direct mixed equality and exact-element-type membership follow the rules above.
 
 `shl`, `shr`, `try`, `deref`, `deref_mut`, `index` and `index_mut` remain reserved
 and unsupported as overloads; no shifts are implemented.
 `examples/operators.nov` has seven tests covering a scalar `Number`, generic
 containers, compound targets, evaluation/snapshots, and enum/union hooks.
 `test-cli-operators` checks all three C modes, relocated stdlib imports and
-semantic/emit-C rejection cases.
+semantic/emit-C rejection cases. See `examples/mixed-operators.nov` for mixed
+operators.
 
 `nov test --filter <text>` selects case-sensitive name substrings before semantic
 checking, in source order. Unselected semantic demands are ignored; syntax/attribute

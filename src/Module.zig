@@ -61,7 +61,7 @@ pub const Operator = enum {
         };
     }
 
-    /// Supported comparison hooks return bool; all other supported hooks return SelfType.
+    /// Supported comparison hooks require bool; other hooks use ordinary function results.
     pub fn returnsBool(self: Operator) bool {
         return self == .equal or self == .less_than;
     }
@@ -228,6 +228,7 @@ pub const Diagnostic = struct {
         duplicate_stringifier,
         invalid_operator_declaration,
         duplicate_operator,
+        ambiguous_operator,
         invalid_operator_signature,
         unsupported_operator,
         invalid_method_receiver,
@@ -597,6 +598,8 @@ pub fn lookupOperator(self: *const Module, container: DeclId, operator: Operator
     return self.lookupConcreteOperator(container, null, operator);
 }
 
+/// Returns only the first candidate. Overload resolution must enumerate declarations
+/// matching container, concrete_type and operator, then compare exact operand types.
 pub fn lookupConcreteOperator(self: *const Module, container: DeclId, concrete_type: ?u32, operator: Operator) ?DeclId {
     for (self.declarations.items, 0..) |decl, i| if (decl.container == container and decl.concrete_type == concrete_type and decl.operator == operator) return @fromBackingInt(@intCast(i));
     return null;
@@ -761,10 +764,6 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         if (operator_seen) {
             if (container == null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or is_test or noreturn_annotation or export_seen or extern_seen or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null) {
                 try self.diagnostics.append(self.allocator, .{ .tag = .invalid_operator_declaration, .span = name_span });
-            } else if (operator) |kind| {
-                if (self.lookupOperator(container.?, kind)) |previous| {
-                    try self.diagnostics.append(self.allocator, .{ .tag = .duplicate_operator, .span = name_span, .related = self.getDeclaration(previous).?.name_span });
-                }
             }
         }
         try self.declarations.append(self.allocator, .{ .operator = operator, .operator_arg = operator_arg, .stringify = stringify, .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
@@ -808,7 +807,7 @@ test "operator metadata selects nominal and concrete candidates and defers quali
     try std.testing.expectEqualStrings("Other.equal", pending.source.ast.getNodeSource(candidate.operator_arg.?));
 }
 
-test "operator recognizes supported nominal tags and reserves each independently" {
+test "operator collects supported tags and defers duplicate signatures to sema" {
     for (std.meta.tags(Operator)) |operator| {
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let S=struct{{\n@[operator(.{s})]\nlet method:(a:S,b:S)->bool=true\n}}", .{@tagName(operator)}, 0);
         defer std.testing.allocator.free(source);
@@ -823,11 +822,8 @@ test "operator recognizes supported nominal tags and reserves each independently
     const source = "let S=struct{\n@[operator(.equal)]\nlet first:(a:S,b:S)->bool=true\n@[operator(.add)]\nlet plus:(a:S,b:S)->S=a\n@[operator(.equal)]\nlet second:(a:S,b:S)->bool=false\n}";
     var module = try Module.init(std.testing.allocator, "duplicate.nov", source);
     defer module.deinit();
-    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-    const diagnostic = module.diagnostics.items[0];
-    try std.testing.expectEqual(Diagnostic.Tag.duplicate_operator, diagnostic.tag);
-    try std.testing.expectEqualStrings("second", module.sourceSlice(diagnostic.span).?);
-    try std.testing.expectEqualStrings("first", module.sourceSlice(diagnostic.related.?).?);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expectEqualStrings("first", module.getDeclaration(module.lookupOperator(module.lookup("S").?, .equal).?).?.name);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 

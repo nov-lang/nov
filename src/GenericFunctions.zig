@@ -1442,6 +1442,7 @@ fn testStructuralEqualityQuery(allocator: std.mem.Allocator, source: [:0]const u
         try std.testing.expect(result != null);
         try std.testing.expect(ir.getType(result.?).? == .boolean);
     } else {
+        if (result != null) std.debug.print("unexpected valid equality query: {s}\n", .{source});
         try std.testing.expect(result == null);
         try std.testing.expect(module.hasErrors());
     }
@@ -1719,7 +1720,7 @@ test "clear query rejects invalid places types and arity" {
     }
 }
 
-const OperatorQueryResult = enum { nominal, boolean, unit, integer, float, string, invalid };
+const OperatorQueryResult = enum { nominal, boolean, unit, integer, float, string, function, invalid };
 
 fn testNominalOperatorQuery(allocator: std.mem.Allocator, source: [:0]const u8, expected: OperatorQueryResult) !void {
     var module = try Module.init(allocator, "nominal-operator-query.nov", source);
@@ -1752,6 +1753,7 @@ fn testNominalOperatorQuery(allocator: std.mem.Allocator, source: [:0]const u8, 
         .integer => ty == .integer,
         .float => ty == .float,
         .string => ty == .string,
+        .function => ty == .function,
         .invalid => unreachable,
     });
 }
@@ -1788,7 +1790,7 @@ test "nominal operator solver exact signatures unsupported protocols and scalar 
     for ([_]struct { source: [:0]const u8, result: OperatorQueryResult = .invalid }{
         .{ .source = "let S=struct{x:int,}\nlet query=S.[x=1]+S.[x=2]" },
         .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:&S,b:&S)->S=unresolved\n}\nlet query=S.[x=1]+S.[x=2]" },
-        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->int=unresolved\n}\nlet query=S.[x=1]+S.[x=2]" },
+        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->int=unresolved\n}\nlet query=S.[x=1]+S.[x=2]", .result = .integer },
         .{ .source = "let S=struct{x:int,\n@[operator(.less_than)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=S.[x=1]<S.[x=2]" },
         .{ .source = "let S=struct{x:int,\n@[operator(.neg)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=-S.[x=1]" },
         .{ .source = "let Other=enum{add,}\nlet S=struct{x:int,\n@[operator(Other.add)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=S.[x=1]+S.[x=2]" },
@@ -1815,7 +1817,7 @@ test "nominal operator solver readonly TypeOf contextual operands and closure qu
         .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.add)]\nlet hook:(a:@This(),b:@This())->@This()=unresolved\n}\nlet query={let x=Box(int).[value=1]\nlet f=(a:Box(int)){a+a}\nf(x)}", .result = .nominal },
         .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.add)]\nlet hook:(a:@This(),b:@This())->@This()=unresolved\n}\nlet apply:(f:(`T)->`U,x:`T)->`U=unresolved\nlet query=apply((a){a+a},Box(int).[value=1])", .result = .nominal },
         .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=@as(@TypeOf(S.[x=1]+S.[x=2]),S.[x=3])", .result = .nominal },
-        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->int=unresolved\n}\nlet query={let x=S.[x=1]\nlet f=(a:S){a+a}\nf(x)}", .result = .invalid },
+        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->int=unresolved\n}\nlet query={let x=S.[x=1]\nlet f=(a:S){a+a}\nf(x)}", .result = .integer },
         .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.add)]\nlet hook:(a:@This(),b:@This())->@This()=unresolved\n}\nlet query=Box(int).[value=1]+Box(bool).[value=true]", .result = .invalid },
     }) |case| {
         try testNominalOperatorQuery(std.testing.allocator, case.source, case.result);
@@ -1897,6 +1899,344 @@ test "nominal operator solver generic contextual inferred closures and TypeOf un
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorInference, .{});
 }
 
+test "mixed operator solver ordered signatures arbitrary results and readonly OOM" {
+    for ([_]struct { source: [:0]const u8, result: OperatorQueryResult }{
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet hook:(a:S,b:int)->str=unresolved\n}\nlet query=S.[x=1]+2", .result = .string },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet hook:(a:int,b:S)->str=unresolved\n}\nlet query=2+S.[x=1]", .result = .string },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet hook:(a:S,b:u8)->str=unresolved\n}\nlet query=S.[x=1]+2", .result = .string },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet integer:(a:S,b:int)->str=unresolved\n@[operator(.add)]\nlet boolean:(a:S,b:bool)->int=unresolved\n}\nlet query=S.[x=1]+true", .result = .integer },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet integer:(a:S,b:int)->str=unresolved\n@[operator(.add)]\nlet byte:(a:S,b:u8)->bool=unresolved\n}\nlet query=S.[x=1]+2", .result = .string },
+        .{ .source = "let S=struct{x:int,@[operator(.neg)]\nlet hook:(a:S)->[]int=unresolved\n}\nlet query=@len(-S.[x=1])", .result = .integer },
+        .{ .source = "let R=struct{value:bool,}\nlet S=struct{x:int,@[operator(.add)]\nlet hook:(a:S,b:int)->R=unresolved\n}\nlet query={let value=S.[x=1]+2\nvalue.value}", .result = .boolean },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet integer:(a:S,b:int)->str=unresolved\n@[operator(.add)]\nlet byte:(a:S,b:u8)->bool=unresolved\n}\nlet query=@as(bool,S.[x=1]+2)", .result = .invalid },
+        .{ .source = "let E=enum{one,two,}\nlet S=struct{x:int,@[operator(.add)]\nlet first:(a:S,b:E)->str=unresolved\n@[operator(.add)]\nlet second:(a:S,b:S)->int=unresolved\n}\nlet query=S.[x=1]+.one", .result = .invalid },
+        .{ .source = "let S=struct{x:int,@[operator(.less_than)]\nlet hook:(a:int,b:S)->bool=unresolved\n}\nlet query=S.[x=1]>2", .result = .boolean },
+        .{ .source = "let S=struct{x:int,@[operator(.less_than)]\nlet hook:(a:int,b:S)->bool=unresolved\n}\nlet query=S.[x=1]<=2", .result = .boolean },
+        .{ .source = "let S=struct{x:int,@[operator(.less_than)]\nlet hook:(a:S,b:int)->bool=unresolved\n}\nlet query=S.[x=1]>=2", .result = .boolean },
+        .{ .source = "let S=struct{x:int,@[operator(.equal)]\nlet hook:(a:S,b:int)->bool=unresolved\n}\nlet query=S.[x=1]!=2", .result = .boolean },
+        .{ .source = "let S=struct{x:int,@[operator(.equal)]\nlet hook:(a:int,b:S)->bool=unresolved\n}\nlet query=2==S.[x=1]", .result = .boolean },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet hook:(a:S,b:int)->S=unresolved\n}\nlet query={let mut s=S.[x=1]\ns+=2}", .result = .unit },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet hook:(a:S,b:int)->str=unresolved\n}\nlet query={let mut s=S.[x=1]\ns+=2}", .result = .invalid },
+        .{ .source = "let S=struct{x:int,@[operator(.equal)]\nlet hook:(a:S,b:int)->bool=unresolved\n}\nlet query=S.[x=1] in [2]", .result = .invalid },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet hook:(a:S,b:int)->str=unresolved\n}\nlet query=@as(int,S.[x=1]+2)", .result = .invalid },
+        .{ .source = "let S=struct{x:int,@[operator(.add)]\nlet hook:(a:S,b:int)->str=unresolved\n}\nlet query=2+S.[x=1]", .result = .invalid },
+    }) |case| {
+        try testNominalOperatorQuery(std.testing.allocator, case.source, case.result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ case.source, case.result });
+    }
+}
+
+fn testMixedOperatorInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "mixed-operator-inference.nov",
+        \\let S=struct{x:int,
+        \\@[operator(.add)]
+        \\let add:(a:S,b:int)->str="mixed"
+        \\@[operator(.neg)]
+        \\let neg:(a:S)->int=a.x
+        \\}
+        \\let combine:(a:`T,b:`U)->`R=a+b
+        \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+        \\let main:()->str={let x=S.[x=1]
+        \\let direct=combine(x,2)
+        \\let inferred=(a:S){a+2}
+        \\let callback=apply((a){a+2},x)
+        \\let negative=apply((a){-a},x)
+        \\let q:@TypeOf(combine(x,2))=direct
+        \\inferred(x)+callback+q}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("mixed inference diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "mixed operator solver generic independent operands results callbacks and OOM" {
+    try testMixedOperatorInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMixedOperatorInference, .{});
+}
+
+fn testOperatorReviewLowering(allocator: std.mem.Allocator, source: [:0]const u8) !void {
+    var module = try Module.init(allocator, "operator-review.nov", source);
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("operator review diagnostics: {any}\nsource: {s}\n", .{ module.diagnostics.items, source });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "mixed operator review contextual self equality paired readonly and lowering OOM" {
+    for ([_][]const u8{
+        "",
+        "@[operator(.equal)]\nlet mixed:(a:S,b:int)->bool=true\n",
+        "@[operator(.equal)]\nlet mixed:(a:S,b:int)->bool=true\n@[operator(.equal)]\nlet same:(a:S,b:S)->bool=true\n",
+    }) |hooks| {
+        for ([_][]const u8{ "S.[x=1]==.[x=1]", ".[x=1]!=S.[x=1]" }) |expression| {
+            const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let S=struct{{x:int,\n{s}}}\nlet query=@as(@TypeOf({s}),true)\nlet main:()->bool={{let ordinary={s}\nlet queried:@TypeOf({s})=ordinary\nqueried}}", .{ hooks, expression, expression, expression }, 0);
+            defer std.testing.allocator.free(source);
+            try testNominalOperatorQuery(std.testing.allocator, source, .boolean);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, OperatorQueryResult.boolean });
+            try testOperatorReviewLowering(std.testing.allocator, source);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorReviewLowering, .{source});
+        }
+    }
+}
+
+test "mixed operator review enum union equality shorthand paired readonly and lowering OOM" {
+    for ([_][]const u8{
+        "",
+        "@[operator(.equal)]\nlet mixed:(a:S,b:int)->bool=true\n",
+        "@[operator(.equal)]\nlet mixed:(a:S,b:int)->bool=true\n@[operator(.equal)]\nlet same:(a:S,b:S)->bool=true\n",
+    }) |hooks| {
+        for ([_]struct { kind: []const u8, fields: []const u8, known: []const u8, shorthand: []const u8 }{
+            .{ .kind = "enum", .fields = "one,two,", .known = "S.one", .shorthand = ".one" },
+            .{ .kind = "union", .fields = "none,some:int,", .known = "S.some[1]", .shorthand = ".some[1]" },
+            .{ .kind = "union", .fields = "none,some:int,", .known = "S.none[]", .shorthand = ".none[]" },
+        }) |case| {
+            for ([_][]const u8{ "==", "!=" }) |op| {
+                for ([_]bool{ false, true }) |reverse| {
+                    const lhs = if (reverse) case.shorthand else case.known;
+                    const rhs = if (reverse) case.known else case.shorthand;
+                    const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let S={s}{{{s}\n{s}}}\nlet query=@as(@TypeOf({s}{s}{s}),true)\nlet main:()->bool={{let ordinary={s}{s}{s}\nlet queried:@TypeOf({s}{s}{s})=ordinary\nqueried}}", .{ case.kind, case.fields, hooks, lhs, op, rhs, lhs, op, rhs, lhs, op, rhs }, 0);
+                    defer std.testing.allocator.free(source);
+                    try testNominalOperatorQuery(std.testing.allocator, source, .boolean);
+                    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, OperatorQueryResult.boolean });
+                    try testOperatorReviewLowering(std.testing.allocator, source);
+                    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorReviewLowering, .{source});
+                }
+            }
+        }
+    }
+}
+
+test "mixed operator review grouped equality shorthand readonly effects and OOM" {
+    for ([_][]const u8{ "", "@[operator(.equal)]\nlet mixed:(a:S,b:int)->bool=true\n" }) |hooks| {
+        for ([_]struct { kind: []const u8, fields: []const u8, known: []const u8, shorthand: []const u8 }{
+            .{ .kind = "struct", .fields = "x:int,", .known = "S.[x=1]", .shorthand = ".[x=1]" },
+            .{ .kind = "enum", .fields = "one,two,", .known = "S.one", .shorthand = ".one" },
+            .{ .kind = "union", .fields = "none,some:int,", .known = "S.some[1]", .shorthand = ".some[1]" },
+            .{ .kind = "union", .fields = "none,some:int,", .known = "S.none[]", .shorthand = ".none[]" },
+        }) |case| {
+            for (0..5) |wrapper| {
+                const grouped = switch (wrapper) {
+                    0 => try std.fmt.allocPrint(std.testing.allocator, "{{{s}}}", .{case.shorthand}),
+                    1 => try std.fmt.allocPrint(std.testing.allocator, "{{{{{s}}}}}", .{case.shorthand}),
+                    2 => try std.fmt.allocPrint(std.testing.allocator, "{{touch()\n{s}}}", .{case.shorthand}),
+                    3 => try std.fmt.allocPrint(std.testing.allocator, "if true {{touch()\n{s}}} else {{{s}}}", .{ case.shorthand, case.known }),
+                    4 => try std.fmt.allocPrint(std.testing.allocator, "match true{{true=>{{touch()\n{s}}}\nfalse=>{s}}}", .{ case.shorthand, case.known }),
+                    else => unreachable,
+                };
+                defer std.testing.allocator.free(grouped);
+                for ([_][]const u8{ "==", "!=" }) |op| {
+                    for ([_]bool{ false, true }) |reverse| {
+                        const lhs = if (reverse) grouped else case.known;
+                        const rhs = if (reverse) case.known else grouped;
+                        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let S={s}{{{s}\n{s}}}\nlet touch:()=@panic(\"TypeOf must not execute effects\")\nlet query=@as(@TypeOf({s}{s}{s}),true)\nlet main:()->bool=@as(@TypeOf({s}{s}{s}),true)", .{ case.kind, case.fields, hooks, lhs, op, rhs, lhs, op, rhs }, 0);
+                        defer std.testing.allocator.free(source);
+                        // QueryValidation may inspect touch's signature, but the
+                        // query helper asserts that no executable IR is published.
+                        try testNominalOperatorQuery(std.testing.allocator, source, .boolean);
+                        try testOperatorReviewLowering(std.testing.allocator, source);
+                        if (wrapper == 2 and hooks.len != 0) try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, OperatorQueryResult.boolean });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn testEmptyArrayCallbackAmbiguity(allocator: std.mem.Allocator, source: [:0]const u8, call: []const u8) !void {
+    var module = try Module.init(allocator, "empty-array-callback.nov", source);
+    defer module.deinit();
+    const declarations = module.declarations.items.len;
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!result.lowering_complete);
+    try std.testing.expectEqual(declarations, module.declarations.items.len);
+    if (module.diagnostics.items.len != 1 or module.diagnostics.items[0].tag != .generic_function_ambiguous) std.debug.print("empty callback diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    const diagnostic = module.diagnostics.items[0];
+    try std.testing.expectEqual(Module.Diagnostic.Tag.generic_function_ambiguous, diagnostic.tag);
+    try std.testing.expectEqualStrings(call, module.sourceSlice(diagnostic.span).?);
+}
+
+test "mixed operator review empty array callback inputs diagnose callsite ambiguity under OOM" {
+    const helpers =
+        \\let identity:(x:`T)->`T=x
+        \\let map:(items:[]`T,convert:(`T)->`U)->[]`U={
+        \\let mut result:[]`U=[]
+        \\loop item in items{result += [convert(item)]}
+        \\result}
+        \\let filter:(items:[]`T,predicate:(`T)->bool)->[]`T={
+        \\let mut result:[]`T=[]
+        \\loop item in items{if predicate(item){result += [item]}}
+        \\result}
+        \\
+    ;
+    for ([_][]const u8{ "map([],identity)", "filter([],(x:`T)->bool{true})", "map([],(x){true})" }) |call| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}let main:()={{let value={s}\n}}", .{ helpers, call }, 0);
+        defer std.testing.allocator.free(source);
+        try testEmptyArrayCallbackAmbiguity(std.testing.allocator, source, call);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testEmptyArrayCallbackAmbiguity, .{ source, call });
+    }
+    const valid = helpers ++
+        \\let known:(x:int)->int=x
+        \\let knownPredicate:(x:int)->bool=true
+        \\let main:()={
+        \\let a:[]int=map([],known)
+        \\let b=filter([],knownPredicate)
+        \\let c=map([],(x:int){x})
+        \\let d=filter([],(x:int){true})
+        \\let e=map([],(x){let exact:int=x
+        \\exact})
+        \\let f=map(@as([]int,[]),identity)
+        \\@print(a,b,c,d,e,f)}
+    ;
+    try testOperatorReviewLowering(std.testing.allocator, valid);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorReviewLowering, .{valid});
+}
+
+fn testImportedEmptyArrayAmbiguity(allocator: std.mem.Allocator, path: []const u8, lib: []const u8, call: []const u8) !void {
+    var comp = try Compilation.load(allocator, std.testing.io, path, .{ .lib_dir = lib });
+    defer comp.deinit();
+    try std.testing.expect(!comp.hasErrors());
+    const declarations = comp.declarations.items.len;
+    var result = try Lowering.lowerCompilation(&comp);
+    defer result.deinit();
+    try std.testing.expect(!result.lowering_complete);
+    try expectNoImportSpecializations(&comp, declarations);
+    var diagnostics: usize = 0;
+    for (comp.modules.items) |module| for (module.diagnostics.items) |diagnostic| {
+        diagnostics += 1;
+        if (diagnostic.tag != .generic_function_ambiguous) std.debug.print("imported empty callback diagnostic: {any}\n", .{diagnostic});
+        try std.testing.expectEqual(Module.Diagnostic.Tag.generic_function_ambiguous, diagnostic.tag);
+        try std.testing.expectEqual(comp.root.?, diagnostic.span.source);
+        try std.testing.expectEqualStrings(call, comp.getModule(diagnostic.span.source).?.sourceSlice(diagnostic.span).?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), diagnostics);
+}
+
+test "mixed operator review real std empty array callbacks retain callsite ambiguity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lib = try std.Io.Dir.cwd().realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    for ([_][]const u8{
+        "std.array.map([],identity)",
+        "std.array.filter([],(x:`T)->bool{true})",
+        "std.array.fold([],@as(int,0),(a:int,x:`T)->int{a})",
+    }) |call| {
+        const source = try std.fmt.allocPrint(allocator, "let std=@import(\"std\")\nlet identity:(x:`T)->`T=x\nlet main:()={{let value={s}\n}}", .{call});
+        defer allocator.free(source);
+        try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data = source });
+        const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+        defer allocator.free(path);
+        try testImportedEmptyArrayAmbiguity(allocator, path, lib, call);
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data =
+        \\let std=@import("std")
+        \\let identity:(x:`T)->`T=x
+        \\let known:(x:int)->int=x
+        \\let knownPredicate:(x:int)->bool=true
+        \\let main:()={
+        \\let a=std.array.map([],known)
+        \\let b=std.array.filter([],knownPredicate)
+        \\let c=std.array.map([],(x:int){x})
+        \\let d=std.array.filter([],(x:int){true})
+        \\let e=std.array.map([],(x){let exact:int=x
+        \\exact})
+        \\let f=std.array.map(@as([]int,[]),identity)
+        \\@print(a,b,c,d,e,f)}
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    try testNonStorableImport(allocator, path, lib, null);
+}
+
+test "mixed operator review arithmetic keeps unique mixed enum shorthand under OOM" {
+    for ([_]bool{ false, true }) |reverse| {
+        const lhs = if (reverse) ".one" else "S.[x=1]";
+        const rhs = if (reverse) "S.[x=1]" else ".one";
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let E=enum{{one,two,}}\nlet S=struct{{x:int,\n@[operator(.add)]\nlet mixed:(a:{s},b:{s})->str=\"mixed\"\n}}\nlet query=@as(@TypeOf({s}+{s}),\"mixed\")\nlet main:()->str={{let ordinary={s}+{s}\nlet queried:@TypeOf({s}+{s})=ordinary\nqueried}}", .{ if (reverse) "E" else "S", if (reverse) "S" else "E", lhs, rhs, lhs, rhs, lhs, rhs }, 0);
+        defer std.testing.allocator.free(source);
+        try testNominalOperatorQuery(std.testing.allocator, source, .string);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, OperatorQueryResult.string });
+        try testOperatorReviewLowering(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorReviewLowering, .{source});
+    }
+}
+
+test "mixed operator review return only function variables paired readonly and lowering OOM" {
+    for ([_]struct { function: []const u8, result: []const u8, body: []const u8, call: []const u8 }{
+        .{ .function = "()->int", .result = "()->`R", .body = "let value:()->int=1", .call = "queried()" },
+        .{ .function = "(int)->bool", .result = "(`R)->bool", .body = "let value:(x:int)->bool=true", .call = "queried(1)" },
+    }) |case| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}\nlet S=struct{{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:int)->{s}=value\n}}\nlet add:(a:`T,b:`U)->{s}=a+b\nlet query=@as(@TypeOf(add(S.[x=1],2)),value)\nlet main:()={{let ordinary=add(S.[x=1],2)\nlet queried:@TypeOf(add(S.[x=1],2))=ordinary\n@print({s})}}", .{ case.body, case.function, case.result, case.call }, 0);
+        defer std.testing.allocator.free(source);
+        try testNominalOperatorQuery(std.testing.allocator, source, .function);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, OperatorQueryResult.function });
+        try testOperatorReviewLowering(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorReviewLowering, .{source});
+    }
+}
+
+fn testMixedMultiplyDefaults(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "mixed-multiply-defaults.nov",
+        \\let Vector=struct{x:f64,y:f64,
+        \\@[operator(.mul)]
+        \\let scale:(vector:Vector,factor:f64)->Vector=unresolved
+        \\@[operator(.mul)]
+        \\let scaleLeft:(factor:f64,vector:Vector)->Vector=unresolved
+        \\@[operator(.mul)]
+        \\let dot:(left:Vector,right:Vector)->f64=unresolved
+        \\@[operator(.equal)]
+        \\let scalarEquals:(scalar:f64,vector:Vector)->bool=unresolved
+        \\}
+        \\let multiply:(left:`A,right:`B)->`C=left*right
+        \\let vector=Vector.[x=1.0,y=2.0]
+    );
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const declarations = module.declarations.items.len;
+    defer std.debug.assert(module.declarations.items.len == declarations);
+    defer std.debug.assert(ir.functions.items.len == 0);
+    defer std.debug.assert(ir.local_generic_instances.items.len == 0);
+    const vector_decl = module.getDeclaration(module.lookup("vector").?).?;
+    const vector_node = module.source.ast.decl(vector_decl.node).ast.init_node;
+    const vector = (try queryExpression(&module, &ir, vector_node, &.{}, &.{}, &.{})).?;
+    const float = try ir.internType(.{ .float = 64 });
+    const ref: Ref = .{ .module = &module, .id = module.lookup("multiply").? };
+    const span = ref.span();
+    const args = [_]Argument{ .{ .ty = null, .default_type = float, .span = span }, .{ .ty = vector, .span = span } };
+    // The unknown operand matches both f64 and Vector hook parameters. Its
+    // soft default resolves that ambiguity, not the surrounding equality hook.
+    try std.testing.expect(try probeResult(&module, &ir, ref, &args, span) == null);
+    try std.testing.expectEqual(vector, (try probeDefaultResult(&module, &ir, ref, &args, span)).?);
+    const dot_args = [_]Argument{ .{ .ty = vector, .span = span }, .{ .ty = vector, .span = span } };
+    try std.testing.expectEqual(float, (try probeResult(&module, &ir, ref, &dot_args, span)).?);
+    const bindings = (try infer(&module, &ir, ref, &args, null, span)).?;
+    defer allocator.free(bindings);
+    try std.testing.expectEqual(vector, bindings[2].ty);
+    try std.testing.expect(!module.hasErrors());
+    const invalid = try infer(&module, &ir, ref, &args, .{ .ty = float, .span = span }, span);
+    defer if (invalid) |unexpected| allocator.free(unexpected);
+    try std.testing.expect(invalid == null);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.generic_function_conflict, module.diagnostics.items[0].tag);
+}
+
+test "mixed operator review multiply soft defaults select result independently under OOM" {
+    try testMixedMultiplyDefaults(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMixedMultiplyDefaults, .{});
+}
+
 const Solver = struct {
     allocator: std.mem.Allocator,
     caller: *Module,
@@ -1909,6 +2249,8 @@ const Solver = struct {
     readonly_layouts: bool = false,
     querying: bool = false,
     query_operations: std.ArrayList(struct { tag: Ast.Node.Tag, operand: *Term, span: Module.Span, module: *Module, node: Ast.Node.Index }) = .empty,
+
+    operations: std.ArrayList(Operation) = .empty,
     query_literals: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_strings: std.ArrayList(struct { module: *Module, node: Ast.Node.Index }) = .empty,
     query_printables: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index, interpolation: bool = true }) = .empty,
@@ -1928,6 +2270,8 @@ const Solver = struct {
     parameters: []const *Term = &.{},
     defaults: std.ArrayList(struct { term: *Term, ty: Ir.TypeId }) = .empty,
     float_defaults_only: bool = false,
+
+    const Operation = struct { tag: Ast.Node.Tag, lhs: *Term, rhs: ?*Term, result: *Term, span: Module.Span, module: *Module, node: Ast.Node.Index };
 
     // Connect signatures before inspecting operations that need concrete operand
     // types. In particular, callback-first arguments must see later siblings.
@@ -1950,7 +2294,7 @@ const Solver = struct {
         // projection. Revisit only these operations, not bodies or defaults.
         var progress = true;
         while (progress and !self.failed) {
-            progress = false;
+            progress = try self.resolveOperations();
             var i: usize = 0;
             while (i < self.projections.items.len) {
                 const projection = self.projections.items[i];
@@ -2013,6 +2357,7 @@ const Solver = struct {
 
     fn operatorHook(tag: Ast.Node.Tag) ?Module.Operator {
         return switch (tag) {
+            .equal_equal, .bang_equal => .equal,
             .less_than, .greater_than, .less_or_equal, .greater_or_equal => .less_than,
             .add, .assign_add => .add,
             .sub, .assign_sub => .sub,
@@ -2040,21 +2385,164 @@ const Solver = struct {
 
     fn nominalOperatorContext(self: *Solver, tag: Ast.Node.Tag, expected: ?*Term) ?*Term {
         const op = operatorHook(tag) orelse return null;
-        if (op == .less_than) return null;
+        if (op.returnsBool()) return null;
         const context = expected orelse return null;
         return if (self.nominalOperand(context)) context else null;
+    }
+
+    // Resolve candidate signatures in the solver pool before QueryValidation
+    // copies it: selected result IDs must outlive that disposable validator.
+    fn operatorSignatures(self: *Solver, module: *Module, tag: Ast.Node.Tag, known: *Term, known_left: bool, warm_only: bool) Ir.BuildError!?*Term {
+        const op = operatorHook(tag) orelse return null;
+        if (!self.nominalOperand(known)) return null;
+        const was_readonly = self.readonly_layouts;
+        self.readonly_layouts = true;
+        defer self.readonly_layouts = was_readonly;
+        const ty = (try self.materialize(known, 0)) orelse return null;
+        const nominal = self.ir.getType(ty).?;
+        if (nominal == .record and nominal.record.anonymous != .none) return null;
+        const source = if (nominal == .record) nominal.record.source else nominal.enumeration.source;
+        const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
+        const owner = if (module.compilation) |comp| comp.getModule(source).? else module;
+        const concrete: ?u32 = if (nominal == .record and nominal.record.type_args.len != 0) @backingInt(ty) else null;
+        const reverse = tag == .greater_than or tag == .less_or_equal;
+        const index: usize = if (known_left != reverse) 0 else 1;
+        var candidate: ?Ir.TypeId = null;
+        for (owner.declarations.items) |decl| {
+            if (decl.container != @as(Module.DeclId, @fromBackingInt(identity)) or decl.operator != op or
+                (decl.concrete_type != null and decl.concrete_type != concrete) or decl.is_generic_function or decl.noreturn or
+                (owner != module and !decl.public)) continue;
+            const function = owner.source.ast.declFunction(decl.node) orelse continue;
+            const signature_id = (try TypeResolver.resolveInScopeReadOnly(owner, self.ir, function.proto_node, decl.container, concrete orelse decl.concrete_type, decl.function_bindings)) orelse continue;
+            const hook_type = self.ir.getType(signature_id).?;
+            if (warm_only) continue;
+            if (hook_type != .function or hook_type.function.params.len != 2 or hook_type.function.params[index] != ty) continue;
+            const param = hook_type.function.params[1 - index];
+            if (candidate) |previous| {
+                if (previous != param) return null;
+            } else candidate = param;
+        }
+        return if (candidate) |param| try self.fromType(param, known.span, 0) else if (op == .equal) known else null;
+    }
+
+    fn operatorParameter(self: *Solver, module: *Module, tag: Ast.Node.Tag, known: *Term, known_left: bool) Ir.BuildError!?*Term {
+        return self.operatorSignatures(module, tag, known, known_left, false);
+    }
+
+    fn returnOnlyVariable(value: *Term, params: []const *Term, depth: usize) bool {
+        if (depth >= max_depth) return false;
+        const result = root(value);
+        return switch (result.value) {
+            .unknown => blk: {
+                for (params) |param| if (occurs(result, param, 0)) break :blk false;
+                break :blk true;
+            },
+            .array, .range => |child| returnOnlyVariable(child, params, depth + 1),
+            .reference => |reference| returnOnlyVariable(reference.child, params, depth + 1),
+            .function => |function| blk: {
+                for (function.params) |param| if (returnOnlyVariable(param, params, depth + 1)) break :blk true;
+                break :blk returnOnlyVariable(function.result, params, depth + 1);
+            },
+            .nominal => |nominal| blk: {
+                for (nominal.args) |arg| if (returnOnlyVariable(arg, params, depth + 1)) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn scalarOperand(self: *Solver, value: *Term) bool {
+        const operand = root(value);
+        if (self.nominalOperand(operand)) return false;
+        if (operand.value != .unknown) return true;
+        for (self.defaults.items) |candidate| if (root(candidate.term) == operand) return true;
+        return false;
+    }
+
+    fn resolveOperations(self: *Solver) Ir.BuildError!bool {
+        const was_readonly = self.readonly_layouts;
+        self.readonly_layouts = true;
+        defer self.readonly_layouts = was_readonly;
+        var progress = false;
+        var i: usize = 0;
+        while (i < self.operations.items.len and !self.failed) {
+            const operation = self.operations.items[i];
+            if (operation.rhs) |rhs| {
+                if (root(rhs).value == .unknown) {
+                    if (try self.operatorParameter(operation.module, operation.tag, operation.lhs, true)) |param| try self.unify(rhs, param, operation.span, 0);
+                }
+                if (root(operation.lhs).value == .unknown) {
+                    if (try self.operatorParameter(operation.module, operation.tag, rhs, false)) |param| try self.unify(operation.lhs, param, operation.span, 0);
+                }
+            }
+            if (self.scalarOperand(operation.lhs) and (if (operation.rhs) |rhs| self.scalarOperand(rhs) else true)) {
+                if (operation.rhs) |rhs| try self.unify(operation.lhs, rhs, operation.span, 0);
+                if (operatorHook(operation.tag) == null or !operatorHook(operation.tag).?.returnsBool()) try self.unify(operation.result, operation.lhs, operation.span, 0);
+            }
+            const lhs = (try self.materialize(operation.lhs, 0)) orelse {
+                i += 1;
+                continue;
+            };
+            const rhs: ?Ir.TypeId = if (operation.rhs) |right| (try self.materialize(right, 0)) orelse {
+                i += 1;
+                continue;
+            } else null;
+            const nominal = self.nominalOperand(operation.lhs) or (if (operation.rhs) |right| self.nominalOperand(right) else false);
+            const op = operatorHook(operation.tag);
+            var result: *Term = operation.lhs;
+            const structural_equality = (operation.tag == .equal_equal or operation.tag == .bang_equal) and rhs != null and lhs == rhs.?;
+            if (nominal and op != null and !structural_equality) {
+                _ = try self.operatorSignatures(operation.module, operation.tag, operation.lhs, true, true);
+                if (operation.rhs) |right| _ = try self.operatorSignatures(operation.module, operation.tag, right, false, true);
+                // Materialize before the disposable validator copies the type pool.
+                var validation = try BodyChecker.QueryValidation.init(self.ir);
+                defer validation.deinit();
+                var params = [_]Ir.TypeId{ lhs, rhs orelse lhs };
+                if (operation.tag == .greater_than or operation.tag == .less_or_equal) std.mem.swap(Ir.TypeId, &params[0], &params[1]);
+                const selected = try validation.operatorOperands(operation.module, operation.node, params[0..if (rhs != null) @as(usize, 2) else 1], op.?);
+                if (selected) |ty| {
+                    result = try self.fromType(ty, operation.span, 0);
+                } else {
+                    self.failed = true;
+                    return progress;
+                }
+            } else {
+                if (operation.rhs) |right| try self.unify(operation.lhs, right, operation.span, 0);
+                if (op) |hook| if (hook.returnsBool()) {
+                    result = try self.fromType(try self.ir.internType(.boolean), operation.span, 0);
+                };
+                try self.query_operations.append(self.allocator, .{ .tag = operation.tag, .operand = operation.lhs, .span = operation.span, .module = operation.module, .node = operation.node });
+            }
+            try self.unify(operation.result, result, operation.span, 0);
+            _ = self.operations.swapRemove(i);
+            progress = true;
+        }
+        return progress;
     }
 
     // Defaults fill only unresolved leaves after all exact constraints. A
     // candidate must never conflict with a contextual type that already won.
     fn applyDefaults(self: *Solver) Ir.BuildError!void {
+        try self.finishBodies();
         // Apply floating leaves first, including inside containers. Shared soft
         // integer candidates then yield without ever changing an exact type.
         self.float_defaults_only = true;
         for (self.defaults.items) |candidate| try self.defaultTerm(candidate.term, candidate.ty, 0);
         self.float_defaults_only = false;
         for (self.defaults.items) |candidate| try self.defaultTerm(candidate.term, candidate.ty, 0);
+        try self.finishBodies();
         if (self.failed) return;
+        if (self.operations.items.len != 0) {
+            // Deferred operators cannot validate an unbound generic input.
+            // Diagnose the missing call constraint, not a dependent body local,
+            // only after callbacks, projections, and defaults reach a fixed point.
+            for (self.parameters) |param| if (!resolved(param, 0)) {
+                try self.fail(if (self.unsupported != null) .generic_function_inference_unsupported else .generic_function_ambiguous, self.unsupported orelse self.call_span, param.span);
+                return;
+            };
+            try self.fail(.unresolved_value_type, self.operations.items[0].span, null);
+            return;
+        }
         const was_readonly_layouts = self.readonly_layouts;
         self.readonly_layouts = true;
         defer self.readonly_layouts = was_readonly_layouts;
@@ -3256,6 +3744,36 @@ const Solver = struct {
         return self.expression(frame, node, depth);
     }
 
+    fn equalityShorthand(ast: *const Ast, node: Ast.Node.Index) bool {
+        return equalityShorthandResult(ast, node, 0);
+    }
+
+    fn equalityShorthandResult(ast: *const Ast, node: Ast.Node.Index, depth: usize) bool {
+        if (node == 0 or depth >= max_depth) return false;
+        const data = ast.nodes.items(.data)[node];
+        return switch (ast.nodes.items(.tag)[node]) {
+            .struct_init => ast.fullStructInit(node).?.type_node == 0,
+            .enum_literal => true,
+            .container_decl_arg, .array_access => ast.nodes.items(.tag)[data.lhs] == .enum_literal,
+            .block, .block_two, .block_newline, .block_two_newline => blk: {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const statements = ast.fullBlock(&buffer, node).?.ast.statements;
+                break :blk statements.len != 0 and equalityShorthandResult(ast, statements[statements.len - 1], depth + 1);
+            },
+            .@"if", .if_else => blk: {
+                const branch = ast.fullIf(node).?.ast;
+                break :blk equalityShorthandResult(ast, branch.then_expr, depth + 1) or equalityShorthandResult(ast, branch.else_expr, depth + 1);
+            },
+            .match => blk: {
+                for (ast.fullMatch(node).?.ast.cases) |case| {
+                    if (equalityShorthandResult(ast, ast.fullMatchCase(case).?.ast.target_expr, depth + 1)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
     fn needsOperandContext(ast: *const Ast, node: Ast.Node.Index) bool {
         return switch (ast.nodes.items(.tag)[node]) {
             .enum_literal => true,
@@ -3461,10 +3979,11 @@ const Solver = struct {
                 }
                 const rhs = try self.expression(frame, data.rhs, depth + 1);
                 if (root(rhs).value == .never) return rhs;
-                if (self.querying) {
-                    if (ast.nodes.items(.tag)[node] != .assign) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span, .module = module, .node = node });
+                if (ast.nodes.items(.tag)[node] == .assign) {
+                    try self.unifyArgument(lhs, rhs, span);
+                } else {
+                    try self.operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .lhs = lhs, .rhs = rhs, .result = lhs, .span = span, .module = module, .node = node });
                 }
-                try self.unifyArgument(lhs, rhs, span);
                 return self.fromType(try self.ir.internType(.void), span, 0);
             },
             .negation, .bit_not => {
@@ -3478,23 +3997,36 @@ const Solver = struct {
                     literal_node = block.ast.statements[0];
                 }
                 if (self.querying and ast.nodes.items(.tag)[node] == .negation and ast.nodes.items(.tag)[literal_node] == .number_literal and self.query_literals.items.len == numbers + 1) self.query_literals.items[numbers].node = node;
-                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = operand, .span = span, .module = module, .node = node });
-                return operand;
+                if (root(operand).value == .never) return operand;
+                const result = try self.term(.unknown, span);
+                try self.operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .lhs = operand, .rhs = null, .result = result, .span = span, .module = module, .node = node });
+                return result;
             },
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
-                const reverse = needsOperandContext(ast, data.lhs) and !needsOperandContext(ast, data.rhs);
+                const equality = operatorHook(ast.nodes.items(.tag)[node]) == .equal;
+                const lhs_context = needsOperandContext(ast, data.lhs) or (equality and equalityShorthand(ast, data.lhs));
+                const rhs_context = needsOperandContext(ast, data.rhs) or (equality and equalityShorthand(ast, data.rhs));
+                const reverse = lhs_context and !rhs_context;
                 const context = self.nominalOperatorContext(ast.nodes.items(.tag)[node], expected);
                 const first = try self.expressionExpected(frame, if (reverse) data.rhs else data.lhs, context, depth + 1);
                 if (root(first).value == .never) return first;
-                const second = try self.expressionExpected(frame, if (reverse) data.lhs else data.rhs, first, depth + 1);
+                _ = try self.resolveOperations();
+                const second_node = if (reverse) data.lhs else data.rhs;
+                // Equality shorthand retains the known operand's structural
+                // context, independently of unrelated mixed hooks.
+                const equality_context = operatorHook(ast.nodes.items(.tag)[node]) == .equal and equalityShorthand(ast, second_node);
+                const param_context = if (equality_context) first else try self.operatorParameter(module, ast.nodes.items(.tag)[node], first, !reverse);
+                const second = try self.expressionExpected(frame, second_node, param_context orelse if (needsOperandContext(ast, second_node) and !self.nominalOperand(first)) first else null, depth + 1);
                 if (root(second).value == .never) return second;
-                try self.unify(first, second, span, 0);
+                if (param_context) |param| if (root(second).value == .unknown) try self.unify(second, param, span, 0);
                 const lhs = if (reverse) second else first;
-                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span, .module = module, .node = node });
-                return switch (ast.nodes.items(.tag)[node]) {
-                    .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => self.fromType(try self.ir.internType(.boolean), span, 0),
-                    else => lhs,
-                };
+                const rhs = if (reverse) first else second;
+                const result = if (operatorHook(ast.nodes.items(.tag)[node]).?.returnsBool())
+                    try self.fromType(try self.ir.internType(.boolean), span, 0)
+                else
+                    try self.term(.unknown, span);
+                try self.operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .lhs = lhs, .rhs = rhs, .result = result, .span = span, .module = module, .node = node });
+                return result;
             },
             .in => {
                 const reverse = needsOperandContext(ast, data.lhs);
@@ -3928,7 +4460,8 @@ const Solver = struct {
                             }
                             if (!self.querying and callee_target.ref.isNoreturn()) return self.term(.never, span);
                             const needs_body = if (self.querying)
-                                TypeResolver.hasInferredSignature(&callee_target.ref.module.source.ast, callee_target.ref.function().proto_node)
+                                TypeResolver.hasInferredSignature(&callee_target.ref.module.source.ast, callee_target.ref.function().proto_node) or
+                                    (callee_target.ref.local == null and callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function and returnOnlyVariable(f.result, f.params, 0))
                             else
                                 callee_target.ref.local != null or callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function or
                                     (self.establishedType(callee_target.ref) == null and callee_target.ref.module.source.ast.fullFnProto(callee_target.ref.function().proto_node).?.ast.infer_result);
