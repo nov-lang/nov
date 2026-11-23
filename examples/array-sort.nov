@@ -29,7 +29,9 @@ let payload_key: (value: Payload) -> int = match value {
 
 let assert_numbers: (actual: []int, expected: []int) = {
     @assert(@len(actual) == @len(expected))
-    loop value, wanted in actual, expected { @assert(value == wanted) }
+    loop value, wanted in actual, expected {
+        @assert(value == wanted)
+    }
 }
 
 @[test]
@@ -129,13 +131,19 @@ let bool_integer_enum_union_and_range_elements: () = {
         (a: `T, b: `T) -> bool {
             let mut left: int = 0
             let mut right: int = 0
-            loop value in a { left += value }
-            loop value in b { right += value }
+            loop value in a {
+                left += value
+            }
+            loop value in b {
+                right += value
+            }
             left < right
         }
     )
     let mut total: int = 0
-    loop value in ranges[0] { total += value }
+    loop value in ranges[0] {
+        total += value
+    }
     @assert(total == 3)
 }
 

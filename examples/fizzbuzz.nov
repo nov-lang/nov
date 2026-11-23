@@ -7,5 +7,7 @@ let fizzBuzz: (n: uint) -> str =
     }
 
 let main: () = {
-    loop i in 1..=15 { i |> fizzBuzz |> @println }
+    loop i in 1..=15 {
+        i |> fizzBuzz |> @println
+    }
 }

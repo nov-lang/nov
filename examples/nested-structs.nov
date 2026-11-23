@@ -8,7 +8,9 @@ let Profile = struct {
     location: Location,
 
     @[stringify]
-    let toString: (self: Profile) -> str = { "{self.name}: {self.location.city} ({self.location.visits})" }
+    let toString: (self: Profile) -> str = {
+        "{self.name}: {self.location.city} ({self.location.visits})"
+    }
 }
 
 let main: () = {

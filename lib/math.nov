@@ -2,13 +2,17 @@
 let abs: (value: `T) -> `T = {
     if value == 0 { 0 } else if value < 0 {
         let result = -value
-        if result < 0 { @panic("absolute value overflow") }
+        if result < 0 {
+            @panic("absolute value overflow")
+        }
         result
     } else { value }
 }
 
 @[public]
 let clamp: (value: `T, lower: `T, upper: `T) -> `T = {
-    if !{ lower <= upper } { @panic("invalid clamp bounds") }
+    if !{ lower <= upper } {
+        @panic("invalid clamp bounds")
+    }
     if value < lower { lower } else if upper < value { upper } else { value }
 }

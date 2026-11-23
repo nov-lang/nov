@@ -729,8 +729,8 @@ test "ascription preserves type syntax comments nested calls interpolation and a
 }
 
 test "iteration continuations format before bodies with stable tokens structure and allocation cleanup" {
-    try expectFormatted("let f=loop item in items:index+=1{continue}else{false}", "let f = loop item in items : index += 1 { continue } else { false }\n");
-    try expectFormatted("let f=loop item in items:{tick()}{break item}", "let f = loop item in items : { tick() } { break item }\n");
+    try expectFormatted("let f=loop item in items:index+=1{continue}else{false}", "let f = loop item in items : index += 1 {\n    continue\n} else { false }\n");
+    try expectFormatted("let f=loop item in items:{tick()}{break item}", "let f = loop item in items : { tick() } {\n    break item\n}\n");
     for ([_][:0]const u8{
         "let f=loop item in [1,2] : index += 1 {continue} else {}",
         "let f=loop rune in \"é😀\" : index += 1 {break rune} else {'?'}",
@@ -756,7 +756,7 @@ test "iteration continuations format before bodies with stable tokens structure 
 }
 
 test "zip iteration formatting preserves comments interpolation and allocation cleanup" {
-    try expectFormatted("let f=loop item,index in items,0.. {item} else {false}", "let f = loop item, index in items, 0.. { item } else { false }\n");
+    try expectFormatted("let f=loop item,index in items,0.. {item} else {false}", "let f = loop item, index in items, 0.. {\n    item\n} else { false }\n");
     for ([_][:0]const u8{
         "let f=loop &item,&other,index in items,others,0.. {continue} else {}",
         "let f=loop x,y in [1,2],\"ab\" {}",
@@ -899,7 +899,7 @@ test "function signatures calls and delimiters are idempotent" {
 
 test "blocks controls assignments and precedence are idempotent" {
     try expectFormatted("let f:(n:int)->int={let mut x:int=1\nx += n * 2\nif x > 0 {return x} else if x == 0 {return -1} else {return 0}}\n", "let f: (n: int) -> int = {\n    let mut x: int = 1\n    x += n * 2\n    if x > 0 { return x } else if x == 0 { return -1 } else { return 0 }\n}\n");
-    try expectFormatted("let main:()->void={loop {true} {if false {break} else {continue}}\nreturn}\n", "let main: () -> void = {\n    loop { true } {\n        if false { break } else { continue }\n    }\n    return\n}\n");
+    try expectFormatted("let main:()->void={loop {true} {if false {break} else {continue}}\nreturn}\n", "let main: () -> void = {\n    loop { true } {\n        if false {\n            break\n        } else {\n            continue\n        }\n    }\n    return\n}\n");
     try expectFormatted("let x={1 + 2} * 3 - 4 / {5 - 6}\n", "let x = { 1 + 2 } * 3 - 4 / { 5 - 6 }\n");
     try expectFormatted("let f:()->bool=false and {return true} or !false\n", "let f: () -> bool = false and { return true } or !false\n");
 }
@@ -916,9 +916,9 @@ test "single statement blocks compact executable forms under allocation failures
     const cases = .{
         .{ "let f:()->int={return 1}", "let f: () -> int = { return 1 }\n" },
         .{ "let f:()={return}", "let f: () = { return }\n" },
-        .{ "let value=loop {break 1}", "let value = loop { break 1 }\n" },
-        .{ "let f:()=loop {break}", "let f: () = loop { break }\n" },
-        .{ "let f:()=loop {continue}", "let f: () = loop { continue }\n" },
+        .{ "let value=loop {break 1}", "let value = loop {\n    break 1\n}\n" },
+        .{ "let f:()=loop {break}", "let f: () = loop {\n    break\n}\n" },
+        .{ "let f:()=loop {continue}", "let f: () = loop {\n    continue\n}\n" },
         .{ "let f:()={x=1}", "let f: () = { x = 1 }\n" },
         .{ "let f:()={a[0]+=1}", "let f: () = { a[0] += 1 }\n" },
         .{ "let f:()={call(1,2)}", "let f: () = { call(1, 2) }\n" },
@@ -926,6 +926,109 @@ test "single statement blocks compact executable forms under allocation failures
         .{ "let value={items[-1]}", "let value = { items[-1] }\n" },
     };
     inline for (cases) |case| {
+        try expectFormatted(case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
+    }
+}
+
+test "loop bodies expand including empty bodies while continuations remain compact under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=loop {}", "let x = loop {\n}\n" },
+        .{ "let x=loop c:{}{}", "let x = loop c : {} {\n}\n" },
+        .{ "let x=loop c:{tick()}{continue}else{0}", "let x = loop c : { tick() } {\n    continue\n} else { 0 }\n" },
+        .{ "let x=loop i in 0..2:{tick()}{}", "let x = loop i in 0..2 : { tick() } {\n}\n" },
+        .{ "let x=loop item in items:{}{}", "let x = loop item in items : {} {\n}\n" },
+        .{ "let x=loop a,b in xs,ys:{tick()}{break a}", "let x = loop a, b in xs, ys : { tick() } {\n    break a\n}\n" },
+        .{ "let f:()=loop c {}else{}", "let f: () = loop c {\n} else {\n}\n" },
+        .{ "let x=loop {break if c {1}else{2}}", "let x = loop {\n    break if c { 1 } else { 2 }\n}\n" },
+        .{ "let x=loop c:if d {tick()}else{tock()}{}", "let x = loop c : if d {\n    tick()\n} else {\n    tock()\n} {\n}\n" },
+        .{ "let x=loop c {}else if d {1}else{2}", "let x = loop c {\n} else if d { 1 } else { 2 }\n" },
+        .{ "let f:()=loop c {}else if d {a()}else{b()}", "let f: () = loop c {\n} else if d {\n    a()\n} else {\n    b()\n}\n" },
+    }) |case| {
+        errdefer std.debug.print("loop layout fixture: {s}\n", .{case[0]});
+        try expectFormatted(case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
+    }
+}
+
+test "conditional layout follows unused statements and used values under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let f:()={if c {tick()}}", "let f: () = {\n    if c {\n        tick()\n    }\n}\n" },
+        .{ "let f:()->void={if c {a()}else{b()}}", "let f: () -> void = {\n    if c {\n        a()\n    } else {\n        b()\n    }\n}\n" },
+        .{ "let f:()->int={if c {a()}else if d {b()}else{z()}\n1}", "let f: () -> int = {\n    if c {\n        a()\n    } else if d {\n        b()\n    } else {\n        z()\n    }\n    1\n}\n" },
+        .{ "let f:()=if c {}else{}", "let f: () = if c {\n} else {\n}\n" },
+        .{ "let f:()->void=if c {a()}else{b()}", "let f: () -> void = if c {\n    a()\n} else {\n    b()\n}\n" },
+        .{ "let x=if c {1}else if d {2}else{3}", "let x = if c { 1 } else if d { 2 } else { 3 }\n" },
+        .{ "let f:()={let x=if c {1}else{2}\nuse(x)}", "let f: () = {\n    let x = if c { 1 } else { 2 }\n    use(x)\n}\n" },
+        .{ "let f:()->int={return if c {1}else{2}}", "let f: () -> int = {\n    return if c { 1 } else { 2 }\n}\n" },
+        .{ "let f:()=use(if c {1}else{2})", "let f: () = use(\n    if c { 1 } else { 2 }\n)\n" },
+        .{ "let x=1+if c {2}else{3}", "let x = 1 + if c { 2 } else { 3 }\n" },
+        .{ "let f:()={x=if c {1}else{2}\ntick()}", "let f: () = {\n    x = if c { 1 } else { 2 }\n    tick()\n}\n" },
+        .{ "let f:()={1+if c {2}else{3}\ntick()}", "let f: () = {\n    1 + if c { 2 } else { 3 }\n    tick()\n}\n" },
+        .{ "let f:()->int={return if c {1}else{2}\n0}", "let f: () -> int = {\n    return if c { 1 } else { 2 }\n    0\n}\n" },
+        .{ "let x=if c {}else{}", "let x = if c {} else {}\n" },
+        .{ "let f=(c){if c {a()}else{b()}\nif c {1}else{2}}", "let f = (c) {\n    if c {\n        a()\n    } else {\n        b()\n    }\n    if c { 1 } else { 2 }\n}\n" },
+        .{ "let f:()->int={tick()\nif c {1}else{2}}", "let f: () -> int = {\n    tick()\n    if c { 1 } else { 2 }\n}\n" },
+        .{ "let f:()->int=if c {1}else{2}", "let f: () -> int = if c { 1 } else { 2 }\n" },
+        .{ "let f=(c){if c {1}else{2}}", "let f = (c) {\n    if c { 1 } else { 2 }\n}\n" },
+        .{ "let f=()->void{if c {tick()}}", "let f = () -> void {\n    if c {\n        tick()\n    }\n}\n" },
+        .{ "let f:()->int={match x {0=>if c {1}else{2}\n_=>match y {0=>if d {3}else{4}\n_=>5}}}", "let f: () -> int = {\n    match x {\n        0 => if c { 1 } else { 2 }\n        _ => match y {\n            0 => if d { 3 } else { 4 }\n            _ => 5\n        }\n    }\n}\n" },
+        .{ "let f:()->void={match x {0=>if c {a()}else{b()}\n_=>{}}}", "let f: () -> void = {\n    match x {\n        0 => if c {\n            a()\n        } else {\n            b()\n        }\n        _ => {}\n    }\n}\n" },
+        .{ "let f:()->int={match x {0=>if c {a()}else{b()}\n_=>{}}\n1}", "let f: () -> int = {\n    match x {\n        0 => if c {\n            a()\n        } else {\n            b()\n        }\n        _ => {}\n    }\n    1\n}\n" },
+    }) |case| {
+        errdefer std.debug.print("conditional context fixture: {s}\n", .{case[0]});
+        try expectFormatted(case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
+    }
+}
+
+test "inferred closure tails expand void conditionals without else under OOM" {
+    const source = "let f=(){if c {tick()}}";
+    try expectFormatted(source, "let f = () {\n    if c {\n        tick()\n    }\n}\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+}
+
+fn repeatedFormatText(comptime text: []const u8, comptime count: usize) [text.len * count]u8 {
+    var bytes: [text.len * count]u8 = undefined;
+    for (0..count) |i| @memcpy(bytes[i * text.len ..][0..text.len], text);
+    return bytes;
+}
+
+test "compact blocks measure 100 Unicode scalars across the whole physical line under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x={" ++ repeatedFormatText("a", 88) ++ "}", "let x = { " ++ repeatedFormatText("a", 88) ++ " }\n" },
+        .{ "let x={" ++ repeatedFormatText("a", 89) ++ "}", "let x = {\n    " ++ repeatedFormatText("a", 89) ++ "\n}\n" },
+        .{ "let x={1}+" ++ repeatedFormatText("a", 84), "let x = { 1 } + " ++ repeatedFormatText("a", 84) ++ "\n" },
+        .{ "let x={1}+" ++ repeatedFormatText("a", 85), "let x = {\n    1\n} + " ++ repeatedFormatText("a", 85) ++ "\n" },
+        .{ "let x={1}; " ++ repeatedFormatText("c", 84), "let x = { 1 } ; " ++ repeatedFormatText("c", 84) ++ "\n" },
+        .{ "let x={1}; " ++ repeatedFormatText("c", 85), "let x = {\n    1\n} ; " ++ repeatedFormatText("c", 85) ++ "\n" },
+        .{ "let f:()={let x={" ++ repeatedFormatText("a", 84) ++ "}\nuse(x)}", "let f: () = {\n    let x = { " ++ repeatedFormatText("a", 84) ++ " }\n    use(x)\n}\n" },
+        .{ "let f:()={let x={" ++ repeatedFormatText("a", 85) ++ "}\nuse(x)}", "let f: () = {\n    let x = {\n        " ++ repeatedFormatText("a", 85) ++ "\n    }\n    use(x)\n}\n" },
+        .{ "let x={\"" ++ repeatedFormatText("é😀", 43) ++ "\"}", "let x = { \"" ++ repeatedFormatText("é😀", 43) ++ "\" }\n" },
+        .{ "let x={\"" ++ repeatedFormatText("é😀", 43) ++ "e\"}", "let x = {\n    \"" ++ repeatedFormatText("é😀", 43) ++ "e\"\n}\n" },
+        .{ "let x={1}; " ++ repeatedFormatText("é😀", 42), "let x = { 1 } ; " ++ repeatedFormatText("é😀", 42) ++ "\n" },
+        .{ "let x={1}; " ++ repeatedFormatText("é😀", 42) ++ "e", "let x = {\n    1\n} ; " ++ repeatedFormatText("é😀", 42) ++ "e\n" },
+    }) |case| {
+        errdefer std.debug.print("physical line width fixture: {s}\n", .{case[0]});
+        try expectFormatted(case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
+    }
+}
+
+test "conditional branches share width decisions without splitting long tokens under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=if c {1}else{" ++ repeatedFormatText("a", 72) ++ "}", "let x = if c { 1 } else { " ++ repeatedFormatText("a", 72) ++ " }\n" },
+        .{ "let x=if c {1}else{" ++ repeatedFormatText("a", 73) ++ "}", "let x = if c {\n    1\n} else {\n    " ++ repeatedFormatText("a", 73) ++ "\n}\n" },
+        .{ "let x=if c {1}else if d {2}else{" ++ repeatedFormatText("a", 56) ++ "}", "let x = if c { 1 } else if d { 2 } else { " ++ repeatedFormatText("a", 56) ++ " }\n" },
+        .{ "let x=if c {1}else if d {2}else{" ++ repeatedFormatText("a", 57) ++ "}", "let x = if c {\n    1\n} else if d {\n    2\n} else {\n    " ++ repeatedFormatText("a", 57) ++ "\n}\n" },
+        .{ "let x=if c {" ++ repeatedFormatText("a", 73) ++ "}else{1}", "let x = if c {\n    " ++ repeatedFormatText("a", 73) ++ "\n} else {\n    1\n}\n" },
+        .{ "let x=if c {1}else{2}; " ++ repeatedFormatText("c", 71), "let x = if c {\n    1\n} else {\n    2\n} ; " ++ repeatedFormatText("c", 71) ++ "\n" },
+        .{ "let f:()->str={\"" ++ repeatedFormatText("x", 76) ++ "\"}", "let f: () -> str = {\n    \"" ++ repeatedFormatText("x", 76) ++ "\"\n}\n" },
+        .{ "let x=if c {\"" ++ repeatedFormatText("é😀", 60) ++ "\"}else{\"short\"}", "let x = if c {\n    \"" ++ repeatedFormatText("é😀", 60) ++ "\"\n} else {\n    \"short\"\n}\n" },
+        .{ "let x=\"" ++ repeatedFormatText("é😀", 60) ++ "\"", "let x = \"" ++ repeatedFormatText("é😀", 60) ++ "\"\n" },
+        .{ "let x=" ++ repeatedFormatText("a", 110) ++ "+" ++ repeatedFormatText("b", 110), "let x = " ++ repeatedFormatText("a", 110) ++ " + " ++ repeatedFormatText("b", 110) ++ "\n" },
+    }) |case| {
+        errdefer std.debug.print("shared width fixture: {s}\n", .{case[0]});
         try expectFormatted(case[0], case[1]);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
     }
@@ -945,7 +1048,7 @@ test "single statement blocks retain comments declarations and multiline express
 test "single statement blocks retain nested blocks and control flow" {
     try expectFormatted("let value={{1}}", "let value = {\n    { 1 }\n}\n");
     try expectFormatted("let value={if ready {1} else {2}}", "let value = {\n    if ready { 1 } else { 2 }\n}\n");
-    try expectFormatted("let value={loop {break 1}}", "let value = {\n    loop { break 1 }\n}\n");
+    try expectFormatted("let value={loop {break 1}}", "let value = {\n    loop {\n        break 1\n    }\n}\n");
     try expectFormatted("let value={match x {0=>1\n_=>2}}", "let value = {\n    match x {\n        0 => 1\n        _ => 2\n    }\n}\n");
 }
 
@@ -1196,7 +1299,7 @@ test "interpolation formatting preserves literal chunks escapes and placeholders
 }
 
 test "conditional loop exhaustion formatting preserves tokens comments and structure" {
-    try expectFormatted("let x=loop false{}else{true}", "let x = loop false {} else { true }\n");
+    try expectFormatted("let x=loop false{}else{true}", "let x = loop false {\n} else { true }\n");
     for ([_][:0]const u8{
         "let x=loop c : step() {break 1} else {2}",
         "let x=loop {true} : {tick()} {break [1,2,]} else {[]}",
@@ -1214,8 +1317,8 @@ test "conditional loop exhaustion formatting preserves tokens comments and struc
 }
 
 test "loop continuations and value breaks are idempotent" {
-    try expectFormatted("let value=loop i<10:i+=1{break 1+2*3}", "let value = loop i < 10 : i += 1 { break 1 + 2 * 3 }\n");
-    try expectFormatted("let value=loop:tick(){break 42}", "let value = loop : tick() { break 42 }\n");
+    try expectFormatted("let value=loop i<10:i+=1{break 1+2*3}", "let value = loop i < 10 : i += 1 {\n    break 1 + 2 * 3\n}\n");
+    try expectFormatted("let value=loop:tick(){break 42}", "let value = loop : tick() {\n    break 42\n}\n");
     for ([_][:0]const u8{
         "let value=loop {break 1 + 2 * 3}",
         "let value=loop : tick(1,2,) {break loop : next() {break 7}}",
@@ -1245,7 +1348,7 @@ test "reference arguments format direct borrows indexed owners and pipes" {
 }
 
 test "iteration formatting preserves copied and borrowed captures comments and nesting" {
-    try expectFormatted("let f:()=loop &item in items {item+=1}", "let f: () = loop &item in items { item += 1 }\n");
+    try expectFormatted("let f:()=loop &item in items {item+=1}", "let f: () = loop &item in items {\n    item += 1\n}\n");
     for ([_][:0]const u8{
         "let f:()=loop item in [true,false,] {continue} else {}",
         "let f:()=loop rune in \"é\\0😀\" {break rune} else {'?'}",
@@ -1299,8 +1402,8 @@ test "range formatting survives every allocation failure" {
 }
 
 test "bare block continuations format without accepting genuine labels" {
-    try expectFormatted("let value=loop ready:{tick()}{break 1}", "let value = loop ready : { tick() } { break 1 }\n");
-    try expectFormatted("let value=loop:{}{break 1}", "let value = loop : {} { break 1 }\n");
+    try expectFormatted("let value=loop ready:{tick()}{break 1}", "let value = loop ready : { tick() } {\n    break 1\n}\n");
+    try expectFormatted("let value=loop:{}{break 1}", "let value = loop : {} {\n    break 1\n}\n");
     for ([_][:0]const u8{
         "let value=loop i < limit : {i += 1} {break 1}",
         "let value=loop true : {} {break 1}",

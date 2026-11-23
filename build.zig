@@ -461,13 +461,17 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("loop-values.nov", @embedFile("examples/loop-values.nov"));
     _ = fixtures.add("inclusive-range.nov",
         \\let main: () = {
-        \\    loop i in 0..=2 { @println(i) }
+        \\    loop i in 0..=2 {
+        \\        @println(i)
+        \\    }
         \\    let max: u64 = 18446744073709551615
         \\    loop i in max..=max {
         \\        @println(i)
         \\        continue
         \\    }
-        \\    loop _ in 2..=1 { @println(false) }
+        \\    loop _ in 2..=1 {
+        \\        @println(false)
+        \\    }
         \\}
         \\
     );
@@ -7906,7 +7910,9 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\    let rangeCanonical: standard.Option(@TypeOf(0..1)) = interval
         \\    let range = rangeCanonical.unwrapOr(0..0)
         \\    let mut count = 0
-        \\    loop n in range { count += 1 }
+        \\    loop n in range {
+        \\        count += 1
+        \\    }
         \\    @assert(count == 3)
         \\}
         \\@[test]
@@ -8100,9 +8106,13 @@ fn addRangeValueCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         \\        range = 8..=9
         \\    }
         \\    @println()
-        \\    loop i in copy { @print("{i} ") }
+        \\    loop i in copy {
+        \\        @print("{i} ")
+        \\    }
         \\    @println()
-        \\    loop i in range { @print("{i} ") }
+        \\    loop i in range {
+        \\        @print("{i} ")
+        \\    }
         \\    @println()
         \\}
         \\

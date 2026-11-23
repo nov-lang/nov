@@ -71,7 +71,9 @@ let ieee_comparisons_and_membership: () = {
 let mutation_copies_and_generic_containers: () = {
     let mut samples = [Measurement.[ value = 1.5, weight = 2 ]]
     let saved = samples
-    loop &sample in samples { sample.*.value *= 2 }
+    loop &sample in samples {
+        sample.*.value *= 2
+    }
     @assert(saved[0].value == 1.5 and samples[0].value == 3)
     let mut numbers: []f32 = [1, 2]
     let first = &numbers[0]

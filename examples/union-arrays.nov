@@ -199,7 +199,9 @@ let inactive_payloads_and_storable_elements: () = {
     let wrapped = Option(@TypeOf(ranges)).some[ranges]
     let mut total = 0
     loop range in wrapped.unwrapOr([]) {
-        loop value in range { total += value }
+        loop value in range {
+            total += value
+        }
     }
     @assert(total == 9)
 }

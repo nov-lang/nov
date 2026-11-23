@@ -19,7 +19,9 @@ let expectValid: (bytes: []u8, expected: str) = {
     @assert(text == expected)
     let encoded = std.string.toBytes(text)
     @assert(@len(encoded) == @len(bytes))
-    loop actual, original in encoded, bytes { @assert(actual == original) }
+    loop actual, original in encoded, bytes {
+        @assert(actual == original)
+    }
 }
 
 let expectInvalid: (bytes: []u8) = {
@@ -39,7 +41,9 @@ let empty_ascii_and_nul: () = {
     let mut byte: u8 = 0
     loop {
         ascii += [byte]
-        if byte == 0x7F { break }
+        if byte == 0x7F {
+            break
+        }
         byte += 1
     }
     let text = std.string.fromBytes(ascii).unwrapOr("bad")
@@ -100,13 +104,17 @@ let invalid_leads_and_stray_continuations: () = {
     let mut byte: u8 = 0x80
     loop {
         expectInvalid([byte])
-        if byte == 0xC1 { break }
+        if byte == 0xC1 {
+            break
+        }
         byte += 1
     }
     byte = 0xF5
     loop {
         expectInvalid([byte, 0x80, 0x80, 0x80])
-        if byte == 0xFF { break }
+        if byte == 0xFF {
+            break
+        }
         byte += 1
     }
     expectInvalid([0xC0, 0x80])

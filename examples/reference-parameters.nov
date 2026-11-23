@@ -24,7 +24,9 @@ let recurse: (p: &mut int, count: int) = {
 let apply: (f: (&mut int, int), p: &mut int, amount: int) = f(p, amount)
 let total: (values: &[]int) -> int = {
     let mut result: int = 0
-    loop value in values.* { result += value }
+    loop value in values.* {
+        result += value
+    }
     result
 }
 let append: (values: &mut []str, value: str) = { values.* += [value] }
@@ -63,7 +65,9 @@ let mutation_readonly_and_direct_borrows: () = {
     let mut values: []int = [1, 2, 3]
     add(&values[-1], 5)
     @assert(total(&values) == 11)
-    loop &item in values { add(item, 1) }
+    loop &item in values {
+        add(item, 1)
+    }
     @assert(total(&values) == 14)
 }
 

@@ -30,7 +30,9 @@ let Custom = union {
         .function[callback] => "callback:{callback(4)}"
         .range[range] => {
             let mut count = 0
-            loop n in range { count += 1 }
+            loop n in range {
+                count += 1
+            }
             "range:{count}"
         }
         .none => "empty"
@@ -68,7 +70,9 @@ let callResult: (value: Result(Callback, str)) -> Result(int, str) = {
 let sumOption: (value: Option(IntRange)) -> Option(int) = {
     let range = value.!
     let mut sum = 0
-    loop n in range { sum += n }
+    loop n in range {
+        sum += n
+    }
     .some[sum]
 }
 
@@ -117,7 +121,9 @@ let escaping_shared_cells_and_overwritten_owner: () = {
     let copy = owner
     owner = .none[]
     let mut pressure: [][]int = []
-    loop n in @as(int, 0)..256 { pressure += [[n, n + 1]] }
+    loop n in @as(int, 0)..256 {
+        pressure += [[n, n + 1]]
+    }
     @assert(owner.isNone() and @len(pressure) == 256)
     let callback = match copy {
         .some[function] => function

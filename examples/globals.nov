@@ -57,7 +57,9 @@ let main: () = {
     @println("Imported:", shared.count, same.count, shared.counter.value, shared.counter.samples, shared.readSecret())
 
     let mut total: uint = 0
-    loop n in interval { total += n }
+    loop n in interval {
+        total += n
+    }
     @println("Range:", total, "Callback:", callback(5))
     callback = (value: int) -> int { value + count }
     count = 30
@@ -92,7 +94,9 @@ let aggregate_copies_and_replacement: () = {
     @assert("{old}" == "Message.values[[8, 9]]" and "{message}" == "Message.none")
     interval = 2..=4
     let mut total: uint = 0
-    loop n in interval { total += n }
+    loop n in interval {
+        total += n
+    }
     @assert(total == 9)
 }
 

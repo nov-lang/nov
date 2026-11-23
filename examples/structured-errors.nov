@@ -30,7 +30,11 @@ let LookupError = struct {
 }
 
 let lookup: (name: str) -> Result(Entry, LookupError) = {
-    if name == "readme" { .ok[Entry.[ name = name, size = 42 ]] } else { .err[LookupError.[ name = name ]] }
+    if name == "readme" {
+        .ok[Entry.[ name = name, size = 42 ]]
+    } else {
+        .err[LookupError.[ name = name ]]
+    }
 }
 
 let describe: (name: str) -> Result(str, LookupError) = .ok[lookup(name).!.describe()]

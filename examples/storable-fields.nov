@@ -110,7 +110,9 @@ let escaping_closures_aliases_and_snapshots: () = {
     let roots = [Box(Processor).[ value = echo(saved) ]]
     owner = make()
     let mut pressure: [][]int = []
-    loop n in @as(int, 0)..256 { pressure += [[n, n + 1]] }
+    loop n in @as(int, 0)..256 {
+        pressure += [[n, n + 1]]
+    }
     @assert(@len(pressure) == 256 and alias(1) == 1)
     @assert(saved.run(2) == 3 and roots[0].value.run(3) == 6)
     @assert(counter().run(1) == 1)
@@ -171,7 +173,9 @@ let range_fields_reloop_and_inclusive_max: () = {
         total += n
         processor.interval = 9..10
     }
-    loop n in saved.interval { total += n }
+    loop n in saved.interval {
+        total += n
+    }
     @assert(total == 12)
     let maximum: uint = 18446744073709551615
     processor.interval = maximum..=maximum
@@ -202,7 +206,9 @@ let generic_fields_methods_and_printing: () = {
     @assert(function.get()(5) == 6 and function.value(6) == 7)
     let ranges = Box(@TypeOf(0..10)).[ value = 2..4 ]
     let mut sum: uint = 0
-    loop n in ranges.get() { sum += n }
+    loop n in ranges.get() {
+        sum += n
+    }
     @assert(sum == 5)
     let processor = make()
     @assert("{processor}" == "Processor(4)")

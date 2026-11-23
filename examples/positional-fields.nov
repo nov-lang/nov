@@ -86,9 +86,13 @@ let range_reuse: () = {
         r.0 = 8..10
     }
     @assert(sum == 3 and r.1 == 7)
-    loop i in saved.0 { sum += i }
+    loop i in saved.0 {
+        sum += i
+    }
     @assert(sum == 6)
-    loop i in r.0 { sum += i }
+    loop i in r.0 {
+        sum += i
+    }
     @assert(sum == 23)
 }
 

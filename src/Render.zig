@@ -19,6 +19,22 @@ allocator: std.mem.Allocator,
 ais: *Ais,
 ast: Ast,
 fixups: Fixups,
+output: *std.Io.Writer.Allocating,
+expanded: *std.AutoHashMapUnmanaged(Ast.Node.Index, void),
+compact_spans: *std.ArrayList(CompactSpan),
+
+const CompactSpan = struct {
+    node: Ast.Node.Index,
+    start: usize,
+    end: usize,
+};
+
+const ExpressionContext = struct {
+    value_used: bool = true,
+    force_multiline: bool = false,
+    // Branches of an if/else chain must make one width decision.
+    compact_group: ?Ast.Node.Index = null,
+};
 
 pub const Fixups = struct {
     /// The key is the `let` token of the variable declaration
@@ -79,13 +95,63 @@ pub const Fixups = struct {
 };
 
 pub fn renderTree(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixups) Error!void {
-    renderTreeInner(buffer, ast, fixups) catch |err| switch (err) {
+    renderTreeWithWidth(buffer, ast, fixups) catch |err| switch (err) {
         // The only writer sink is Allocating, so WriteFailed means allocation failed.
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
     };
 }
 
-fn renderTreeInner(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixups) RenderError!void {
+fn renderTreeWithWidth(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixups) RenderError!void {
+    var output: std.Io.Writer.Allocating = .init(buffer.allocator);
+    defer output.deinit();
+    var expanded: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty;
+    defer expanded.deinit(buffer.allocator);
+    var spans: std.ArrayList(CompactSpan) = .empty;
+    defer spans.deinit(buffer.allocator);
+
+    // Decisions only move from compact to expanded. Each pass renders the tree
+    // once (never recursively previews subtrees), and must retire a candidate.
+    while (true) {
+        output.writer.end = 0;
+        spans.clearRetainingCapacity();
+        try renderTreeInner(&output, ast, fixups, &expanded, &spans);
+        const text = output.written();
+        var changed = false;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var start: usize = 0;
+        var first_span: usize = 0;
+        while (lines.next()) |line| {
+            const end = start + line.len;
+            // Count scalar starts rather than UTF-8 bytes. Token contents are
+            // copied unchanged; this is only a layout measurement.
+            var width: usize = 0;
+            for (line) |byte| {
+                if (byte & 0xc0 != 0x80) width += 1;
+            }
+            // Compact blocks cannot contain other blocks, so spans arrive in
+            // output order. Sweep them rather than rescanning for every line.
+            while (first_span < spans.items.len and spans.items[first_span].end <= start) : (first_span += 1) {}
+            if (width > 100) {
+                for (spans.items[first_span..]) |span| {
+                    if (span.start >= end) break;
+                    const entry = try expanded.getOrPut(buffer.allocator, span.node);
+                    changed = changed or !entry.found_existing;
+                }
+            }
+            start = end + 1;
+        }
+        if (!changed) break;
+    }
+    try buffer.writer.writeAll(output.written());
+}
+
+fn renderTreeInner(
+    buffer: *std.Io.Writer.Allocating,
+    ast: Ast,
+    fixups: Fixups,
+    expanded: *std.AutoHashMapUnmanaged(Ast.Node.Index, void),
+    spans: *std.ArrayList(CompactSpan),
+) RenderError!void {
     assert(ast.errors.len == 0); // Cannot render an invalid AST.
     var auto_indenting_stream = Ais.init(buffer, indent_delta);
     defer auto_indenting_stream.deinit();
@@ -94,6 +160,9 @@ fn renderTreeInner(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixups) 
         .ais = &auto_indenting_stream,
         .ast = ast,
         .fixups = fixups,
+        .output = buffer,
+        .expanded = expanded,
+        .compact_spans = spans,
     };
 
     // Render all the line comments at the beginning of the file.
@@ -202,6 +271,10 @@ fn renderExpressions(
 }
 
 fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderError!void {
+    return self.renderExpressionContext(node, space, .{});
+}
+
+fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, context: ExpressionContext) RenderError!void {
     const ast = self.ast;
     const ais = self.ais;
     const token_tags = ast.tokens.items(.tag);
@@ -213,7 +286,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         try renderOnlySpace(self, space);
         return;
     } else if (self.fixups.replace_nodes_with_node.get(node)) |replacement| {
-        return self.renderExpression(replacement, space);
+        return self.renderExpressionContext(replacement, space, context);
     }
     switch (node_tags[node]) {
         .inferred_type => return self.renderIdentifier(main_tokens[node], space, .preserve_when_shadowing),
@@ -237,13 +310,19 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .block_two, .block_two_newline, .block, .block_newline => {
             var buffer: [2]Ast.Node.Index = undefined;
             const block = ast.fullBlock(&buffer, node).?;
-            if (block.ast.statements.len == 0 and !hasComment(ast, block.ast.lbrace, block.ast.rbrace)) {
+            const start = self.output.written().len;
+            const group = context.compact_group orelse node;
+            const may_compact = !context.force_multiline and !self.expanded.contains(node) and !self.expanded.contains(group);
+            var compact = false;
+            if (may_compact and block.ast.statements.len == 0 and !hasComment(ast, block.ast.lbrace, block.ast.rbrace)) {
+                compact = true;
                 try self.renderToken(block.ast.lbrace, .none);
-            } else if (block.ast.statements.len == 1 and self.inlineBlockExpression(block.ast.statements[0]) and
+            } else if (may_compact and block.ast.statements.len == 1 and self.inlineBlockExpression(block.ast.statements[0]) and
                 !hasComment(ast, block.ast.lbrace, block.ast.rbrace))
             {
+                compact = true;
                 try self.renderToken(block.ast.lbrace, .space);
-                try self.renderExpression(block.ast.statements[0], .space);
+                try self.renderExpressionContext(block.ast.statements[0], .space, .{ .value_used = context.value_used });
             } else {
                 try ais.pushIndent(.normal);
                 try self.renderToken(block.ast.lbrace, .newline);
@@ -255,13 +334,20 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
                     if (node_tags[statement] == .decl) {
                         try self.renderDecl(ast.fullDecl(statement).?, .endline);
                     } else {
-                        try self.renderExpression(statement, .endline);
+                        try self.renderExpressionContext(statement, .endline, .{
+                            .value_used = context.value_used and i + 1 == block.ast.statements.len,
+                        });
                     }
                 }
                 ais.popSpace();
                 ais.popIndent();
             }
-            return self.renderToken(block.ast.rbrace, space);
+            try self.renderToken(block.ast.rbrace, space);
+            if (compact) try self.compact_spans.append(self.allocator, .{
+                .node = group,
+                .start = start,
+                .end = self.output.written().len,
+            });
         },
         .loop_range => {
             const loop = ast.fullRange(node).?;
@@ -283,14 +369,17 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             }
             if (loop.continuation != 0) {
                 try self.renderToken(ast.firstToken(loop.continuation) - 1, .space);
-                try self.renderExpression(loop.continuation, .space);
+                try self.renderExpressionContext(loop.continuation, .space, .{ .value_used = false });
             }
             if (loop.else_expr != 0) {
-                try self.renderExpression(loop.body, .space);
+                try self.renderExpressionContext(loop.body, .space, .{ .value_used = false, .force_multiline = true });
                 try self.renderToken(ast.lastToken(loop.body) + 1, .space);
-                return self.renderExpression(loop.else_expr, space);
+                return self.renderExpressionContext(loop.else_expr, space, .{
+                    .value_used = context.value_used,
+                    .force_multiline = !context.value_used,
+                });
             }
-            return self.renderExpression(loop.body, space);
+            return self.renderExpressionContext(loop.body, space, .{ .value_used = false, .force_multiline = true });
         },
         .loop_condition, .loop_cont, .loop_else => {
             const loop = ast.fullLoop(node).?;
@@ -298,14 +387,17 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             if (loop.condition != 0) try self.renderExpression(loop.condition, .space);
             if (loop.continuation != 0) {
                 try self.renderToken(ast.firstToken(loop.continuation) - 1, .space);
-                try self.renderExpression(loop.continuation, .space);
+                try self.renderExpressionContext(loop.continuation, .space, .{ .value_used = false });
             }
             if (loop.else_expr != 0) {
-                try self.renderExpression(loop.body, .space);
+                try self.renderExpressionContext(loop.body, .space, .{ .value_used = false, .force_multiline = true });
                 try self.renderToken(ast.lastToken(loop.body) + 1, .space);
-                return self.renderExpression(loop.else_expr, space);
+                return self.renderExpressionContext(loop.else_expr, space, .{
+                    .value_used = context.value_used,
+                    .force_multiline = !context.value_used,
+                });
             }
-            return self.renderExpression(loop.body, space);
+            return self.renderExpressionContext(loop.body, space, .{ .value_used = false, .force_multiline = true });
         },
 
         .@"defer" => {
@@ -316,7 +408,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             const comptime_token = main_tokens[node];
             const block = datas[node].rhs;
             try self.renderToken(comptime_token, .none);
-            return self.renderExpression(block, space);
+            return self.renderExpressionContext(block, space, context);
         },
 
         .field_access => {
@@ -551,8 +643,9 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         },
 
         .function_expr => {
+            const proto = ast.fullFnProto(datas[node].lhs).?;
             try self.renderExpression(datas[node].lhs, .space);
-            return self.renderExpression(datas[node].rhs, space);
+            return self.renderExpressionContext(datas[node].rhs, space, .{ .value_used = self.functionResultUsed(proto) });
         },
         .fn_proto_one, .fn_proto => {
             const proto = ast.fullFnProto(node).?;
@@ -590,7 +683,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             }
             try self.ais.pushIndent(.normal);
             try self.renderToken(match.lbrace, .newline);
-            for (match.cases) |case| try self.renderExpression(case, .newline);
+            for (match.cases) |case| try self.renderExpressionContext(case, .newline, .{ .value_used = context.value_used });
             self.ais.popIndent();
             return self.renderToken(ast.lastToken(node), space);
         },
@@ -618,17 +711,23 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
                 if (token_tags[next] == .comma) try self.renderToken(next, .space);
             }
             try self.renderToken(prong.arrow_token, .space);
-            return self.renderExpression(prong.target_expr, space);
+            return self.renderExpressionContext(prong.target_expr, space, .{ .value_used = context.value_used });
         },
 
         .@"if", .if_else => {
             const conditional = ast.fullIf(node).?;
             try self.renderToken(conditional.ast.if_token, .space);
             try self.renderExpression(conditional.ast.cond_expr, .space);
-            try self.renderExpression(conditional.ast.then_expr, if (conditional.ast.else_expr == 0) space else .space);
+            const value_used = context.value_used and conditional.ast.else_expr != 0;
+            const branch_context: ExpressionContext = .{
+                .value_used = value_used,
+                .force_multiline = context.force_multiline or !value_used,
+                .compact_group = context.compact_group orelse node,
+            };
+            try self.renderExpressionContext(conditional.ast.then_expr, if (conditional.ast.else_expr == 0) space else .space, branch_context);
             if (conditional.ast.else_expr != 0) {
                 try self.renderToken(conditional.else_token, .space);
-                try self.renderExpression(conditional.ast.else_expr, space);
+                try self.renderExpressionContext(conditional.ast.else_expr, space, branch_context);
             }
         },
 
@@ -645,6 +744,15 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .root,
         => unreachable,
     }
+}
+
+fn functionResultUsed(self: *Render, proto: Ast.full.FnProto) bool {
+    // Omitted results in function declarations mean void; closures carry an
+    // explicit inferred-result marker. Treat inferred tails as potential values
+    // without attempting to resolve aliases or the types of tail expressions.
+    const result = proto.ast.return_type orelse return proto.ast.infer_result;
+    return !(self.ast.nodes.items(.tag)[result] == .identifier and
+        std.mem.eql(u8, self.ast.tokenSlice(self.ast.nodes.items(.main_token)[result]), "void"));
 }
 
 fn inlineBlockExpression(self: *Render, node: Ast.Node.Index) bool {
@@ -696,7 +804,9 @@ fn listIsMultiline(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex) b
     const tags = self.ast.tokens.items(.tag);
     var token = open + 1;
     while (token < close) : (token += 1) {
-        if (tags[token] == .l_brace and tags[token + 1] != .r_brace) return true;
+        // Empty blocks can expand too (loop bodies and width decisions).
+        // Prime the surrounding list's layout independently of source layout.
+        if (tags[token] == .l_brace) return true;
     }
     return false;
 }
@@ -760,7 +870,8 @@ fn renderDeclWithoutFixups(
             assert(token_tags[prev_token] == .newline);
             try self.renderToken(prev_token - 1, .newline); // =
         }
-        try self.renderExpression(decl.ast.init_node, space);
+        const value_used = if (ast.fullFnProto(decl.ast.type_node)) |proto| self.functionResultUsed(proto) else true;
+        try self.renderExpressionContext(decl.ast.init_node, space, .{ .value_used = value_used });
         ais.popIndent();
     }
 }

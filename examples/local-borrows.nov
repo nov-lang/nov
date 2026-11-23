@@ -53,7 +53,9 @@ let main: () = {
     let mut range = 0..2
     let selected = &range
     selected.* = 1..=2
-    loop i in selected.* { @print("{i} ") }
+    loop i in selected.* {
+        @print("{i} ")
+    }
     @println()
 
     let mut operation = double

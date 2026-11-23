@@ -31,7 +31,9 @@ let Box: (T: type) -> type = struct {
 let unwrap: (box: Box(`T)) -> `U = box.value
 let invert: (value: `T) -> `U = !value
 let size: (value: `T) -> `U = @len(value)
-let looped: (value: `T) -> `U = loop { break value }
+let looped: (value: `T) -> `U = loop {
+    break value
+}
 
 let main: () = {
     let numbers: []uint = [7, 8]
