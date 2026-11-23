@@ -188,6 +188,167 @@ test "extremum globals isolate queries and skip unreachable factories" {
     for (result.ir.functions.items) |function| try std.testing.expect(!std.mem.eql(u8, function.name, "make"));
 }
 
+fn testArraySliceEvaluation(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const integer = try ir.internType(.{ .integer = .{ .bits = Ir.native_pointer_bits, .signedness = .signed } });
+    const array = try ir.internType(.{ .array = integer });
+    const nested = [_]Data{ .{ .scalar = .{ .string = "managed" } }, .{ .function = @fromBackingInt(7) } };
+    const payload: Data = .{ .aggregate = &nested };
+    const elements = [_]Data{ .{ .scalar = .{ .signed_integer = 1 } }, payload, .{ .tagged = .{ .index = 2, .payload = &payload } } };
+    var values = [_]Data{ .{ .aggregate = &elements }, .{ .scalar = .{ .signed_integer = -2 } }, .{ .scalar = .{ .signed_integer = -1 } } };
+    const instructions = [_]Ir.Instruction{.{ .ty = array, .span = .{ .start = 0, .end = 0 }, .op = undefined }};
+    const evaluator: Evaluator = .{ .allocator = arena.allocator(), .ir = &ir, .globals = &.{}, .values = &values, .instructions = &instructions };
+    var instruction: Ir.Instruction = .{ .ty = array, .span = .{ .start = 0, .end = 0 }, .op = .{ .array_slice = .{ .base = @fromBackingInt(0), .start = @fromBackingInt(1), .end = @fromBackingInt(2), .inclusive = true } } };
+    const result = try evaluator.evaluate(instruction);
+    try std.testing.expectEqual(@as(usize, 2), result.aggregate.len);
+    try std.testing.expect(result.aggregate.ptr != elements[1..].ptr);
+    try std.testing.expectEqualDeep(elements[1..], result.aggregate);
+    for ([_]Data{
+        .{ .scalar = .{ .boolean = true } },       .{ .scalar = .{ .string = "1" } },
+        .{ .scalar = .{ .unsigned_integer = 1 } }, .{ .scalar = .{ .rune = 1 } },
+        .{ .scalar = .{ .enum_tag = 1 } },         .{ .scalar = .{ .float_bits = 0 } },
+        .{ .scalar = .void },                      payload,
+        elements[2],                               nested[1],
+    }) |invalid| {
+        for ([_]bool{ false, true }) |end| {
+            values[1] = invalid;
+            instruction.op.array_slice.start = if (end) null else @fromBackingInt(1);
+            instruction.op.array_slice.end = if (end) @fromBackingInt(1) else null;
+            try std.testing.expectError(error.InvalidData, evaluator.evaluate(instruction));
+        }
+    }
+    for ([_][2]i128{ .{ -4, 0 }, .{ 0, 4 }, .{ 2, 1 }, .{ std.math.minInt(i128), 0 }, .{ 0, std.math.maxInt(i128) } }) |bounds| {
+        values[1] = .{ .scalar = .{ .signed_integer = bounds[0] } };
+        values[2] = .{ .scalar = .{ .signed_integer = bounds[1] } };
+        instruction.op.array_slice.start = @fromBackingInt(1);
+        instruction.op.array_slice.end = @fromBackingInt(2);
+        instruction.op.array_slice.inclusive = false;
+        try std.testing.expectError(error.InvalidData, evaluator.evaluate(instruction));
+    }
+}
+
+test "array slice evaluator copies Data and rejects invalid scalar bounds under OOM" {
+    try testArraySliceEvaluation(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArraySliceEvaluation, .{});
+}
+
+fn testArraySliceData(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "global-array-slice.nov",
+        \\let tail=items[first..=-1]
+        \\let count=@len(tail)
+        \\let first:int=-2
+        \\let items=[1,2,3]
+        \\let all=items[..=]
+        \\let empty=items[3..3]
+        \\let none:[]str=[]
+        \\let R=struct{rows:[][]str,}
+        \\let U=union{some:R,none,}
+        \\let rows=[["a","b"],["c"]]
+        \\let record=R.[rows=rows[..]]
+        \\let wrapped=U.some[record]
+        \\let wrappers=[wrapped]
+        \\let managed=wrappers[..]
+        \\let nested=record.rows[-2..=0][0][1..]
+        \\let flag_values=[true,false]
+        \\let flags=flag_values[..]
+        \\let float_values=[1.0,2.0]
+        \\let floats=float_values[..]
+        \\let rune_values=['é','x']
+        \\let runes=rune_values[..]
+        \\let E=enum{one,two,}
+        \\let enum_values=[E.one,E.two]
+        \\let enums=enum_values[..]
+        \\let callback:()->int=1
+        \\let callback_values=[callback]
+        \\let callbacks=callback_values[..]
+        \\let range_values=[0..2,3..=4]
+        \\let ranges=range_values[..]
+        \\let Alias=@TypeOf(items[{1/0}..])
+        \\let queried:Alias=items[..]
+        \\let no=false and @len(items[{1/0}..])==0
+        \\let yes=true or @len(items[..=3])==0
+        \\let proof_tail=tail==[2,3]
+        \\let proof_all=all==items
+        \\let proof_empty=@len(empty)==0
+        \\let proof_none=@len(none[..=])==0
+        \\let proof_nested=nested==["b"]
+        \\let proof_managed=managed==[wrapped]
+        \\let proof_flags=flags[0]
+        \\let proof_floats=floats[1]==2.0
+        \\let proof_runes=runes[0]=='é'
+        \\let proof_enums=enums[1]==E.two
+        \\let proof_callbacks=@len(callbacks)==1
+        \\let proof_ranges=@len(ranges[1])==2
+        \\let proof_no=!no
+        \\let proof_yes=yes
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("array slice globals: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var proofs: usize = 0;
+    var slices: usize = 0;
+    for (result.ir.globals.items) |global| {
+        const body = result.ir.getFunction(global.initializer).?.body.?;
+        for (body.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .call);
+            if (instruction.op == .array_slice) slices += 1;
+        }
+        if (std.mem.eql(u8, global.name, "count") or std.mem.startsWith(u8, global.name, "proof_")) {
+            const instruction = body.instructions[@backingInt(body.result)];
+            try std.testing.expect(instruction.op == .constant);
+            const value = result.ir.getConstant(instruction.op.constant).?.value;
+            if (std.mem.eql(u8, global.name, "count")) {
+                try std.testing.expect(value == .unsigned_integer and value.unsigned_integer == 2);
+            } else {
+                try std.testing.expect(value == .boolean and value.boolean);
+                proofs += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 14), proofs);
+    try std.testing.expect(slices >= 15);
+}
+
+test "array slice globals preserve known managed data queries and skipped bounds under OOM" {
+    try testArraySliceData(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArraySliceData, .{});
+}
+
+fn testArraySliceRejection(allocator: std.mem.Allocator, source: []const u8, tag: Module.Diagnostic.Tag) !void {
+    var module = try Module.init(allocator, "global-array-slice-invalid.nov", source);
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+    try std.testing.expect(!result.lowering_complete);
+}
+
+test "array slice globals reject reached invalid bounds and user calls under OOM" {
+    for ([_][]const u8{
+        "items[-4..]",                              "items[..4]", "items[2..1]", "items[..=3]", "items[..=-4]",
+        "items[@as(int,-9223372036854775807)-1..]",
+    }) |expression| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let items=[1,2,3]\nlet f:()->int=0\nlet value=", expression });
+        defer std.testing.allocator.free(source);
+        try testArraySliceRejection(std.testing.allocator, source, .unsupported_global_initializer);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArraySliceRejection, .{ source, .unsupported_global_initializer });
+    }
+    const call_source = "let items=[1,2,3]\nlet f:()->int=0\nlet value=items[f()..]";
+    try testArraySliceRejection(std.testing.allocator, call_source, .unsupported_dependency_expression);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArraySliceRejection, .{ call_source, .unsupported_dependency_expression });
+}
+
 fn testArrayConcatenationData(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "global-array-concat.nov",
         \\let rows=first+[[2]]
@@ -903,6 +1064,20 @@ const Evaluator = struct {
                 }
                 return error.InvalidData;
             },
+            .array_slice => |slice| {
+                const base = self.get(slice.base);
+                if (base != .aggregate) return error.InvalidData;
+                const len = base.aggregate.len;
+                const first = if (slice.start) |id| try self.arraySliceBound(id, len) else 0;
+                const end = if (slice.end) |id| try self.arraySliceBound(id, len) else len;
+                const inclusive = slice.end != null and slice.inclusive;
+                if (inclusive and end == len) return error.InvalidData;
+                const last = end + @intFromBool(inclusive);
+                if (first > last) return error.InvalidData;
+                // Data is immutable arena-owned evaluation state. Executable IR
+                // retains the slice operation, which recursively copies storage.
+                return .{ .aggregate = try self.allocator.dupe(Data, base.aggregate[first..last]) };
+            },
             .string_slice => |slice| blk: {
                 const base = try self.scalar(slice.base);
                 if (base != .string) return error.InvalidData;
@@ -1102,6 +1277,12 @@ const Evaluator = struct {
             },
             else => error.InvalidData,
         };
+    }
+
+    fn arraySliceBound(self: Evaluator, id: Ir.ValueId, len: usize) error{InvalidData}!usize {
+        const value = try self.scalar(id);
+        if (value != .signed_integer) return error.InvalidData;
+        return normalizeBound(value.signed_integer, len);
     }
 
     // Use the wider evaluation integer so even the minimum native signed

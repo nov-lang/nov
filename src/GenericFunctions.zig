@@ -2482,6 +2482,54 @@ test "min max solver ordinary generic calls validate ordering under OOM" {
     }
 }
 
+test "array slicing readonly exact types generic callbacks and query purity" {
+    for ([_][:0]const u8{
+        "let expected:[]u8\nlet query=@as([]u8,[])[..]",
+        "let expected:[][]u8\nlet query=@as([][]u8,[[1],[2]])[-2..=-1]",
+        "let expected:u8\nlet query=@as([]u8,[1,2])[1..][0]",
+        "let expected:str\nlet query=\"abc\"[1..]",
+        "let expected:[]u8\nlet query={let cut=(x){x[1..]}\ncut(@as([]u8,[1,2]))}",
+        "let expected:str\nlet query={let cut=(x){x[1..]}\ncut(\"abc\")}",
+        "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet expected:[]u8\nlet query=apply((x){x[..]},@as([]u8,[1]))",
+        "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet expected:str\nlet query=apply((x){x[..]},\"abc\")",
+        "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet expected:u8\nlet query=apply((x){x[1..][0]},@as([]u8,[1,2]))",
+        "let cut:(x:`T)->`T=x[..]\nlet expected:str\nlet query=cut(\"abc\")",
+        "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet expected:str\nlet query=both((x){x[1..]},(){\"abc\"})",
+        "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet expected:rune\nlet query=both((x){x[1..][0]},(){\"abc\"})",
+        "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet expected:[]u8\nlet query=both((x){x[1..]},(){@as([]u8,[1,2])})",
+        "let cut:(x:`T)->`T=x[..]\nlet expected:[]u8\nlet query=cut(@as([]u8,[1]))",
+        "let expected:[]u8\nlet query={let cut=(x)->[]u8{x[..]}\ncut([])}",
+        "let expected:str\nlet query={let cut=(x)->str{x[..]}\ncut(\"abc\")}",
+    }) |source| {
+        errdefer std.debug.print("slice query source: {s}\n", .{source});
+        try testDefaultTypeQuery(std.testing.allocator, source, true);
+    }
+    for ([_][:0]const u8{
+        "let query=@as([]u8,[1])[true..]",
+        "let query=@as([]u8,[1])[..@as(uint,1)]",
+        "let query=@as([]u8,[1])[@as(i8,0)..]",
+        "let query=@as(int,1)[..]",
+        "let query=@as(str,@as([]u8,[])[..])",
+        "let query={let cut=(x){x[..]}\ncut(true)}",
+        "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet query=both((x){x[..]},(){true})",
+        "let query={let mut a=[1]\nlet r=&a\nr[..]}",
+        "let query={let mut a=[1]\na[..]=[2]}",
+        "let query={let mut a=[1]\nlet r=&a[..]\nr}",
+    }) |source| {
+        errdefer std.debug.print("invalid slice query source: {s}\n", .{source});
+        try testDefaultTypeQuery(std.testing.allocator, source, false);
+    }
+}
+
+test "array slicing readonly query purity under OOM" {
+    for ([_]struct { source: [:0]const u8, valid: bool }{
+        .{ .source = "let expected:[][]u8\nlet query=@as([][]u8,[[1],[2]])[-2..=-1]", .valid = true },
+        .{ .source = "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet expected:rune\nlet query=both((x){x[1..][0]},(){\"abc\"})", .valid = true },
+        .{ .source = "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet expected:u8\nlet query=apply((x){x[1..][0]},@as([]u8,[1,2]))", .valid = true },
+        .{ .source = "let query={let cut=(x){x[..]}\ncut(true)}", .valid = false },
+    }) |case| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testDefaultTypeQuery, .{ case.source, case.valid });
+}
+
 const Solver = struct {
     allocator: std.mem.Allocator,
     caller: *Module,
@@ -2507,13 +2555,14 @@ const Solver = struct {
     query_unions: std.ArrayList(struct { payload_type: *Term, module: *Module, node: Ast.Node.Index, payload: Ast.Node.Index, enum_payload: bool }) = .empty,
     query_matches: std.ArrayList(struct { module: *Module, node: Ast.Node.Index, subjects: []const *Term }) = .empty,
     length_operands: std.ArrayList(*Term) = .empty,
+    slices: std.ArrayList(struct { base: *Term, span: Module.Span }) = .empty,
     query_statements: std.ArrayList(struct { operand: *Term, span: Module.Span }) = .empty,
     query_places: std.ArrayList(struct { operand: *Term, kind: enum { array, record, mutable_reference, borrow_array, clear_array }, span: Module.Span }) = .empty,
     analysis: ?*const Sema = null,
     types: []const ?Ir.TypeId = &.{},
     unsupported: ?Module.Span = null,
     pending_bodies: std.ArrayList(struct { frame: Frame, depth: usize, querying: bool }) = .empty,
-    projections: std.ArrayList(struct { base: *Term, result: *Term, name: ?[]const u8, span: Module.Span, iteration: bool = false }) = .empty,
+    projections: std.ArrayList(struct { base: *Term, result: *Term, name: ?[]const u8, span: Module.Span, iteration: bool = false, indexing: bool = false }) = .empty,
     parameters: []const *Term = &.{},
     defaults: std.ArrayList(struct { term: *Term, ty: Ir.TypeId }) = .empty,
     float_defaults_only: bool = false,
@@ -2542,6 +2591,19 @@ const Solver = struct {
         var progress = true;
         while (progress and !self.failed) {
             progress = try self.resolveOperations();
+            var slice_index: usize = 0;
+            while (slice_index < self.slices.items.len and !self.failed) {
+                const slice = self.slices.items[slice_index];
+                const base = root(slice.base);
+                if (base.value == .unknown) {
+                    slice_index += 1;
+                    continue;
+                }
+                const valid = base.value == .array or (base.value == .known and self.ir.getType(base.value.known).? == .string);
+                if (!valid) try self.fail(.string_slice_requires_string, slice.span, null);
+                _ = self.slices.swapRemove(slice_index);
+                progress = true;
+            }
             var i: usize = 0;
             while (i < self.projections.items.len) {
                 const projection = self.projections.items[i];
@@ -2549,7 +2611,14 @@ const Solver = struct {
                     i += 1;
                     continue;
                 }
-                const value = if (projection.iteration)
+                const value = if (projection.indexing) blk: {
+                    const base = root(projection.base).value;
+                    if (base == .array) break :blk base.array;
+                    if (base == .known and self.ir.getType(base.known).? == .string)
+                        break :blk try self.fromType(try self.ir.internType(.rune), projection.span, 0);
+                    try self.fail(.expression_type_mismatch, projection.span, null);
+                    break :blk try self.term(.unknown, projection.span);
+                } else if (projection.iteration)
                     try self.iterationElement(projection.base, projection.span)
                 else if (projection.name) |name|
                     try self.fieldType(projection.base, name, projection.span, 0)
@@ -4339,20 +4408,48 @@ const Solver = struct {
                 try self.unify(index, try self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } }), span, 0), span, 0);
                 if (known.value == .known and self.ir.getType(known.value.known).? == .string) return self.fromType(try self.ir.internType(.rune), span, 0);
                 const element = try self.term(.unknown, span);
+                // Indexing an unresolved slice cannot choose array over string.
+                // Keep ordinary indexing's array inference for other operands.
+                if (known.value == .unknown) for (self.slices.items) |slice| {
+                    if (root(slice.base) == known) {
+                        try self.projections.append(self.allocator, .{ .base = base, .result = element, .name = null, .span = span, .indexing = true });
+                        return element;
+                    }
+                };
                 try self.unify(base, try self.term(.{ .array = element }, span), span, 0);
                 return element;
             },
             .slice => {
                 if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
                     return self.unionConstructor(frame, node, ty, depth + 1);
+                if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) {
+                    self.unsupported = self.unsupported orelse span;
+                    return self.term(.unknown, span);
+                }
                 const slice = ast.slice(node).ast;
-                const string = try self.fromType(try self.ir.internType(.string), span, 0);
-                try self.unify(string, try self.expression(frame, slice.sliced, depth + 1), span, 0);
+                const context = if (expected) |want| blk: {
+                    const value = root(want).value;
+                    break :blk if (value == .array or (value == .known and self.ir.getType(value.known).? == .string)) want else null;
+                } else null;
+                const base = try self.expressionExpected(frame, slice.sliced, context, depth + 1);
+                if (root(base).value == .never) return base;
+                if (context) |want| if (root(base).value == .unknown) try self.unify(base, want, span, 0);
+                const base_span = module.tokenSpan(ast.firstToken(slice.sliced));
+                const kind = root(base).value;
+                if (kind != .unknown and kind != .array and !(kind == .known and self.ir.getType(kind.known).? == .string)) {
+                    try self.fail(.string_slice_requires_string, base_span, null);
+                    return base;
+                }
+                // A slice preserves its base type, but does not choose a sequence
+                // kind for an unconstrained callback parameter.
+                if (kind == .unknown) try self.slices.append(self.allocator, .{ .base = base, .span = base_span });
                 const index = try self.fromType(try BodyChecker.defaultIntegerType(self.ir), span, 0);
                 for ([_]Ast.Node.Index{ slice.start, slice.end }) |bound| if (bound != 0) {
-                    try self.unify(index, try self.expressionExpected(frame, bound, index, depth + 1), span, 0);
+                    const value = try self.expressionExpected(frame, bound, index, depth + 1);
+                    if (root(value).value == .never) return value;
+                    try self.unify(index, value, span, 0);
                 };
-                return string;
+                return base;
             },
             .container_decl_arg => {
                 if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|

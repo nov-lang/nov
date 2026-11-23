@@ -3548,7 +3548,11 @@ const Context = struct {
             .slice => blk: {
                 if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
                 if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) break :blk null;
-                break :blk .{ .ty = try self.ir.internType(.string) };
+                const base = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
+                break :blk switch (self.ir.getType(base.ty).?) {
+                    .array, .string => base,
+                    else => null,
+                };
             },
             .char_literal => .{ .ty = try self.ir.internType(.rune) },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => try self.probeArray(node, depth),
@@ -3785,7 +3789,7 @@ const Context = struct {
             // These operations already produce independent storage. Their result
             // is an expression temporary, not another read of its eventual binding.
             switch (emitter.instructions.items[@backingInt(try emitter.value(node))].op) {
-                .array_clone, .array_literal, .array_set, .array_append, .record_init, .union_init, .call, .branch, .loop => return,
+                .array_clone, .array_literal, .array_slice, .array_set, .array_append, .record_init, .union_init, .call, .branch, .loop => return,
                 else => {},
             }
         }
@@ -3905,12 +3909,14 @@ const Context = struct {
             },
             .slice => blk: {
                 const bounds = ast.slice(node).ast;
-                break :blk .{ .string_slice = .{
-                    .base = try emitter.value(bounds.sliced),
-                    .start = if (bounds.start != 0) try emitter.value(bounds.start) else null,
-                    .end = if (bounds.end != 0) try emitter.value(bounds.end) else null,
-                    .inclusive = ast.tokens.items(.tag)[ast.nodes.items(.main_token)[data.rhs]] == .period_period_equal,
-                } };
+                const base = try emitter.value(bounds.sliced);
+                const start = if (bounds.start != 0) try emitter.value(bounds.start) else null;
+                const end = if (bounds.end != 0) try emitter.value(bounds.end) else null;
+                const inclusive = ast.tokens.items(.tag)[ast.nodes.items(.main_token)[data.rhs]] == .period_period_equal;
+                break :blk if (self.ir.getType(ty).? == .array)
+                    .{ .array_slice = .{ .base = base, .start = start, .end = end, .inclusive = inclusive } }
+                else
+                    .{ .string_slice = .{ .base = base, .start = start, .end = end, .inclusive = inclusive } };
             },
             .deref => .{ .borrow_read = (try self.dereferenceBinding(node)).?.borrow.? },
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
@@ -5482,9 +5488,18 @@ const Context = struct {
             },
             .slice => {
                 const bounds = ast.slice(node).ast;
-                const base = (try self.expression(bounds.sliced, null, depth + 1)) orelse return null;
+                const base_hint = if (expected) |want| switch (self.ir.getType(want.ty).?) {
+                    .array, .string => expected,
+                    else => null,
+                } else null;
+                const base = (try self.expression(bounds.sliced, if (try self.probe(bounds.sliced, depth + 1) == null) base_hint else null, depth + 1)) orelse return null;
                 if (self.terminated) return if (expected) |want| want.ty else base;
-                if (self.ir.getType(base).? != .string) return self.fail(.string_slice_requires_string, bounds.sliced, null);
+                switch (self.ir.getType(base).?) {
+                    .array, .string => {},
+                    else => return self.fail(.string_slice_requires_string, bounds.sliced, null),
+                }
+                // Bounds can mutate the original storage, including nested arrays.
+                try self.copyNode(bounds.sliced, base);
                 const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
                 for ([_]Ast.Node.Index{ bounds.start, bounds.end }) |bound| {
                     if (bound == 0) continue;
@@ -9460,11 +9475,110 @@ test "inline range payloads evaluate bounds once in order before construction un
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInlineRangeEvaluation, .{});
 }
 
+fn testArraySlicingLowering(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "array-slices.nov",
+        \\let reduce:(items:[]`T,combine:(`T,`T)->`T)->`T={let mut result=items[0]
+        \\    loop item in items[1..] {result=combine(result,item)}
+        \\    result}
+        \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+        \\let bound:()->int=-1
+        \\let snapshot:(items:[][]u8)->[][]u8={let mut a=items
+        \\    a[{a[0]=[9]
+        \\        0}..=bound()]}
+        \\let sliceUse:(items:[]u8)->u8={let alias=&items
+        \\    let cut=alias.*[-2..=-1]
+        \\    let typed:[]u8=@as([]u8,[])[..]
+        \\    let inferred=apply((x){x[1..][0]},items)
+        \\    let query:@TypeOf(items[..])=cut
+        \\    reduce(query,(a,b){a+b})+inferred}
+    );
+    defer module.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("array slicing diagnostics: {any}; syntax: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var count: usize = 0;
+    var snapshot_checked = false;
+    for (sema.ir.functions.items) |function| {
+        for (function.body.?.instructions, 0..) |instruction, at| {
+            if (instruction.op != .array_slice) continue;
+            count += 1;
+            const slice = instruction.op.array_slice;
+            const instructions = function.body.?.instructions;
+            try std.testing.expect(sema.ir.getType(instruction.ty).? == .array);
+            try std.testing.expectEqual(instruction.ty, instructions[@backingInt(slice.base)].ty);
+            try std.testing.expect(@backingInt(slice.base) < at);
+            for ([_]?Ir.ValueId{ slice.start, slice.end }) |bound| if (bound) |value| {
+                try std.testing.expect(@backingInt(slice.base) < @backingInt(value));
+                try std.testing.expect(@backingInt(value) < at);
+                try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .signed, .bits = Ir.native_pointer_bits }, sema.ir.getType(instructions[@backingInt(value)].ty).?.integer);
+            };
+            if (sema.ir.getType(sema.ir.getType(instruction.ty).?.array).? == .array) {
+                try std.testing.expect(instructions[@backingInt(slice.base)].op == .array_clone);
+                var mutated = false;
+                for (instructions[@backingInt(slice.base) + 1 .. @backingInt(slice.start.?)]) |between| {
+                    if (between.op == .array_set) mutated = true;
+                }
+                try std.testing.expect(mutated);
+                snapshot_checked = true;
+            }
+        }
+    }
+    try std.testing.expect(count >= 4);
+    try std.testing.expect(snapshot_checked);
+}
+
+test "array slicing lowering snapshots exact types reduce callbacks under OOM" {
+    try testArraySlicingLowering(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArraySlicingLowering, .{});
+}
+
+test "array slicing rejects invalid bounds scalar bases and views" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let f:(a:[]u8)->[]u8=a[true..]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(a:[]u8,n:uint)->[]u8=a[..=n]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(a:[]u8,n:i8)->[]u8=a[n..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(a:bool)->bool=a[..]", .tag = .string_slice_requires_string },
+        .{ .source = "let f:(a:[]u8)->[]u16=a[..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(a:[]u8)->str=a[..]", .tag = .expression_type_mismatch },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "array-slice-errors.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+    }
+}
+
+test "array slicing terminal operands skip later effects" {
+    for ([_][]const u8{
+        "let f:()->[]u8=@panic(\"stop\")[missing..missing]",
+        "let f:(a:[]u8)->[]u8=a[{return a}..missing]",
+        "let f:(a:[]u8)->bool=a[0..@panic(\"stop\")]",
+        "let f:(a:[]u8)->[]u8=loop {a[..{break a}]}",
+        "let f:(a:[]u8)->[]u8=loop {a[{continue}..missing]}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "array-slice-terminal.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        for (sema.ir.functions.items) |function| for (function.body.?.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .array_slice);
+        };
+    }
+}
+
 test "string slicing semantic types inference and rejection" {
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .source = "let f:(s:str,n:uint)->str=s[..=n]", .tag = .expression_type_mismatch },
         .{ .source = "let f:(s:str)->str=s[true..=]", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(s:[]u8)->str=s[..]", .tag = .string_slice_requires_string },
+        .{ .source = "let f:(s:[]u8)->str=s[..]", .tag = .expression_type_mismatch },
         .{ .source = "let f:(s:rune)->str=s[..]", .tag = .string_slice_requires_string },
         .{ .source = "let f:(s:str,n:uint)->str=s[n..]", .tag = .expression_type_mismatch },
         .{ .source = "let f:(s:str,n:u8)->str=s[..n]", .tag = .expression_type_mismatch },

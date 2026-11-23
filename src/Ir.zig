@@ -115,6 +115,8 @@ pub const Operation = union(enum) {
     /// Scalar bounds; explicit inclusive end names the final included scalar.
     /// Omitted bounds default to zero and scalar length. Shares owner.
     string_slice: struct { base: ValueId, start: ?ValueId, end: ?ValueId, inclusive: bool = false },
+    /// Independent recursive element storage; bounds index the snapshotted base.
+    array_slice: struct { base: ValueId, start: ?ValueId, end: ?ValueId, inclusive: bool = false },
     /// Allocation-free scalar/string equality scan; record equality is unsupported.
     array_contains: struct { value: ValueId, array: ValueId },
     array_set: struct { array: ValueId, index: ValueId, value: ValueId },
@@ -1430,6 +1432,16 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .string_slice => |r| {
                 if (ty != .string) return error.OperandTypeMismatch;
                 if (self.getType(try operandType(body, r.base, i)).? != .string) return error.InvalidOperation;
+                for ([_]?ValueId{ r.start, r.end }) |bound| {
+                    if (bound) |value| {
+                        if (!isNativeInteger(self.getType(try operandType(body, value, i)).?, .signed)) return error.OperandTypeMismatch;
+                    }
+                }
+            },
+            .array_slice => |r| {
+                const base = try operandType(body, r.base, i);
+                if (self.getType(base).? != .array) return error.InvalidOperation;
+                if (instruction.ty != base) return error.OperandTypeMismatch;
                 for ([_]?ValueId{ r.start, r.end }) |bound| {
                     if (bound) |value| {
                         if (!isNativeInteger(self.getType(try operandType(body, value, i)).?, .signed)) return error.OperandTypeMismatch;
@@ -2848,6 +2860,123 @@ test "string slicing IR verifies optional native bounds types and prior operands
     owned[6].op.string_slice.base = @fromBackingInt(6);
     try std.testing.expectError(error.InvalidValueId, ir.verify());
     owned[6] = saved;
+    try ir.verify();
+}
+
+fn expectArraySliceVerifyError(ir: *const Ir, expected: VerifyError) !void {
+    ir.verify() catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(expected, err);
+        return;
+    };
+    return error.TestExpectedError;
+}
+
+fn testArraySliceVerification(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const array = try ir.internType(.{ .array = integer });
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const narrow = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 8 } });
+    const boolean = try ir.internType(.boolean);
+    const rune = try ir.internType(.rune);
+    const other_array = try ir.internType(.{ .array = uint });
+    const params = [_]TypeId{ array, integer, uint, narrow, boolean, rune, other_array };
+    const signature = try ir.internType(.{ .function = .{ .params = &params, .result = array } });
+    const function = try ir.addFunction("slice", signature, span);
+    var instructions: [8]Instruction = undefined;
+    for (params, 0..) |ty, i| instructions[i] = .{ .ty = ty, .span = span, .op = .{ .parameter = @intCast(i) } };
+    instructions[7] = .{ .ty = array, .span = span, .op = .{ .array_slice = .{ .base = @fromBackingInt(0), .start = @fromBackingInt(1), .end = @fromBackingInt(1) } } };
+    try ir.setFunctionBody(function, &instructions, @fromBackingInt(7));
+    try ir.verify();
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    const saved = owned[7];
+    for ([_]bool{ false, true }) |inclusive| {
+        for ([_]?ValueId{ null, @fromBackingInt(1) }) |start| {
+            for ([_]?ValueId{ null, @fromBackingInt(1) }) |end| {
+                owned[7].op.array_slice = .{ .base = @fromBackingInt(0), .start = start, .end = end, .inclusive = inclusive };
+                try ir.verify();
+            }
+        }
+    }
+    for ([_]bool{ false, true }) |end| {
+        for ([_]u32{ 0, 2, 3, 4, 5, 6, 7, 99 }) |bad| {
+            owned[7] = saved;
+            if (end) owned[7].op.array_slice.end = @fromBackingInt(bad) else owned[7].op.array_slice.start = @fromBackingInt(bad);
+            try expectArraySliceVerifyError(&ir, if (bad >= 7) error.InvalidValueId else error.OperandTypeMismatch);
+        }
+    }
+    for (params[1..]) |ty| {
+        owned[7] = saved;
+        owned[7].ty = ty;
+        try expectArraySliceVerifyError(&ir, error.OperandTypeMismatch);
+    }
+    owned[7] = saved;
+    owned[7].op.array_slice.base = @fromBackingInt(4);
+    try expectArraySliceVerifyError(&ir, error.InvalidOperation);
+    owned[7] = saved;
+    owned[7].op.array_slice.base = @fromBackingInt(7);
+    try expectArraySliceVerifyError(&ir, error.InvalidValueId);
+    owned[7] = saved;
+    try ir.verify();
+}
+
+test "array slicing IR exact array native signed bounds prior operands and every OOM" {
+    try testArraySliceVerification(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArraySliceVerification, .{});
+}
+
+test "array slicing IR rejects private regions slots and capabilities" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const array = try ir.internType(.{ .array = integer });
+    const boolean = try ir.internType(.boolean);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ array, integer, boolean }, .result = array } });
+    const function = try ir.addFunction("slice", signature, span);
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const ins = struct {
+        fn make(ty: TypeId, op: Operation) Instruction {
+            return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+        }
+    }.make;
+    const id = struct {
+        fn make(i: u32) ValueId {
+            return @fromBackingInt(i);
+        }
+    }.make;
+    try ir.setFunctionBody(function, &.{
+        ins(array, .{ .parameter = 0 }),
+        ins(integer, .{ .parameter = 1 }),
+        ins(boolean, .{ .parameter = 2 }),
+        ins(array, .{ .local_slot = id(0) }),
+        ins(unit, .{ .borrow_reserve = id(3) }),
+        ins(unit, .{ .borrow_start = .{ .reservation = id(4), .index = null } }),
+        ins(array, .{ .array_clone = id(0) }),
+        ins(uint, .{ .array_len = id(6) }),
+        ins(array, .{ .branch = .{ .condition = id(2), .then_start = 6, .else_start = 8, .then_value = id(6), .else_value = id(0) } }),
+        ins(array, .{ .array_slice = .{ .base = id(0), .start = id(1), .end = id(1) } }),
+    }, id(9));
+    try ir.verify();
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    const saved = owned[9];
+    for (0..3) |operand| {
+        for ([_]u32{ 3, 4, 5, 6, 7 }) |bad| {
+            owned[9] = saved;
+            switch (operand) {
+                0 => owned[9].op.array_slice.base = id(bad),
+                1 => owned[9].op.array_slice.start = id(bad),
+                2 => owned[9].op.array_slice.end = id(bad),
+                else => unreachable,
+            }
+            try std.testing.expectError(if (bad == 3 or bad >= 6) error.InvalidValueId else if (operand == 0) error.InvalidOperation else error.OperandTypeMismatch, ir.verify());
+        }
+    }
+    owned[9] = saved;
     try ir.verify();
 }
 

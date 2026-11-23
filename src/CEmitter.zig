@@ -710,7 +710,7 @@ fn usesElementLayout(ir: *const Ir, element: Ir.TypeId) bool {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
         for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
-            .array_literal, .array_set, .array_append => if (ir.getType(instruction.ty).?.array == element) return true,
+            .array_literal, .array_slice, .array_set, .array_append => if (ir.getType(instruction.ty).?.array == element) return true,
             .array_clone => {},
             .array_clear => |clear| {
                 var ty = switch (clear.target) {
@@ -2121,7 +2121,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(r.end)] = true;
         },
         .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .iteration_len, .to_string, .string_to_bytes, .bytes_to_string => |value| value_used[@backingInt(value)] = true,
-        .string_slice => |r| {
+        inline .string_slice, .array_slice => |r| {
             value_used[@backingInt(r.base)] = true;
             if (r.start) |value| value_used[@backingInt(value)] = true;
             if (r.end) |value| value_used[@backingInt(value)] = true;
@@ -2229,7 +2229,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
     if (usesClosures(ir)) try w.writeAll("    (void)nov_env_element;\n");
     // Reference-only clear needs runtime helpers but no callee-owned GC roots.
     // Library hosts own shutdown; keep unused-function warnings portable.
-    if (usesManagedRuntime(ir)) try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_push; (void)nov_gc_pop; (void)nov_gc_alloc;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append; (void)nov_array_clear;\n");
+    if (usesManagedRuntime(ir)) try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_push; (void)nov_gc_pop; (void)nov_gc_alloc;\n    (void)nov_array_clone; (void)nov_array_slice; (void)nov_array_index; (void)nov_array_append; (void)nov_array_clear;\n");
     if (managed) {
         var roots: usize = @intFromBool(function.is_closure);
         if (function.is_closure) try w.writeAll("    (void)nov_env;\n");
@@ -2700,7 +2700,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 }
             },
             .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @backingInt(body.instructions[@backingInt(r.value)].ty), @backingInt(r.value), @backingInt(r.array) }),
-            .array_literal, .array_clone, .array_set, .array_append, .array_clear, .to_string, .string_to_bytes, .bytes_to_string, .field_store => unreachable,
+            .array_literal, .array_clone, .array_slice, .array_set, .array_append, .array_clear, .to_string, .string_to_bytes, .bytes_to_string, .field_store => unreachable,
             .constant => |id| try writeConstant(w, ir.constants.items[@backingInt(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
             .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
@@ -2812,6 +2812,10 @@ fn markCopyTypes(allocator: std.mem.Allocator, ir: *const Ir, copied: []bool) st
             .array_clone => |value| if (!transfers.canElideClone(body, value, i)) {
                 copied[@backingInt(instruction.ty)] = true;
             },
+            .array_slice => {
+                const element = ir.getType(instruction.ty).?.array;
+                if (try ir.needsArrayCopy(element)) copied[@backingInt(element)] = true;
+            },
             .array_set => |update| {
                 if (!transfers.canTake(body, update.array, i)) copied[@backingInt(instruction.ty)] = true;
                 const element = ir.getType(instruction.ty).?.array;
@@ -2886,8 +2890,13 @@ fn writePayloadChecks(allocator: std.mem.Allocator, ir: *const Ir, copy_types: [
         for (ir.getType(function.ty).?.function.params) |param| {
             if (ir.getType(param).? == .record) checked[@backingInt(param)] = true;
         }
-        for (body.instructions) |instruction| if (instruction.op == .array_clone) {
-            checked[@backingInt(instruction.ty)] = true;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .array_clone => checked[@backingInt(instruction.ty)] = true,
+            .array_slice => {
+                const element = ir.getType(instruction.ty).?.array;
+                if (ir.getType(element).? == .record) checked[@backingInt(element)] = true;
+            },
+            else => {},
         };
     }
     var changed = true;
@@ -3148,7 +3157,7 @@ const ArrayTransfers = struct {
         for (body.instructions, 0..) |instruction, i| {
             detached[i] = switch (instruction.op) {
                 // These operations either copy or use this same proof for inputs.
-                .array_clone, .array_literal, .array_set, .array_append, .string_to_bytes => true,
+                .array_clone, .array_literal, .array_slice, .array_set, .array_append, .string_to_bytes => true,
                 .local_load => |slot| self.ownsLastLoad(body, slot, i),
                 .record_init => |fields| blk: {
                     for (fields) |field| {
@@ -3338,6 +3347,21 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
             }
             return;
         },
+        .array_slice => |r| {
+            try w.print("nov_array_slice(v{d}, ", .{@backingInt(r.base)});
+            if (r.start) |value| try w.print("v{d}", .{@backingInt(value)}) else try w.writeAll("0");
+            try w.writeAll(", ");
+            if (r.end) |value| try w.print("v{d}", .{@backingInt(value)}) else try w.writeAll("0");
+            try w.print(", {s}, {s}, ", .{ if (r.end != null) "true" else "false", if (r.inclusive) "true" else "false" });
+            try writeElementLayout(ir, w, element);
+            try w.writeAll(");\n");
+            if (ir.getType(element).? == .record or try ir.needsArrayCopy(element)) {
+                try w.print("    for (uintptr_t j = 0; j < v{d}.len; ++j) {{\n        ", .{i});
+                try writeType(ir, w, element);
+                try w.print(" *data = v{d}.data;\n        data[j] = nov_{s}_{d}(data[j]);\n    }}\n", .{ i, if (try ir.needsArrayCopy(element)) "copy" else "check", @backingInt(element) });
+            }
+            return;
+        },
         .string_to_bytes => |value| try w.print("nov_string_to_bytes(v{d})", .{@backingInt(value)}),
         .array_clone => |value| {
             if (transfers.canElideClone(body, value, i))
@@ -3377,6 +3401,226 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
             try w.print(" *data = v{d}.data;\n        data[j] = nov_copy_{d}(data[j]);\n    }}\n", .{ i, @backingInt(element) });
         }
     }
+}
+
+fn emitArraySliceTest(allocator: std.mem.Allocator) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .bits = Ir.native_pointer_bits, .signedness = .signed } });
+    const scalar_array = try ir.internType(.{ .array = integer });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{.{ .name = "row", .ty = scalar_array, .span = span }});
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(tagged, &.{
+        .{ .name = "row", .ty = scalar_array, .span = span },
+        .{ .name = "number", .ty = integer, .span = span },
+    });
+    const callback = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
+    const range = try ir.internType(.{ .range = integer });
+    const elements = [_]Ir.TypeId{ integer, scalar_array, record, tagged, callback, range };
+    for (elements, 0..) |element, kind| {
+        const array = try ir.internType(.{ .array = element });
+        const signature = try ir.internType(.{ .function = .{ .params = &.{ array, integer, integer }, .result = array } });
+        // Scalar variants exercise every optional-bound combination, inclusive
+        // explicit bounds, and inclusive omitted end without frontend input.
+        const variants: usize = if (kind == 0) 6 else 1;
+        for (0..variants) |variant| {
+            const name = try std.fmt.allocPrint(allocator, "slice{d}_{d}", .{ kind, variant });
+            defer allocator.free(name);
+            const function = try ir.addFunction(name, signature, span);
+            try ir.setFunctionBody(function, &.{
+                .{ .ty = array, .span = span, .op = .{ .parameter = 0 } },
+                .{ .ty = integer, .span = span, .op = .{ .parameter = 1 } },
+                .{ .ty = integer, .span = span, .op = .{ .parameter = 2 } },
+                .{ .ty = array, .span = span, .op = .{ .array_slice = .{
+                    .base = @fromBackingInt(0),
+                    .start = if (variant == 2 or variant == 3 or variant == 5) null else @fromBackingInt(1),
+                    .end = if (variant == 1 or variant == 3 or variant == 5) null else @fromBackingInt(2),
+                    .inclusive = variant >= 4,
+                } } },
+            }, @fromBackingInt(3));
+        }
+    }
+    const library = try emit(allocator, &ir, null);
+    defer allocator.free(library);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(library);
+    for (ir.functions.items) |function| {
+        try out.writer.print("#define {s} ", .{function.name});
+        try writeScopedFunctionName(&out.writer, function);
+        try out.writer.writeByte('\n');
+    }
+    for (elements, 0..) |element, kind| {
+        try out.writer.writeAll("typedef ");
+        try writeType(&ir, &out.writer, element);
+        try out.writer.print(" SliceElement{d};\n#define slice_element{d} nov_element_{d}\n", .{ kind, kind, @backingInt(element) });
+    }
+    return out.toOwnedSlice();
+}
+
+fn testArraySliceEmissionFailures(allocator: std.mem.Allocator) !void {
+    const library = emitArraySliceTest(allocator) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    defer allocator.free(library);
+}
+
+test "array slicing source free scalar nested record union function range independent forced GC O0 O3" {
+    const library = try emitArraySliceTest(test_gpa);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\static intptr_t identity(intptr_t x) { return x; }
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array source = {0}, result = {0}, child = {0};
+        \\    void **roots[] = {&source.data, &result.data, &child.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 3);
+        \\    source = nov_array_new(3, 3, &slice_element0);
+        \\    intptr_t *numbers = source.data; numbers[0]=10; numbers[1]=20; numbers[2]=30;
+        \\    result = slice0_0(source, -2, -1);
+        \\    if(result.len!=1 || result.data==source.data || ((intptr_t *)result.data)[0]!=20) return 1;
+        \\    ((intptr_t *)result.data)[0]=99; if(numbers[1]!=20) return 2;
+        \\    result = slice0_1(source, 1, INTPTR_MIN); if(result.len!=2) return 3;
+        \\    result = slice0_2(source, INTPTR_MIN, 2); if(result.len!=2) return 4;
+        \\    result = slice0_3(source, INTPTR_MIN, INTPTR_MAX); if(result.len!=3) return 5;
+        \\    result = slice0_4(source, -2, -1); if(result.len!=2) return 6;
+        \\    result = slice0_5(source, INTPTR_MIN, INTPTR_MAX); if(result.len!=3) return 7;
+        \\    fail_allocations=1;
+        \\    if(slice0_0(source, 3, 3).len || slice0_4(source, 2, 1).len || slice0_3((nov_array){0},0,0).len || slice0_5((nov_array){0},0,0).len) return 8;
+        \\    fail_allocations=0;
+        \\    child = nov_array_new(1, 1, &slice_element0); ((intptr_t *)child.data)[0]=42;
+        \\    source = nov_array_new(2, 2, &slice_element1);
+        \\    ((nov_array *)source.data)[0]=child; ((nov_array *)source.data)[1]=child;
+        \\    result = slice1_0(source,0,2);
+        \\    nov_array *rows = result.data;
+        \\    if(result.data==source.data || rows[0].data==child.data || rows[1].data==child.data || rows[0].data==rows[1].data) return 9;
+        \\    ((intptr_t *)rows[0].data)[0]=7; if(((intptr_t *)child.data)[0]!=42 || ((intptr_t *)rows[1].data)[0]!=42) return 10;
+        \\    source = nov_array_new(1,1,&slice_element2); ((SliceElement2 *)source.data)[0].f0=child;
+        \\    result = slice2_0(source,0,1);
+        \\    if(result.data==source.data || ((SliceElement2 *)result.data)[0].f0.data==child.data) return 11;
+        \\    ((intptr_t *)((SliceElement2 *)result.data)[0].f0.data)[0]=8;
+        \\    if(((intptr_t *)child.data)[0]!=42) return 12;
+        \\    source = nov_array_new(2,2,&slice_element3);
+        \\    SliceElement3 *unions=source.data; unions[0].tag=0; unions[0].f0=child; unions[1].tag=1; unions[1].f1=123;
+        \\    result = slice3_0(source,0,2); unions=result.data;
+        \\    if(unions[0].f0.data==child.data || unions[1].tag!=1 || unions[1].f1!=123 || unions[1].f0.data) return 13;
+        \\    source = nov_array_new(1,1,&slice_element4); ((SliceElement4 *)source.data)[0]=identity;
+        \\    result = slice4_0(source,0,1); if(result.data==source.data || ((SliceElement4 *)result.data)[0](7)!=7) return 14;
+        \\    source = nov_array_new(1,1,&slice_element5); ((SliceElement5 *)source.data)[0]=(SliceElement5){-3,8,true};
+        \\    result = slice5_0(source,0,1); ((SliceElement5 *)result.data)[0].start=0;
+        \\    if(result.data==source.data || ((SliceElement5 *)source.data)[0].start!=-3 || !((SliceElement5 *)result.data)[0].inclusive) return 15;
+        \\    nov_gc_pop(&nov_rt_heap,&frame); nov_gc_collect(&nov_rt_heap);
+        \\    if(nov_rt_heap.live_objects || nov_rt_heap.frames) return 16;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
+test "array slicing source free managed strings owner mutation bound snapshots forced GC O0 O3" {
+    const source =
+        \\let base:()->[][]str={@print("B")
+        \\    [["a"+"b"],["c"+"d"],["e"+"f"]]}
+        \\let main:()={
+        \\    let mut rows=base()
+        \\    let mut first:int=1
+        \\    let mut selected=rows[{@print("L")
+        \\        rows[1]=["changed"+"!"]
+        \\        rows+=[["extra"+"!"]]
+        \\        first}..{@print("U")
+        \\        first=0
+        \\        @as(int,3)}]
+        \\    if @len(selected)!=2 or selected[0][0]!="cd" or selected[1][0]!="ef" or rows[1][0]!="changed!" or first!=0 {@panic("snapshot before bounds")}
+        \\    loop &row in selected {row.*=["replace"+"!"]}
+        \\    if rows[2][0]!="ef" {@panic("slice alias")}
+        \\    let tail=rows[{rows+=[["more"+"!"]]
+        \\        @as(int,1)}..]
+        \\    if @len(tail)!=3 or @len(rows)!=5 {@panic("omitted end snapshot")}
+        \\    let ordered=base()[{@print("S")
+        \\        @as(int,1)}..{@print("E")
+        \\        @as(int,2)}]
+        \\    if @len(ordered)!=1 or ordered[0][0]!="cd" {@panic("evaluate once in order")}
+        \\    let mut counter:int=0
+        \\    let callback=()->int {counter+=1
+        \\        counter}
+        \\    let mut callbacks=[callback,callback]
+        \\    let copied=callbacks[1..]
+        \\    callbacks=[]
+        \\    if copied[0]()!=1 {@panic("closure root")}
+        \\    @println("slice snapshots ok")
+        \\}
+    ;
+    // Release the AST before emission; bound effects must already be explicit
+    // ordered IR instructions, not reconstructed from source by the backend.
+    var lowered = blk: {
+        var module = try Module.init(test_gpa, "array-slice.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer lowered.deinit();
+    const library = try emit(test_gpa, &lowered.ir, null);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "BLUBSEslice snapshots ok\n", "", mode);
+}
+
+test "array slicing source free compiler every allocation failure" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArraySliceEmissionFailures, .{});
+}
+
+test "array slicing source free invalid bounds panic O0 O3" {
+    const library = try emitArraySliceTest(test_gpa);
+    defer test_gpa.free(library);
+    for ([_][]const u8{
+        "slice0_0(source,-4,2)",         "slice0_0(source,0,-4)",
+        "slice0_0(source,INTPTR_MIN,2)", "slice0_0(source,0,INTPTR_MIN)",
+        "slice0_0(source,INTPTR_MAX,2)", "slice0_0(source,0,INTPTR_MAX)",
+        "slice0_0(source,2,1)",          "slice0_4(source,3,1)",
+        "slice0_4(source,0,3)",          "slice0_4((nov_array){0},0,0)",
+    }) |expression| {
+        const c = try std.fmt.allocPrint(test_gpa, "{s}\nint main(void) {{ intptr_t data[3]={{1,2,3}}; nov_array source={{data,3,3}}; (void)source; (void){s}; return 99; }}", .{ library, expression });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: array slice out of bounds\n", mode);
+    }
+}
+
+test "array slicing source free outer and recursive runtime OOM O0 O3" {
+    const library = try emitArraySliceTest(test_gpa);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array source=nov_array_new(1,1,&slice_element0);
+        \\    ((intptr_t *)source.data)[0]=1; fail_allocations=1;
+        \\    (void)slice0_0(source,0,1); return 99;
+        \\}
+    , true);
+    // The outer allocation succeeds, then the first recursive child fails.
+    const allocator =
+        \\#include <stdlib.h>
+        \\static int remaining=-1;
+        \\static void *slice_malloc(size_t n) { if(!remaining) return NULL; if(remaining>0) --remaining; return malloc(n); }
+        \\#define NOV_GC_MALLOC slice_malloc
+        \\#define NOV_GC_FREE free
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        allocator, library,
+        \\int main(void) {
+        \\    nov_array child=nov_array_new(1,1,&slice_element0);
+        \\    ((intptr_t *)child.data)[0]=42;
+        \\    void **roots[]={&child.data}; nov_gc_roots frame={0}; nov_gc_push(&nov_rt_heap,&frame,roots,1);
+        \\    nov_array source=nov_array_new(1,1,&slice_element1); ((nov_array *)source.data)[0]=child;
+        \\    nov_rt_heap.collect_every_allocation=1; remaining=1;
+        \\    (void)slice1_0(source,0,1); return 99;
+        \\}
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
 }
 
 test "floats direct IR exact bits IEEE operations comparisons and separate C ABI O0 O3" {

@@ -60,6 +60,29 @@ results. See `tests/array-fields.nov`.
 
 ## Current delivered status
 
+Array slicing is implemented for all ordinary storable element types, returning
+the base's exact `[]T` type with fresh, recursively independent array backing,
+not a borrow/view. Nested arrays, record fields and active union payloads follow
+ordinary recursive-copy rules; strings and closure environments retain their
+usual sharing. String slicing remains an immutable shared-owner view unchanged.
+Bounds are exact native signed `int`; negatives are relative to length, omitted
+start is 0 and omitted end is length. `..` is exclusive; `..=` normalizes an
+explicit end, requires it below length, then adds 1. An omitted inclusive end
+means through length. Require `0 <= first <= exclusive_end <= len` after
+normalization, with no clamping. Adjacent reversed inclusive bounds can be empty;
+empty `[..]` / `[..=]` work, but empty `[..=0]` panics. Runtime bounds failures
+use `array slice out of bounds` in every mode. Known-data globals support slices,
+with reached invalid bounds rejected at compile time.
+The base is evaluated and snapshotted before start/end, each evaluated once
+left-to-right. `@TypeOf` validates without effects or out-of-bounds evaluation.
+Slice expressions are not writable lvalues or borrowable views. Reference bases
+require explicit `r.*` slicing, not implicit autodereference. Direct literal
+suffixes such as `[1, 2][..]` remain unsupported; use a named array or `@as`
+expression, without a grammar expansion. Recursive copies, including the base
+snapshot, remain potentially expensive; no slicing optimization is claimed.
+See `tests/array-slices.nov` (five tests) and `zig build test-cli-array-slices`.
+Array/slice view redesign and alias proposals remain deferred and unaccepted.
+
 ``std.array.reduce(items: []`T, combine: (`T, `T) -> `T) -> Option(`T)`` is
 implemented as ordinary Nov, without a compiler builtin. Empty input returns
 `.none[]`; singleton input returns `.some[first]` with no callback. Otherwise the
@@ -68,7 +91,9 @@ left-to-right exactly `n - 1` times. Exact element/callback types are required;
 all ordinary storable types work without equality or ordering. Eager once-only
 arguments snapshot the input before callback construction/effects. Recursive
 managed backing is independent, closure cells stay shared, panics propagate,
-and `@TypeOf` has no effects. Ordinary recursive-copy costs remain. See
+and `@TypeOf` has no effects. Its user-library implementation can now traverse
+`items[1..]` after seeding; the existing reduce regression works with that sliced
+implementation. Ordinary recursive-copy costs, including slicing, remain. See
 `tests/array-reduce.nov` (five tests), `zig build test-cli-array-reduce`
 (all modes, relocated stdlib, import aliases and negative check/emit-C fixtures),
 and actual-stdlib source-free forced-GC O0/O3/runtime-OOM backend tests.
@@ -589,7 +614,7 @@ including a runtime binding or imported value reference with visibility checks. 
 visible from enclosing closure scopes are queryable, including concrete
 specialized function variables. Types/type aliases, namespaces and unspecialized
 generic templates reject, even if a template has previously been specialized.
-Calls, literals, arithmetic, fields, indexing, string slices, constructors, arrays,
+Calls, literals, arithmetic, fields, indexing, array/string slices, constructors, arrays,
 blocks, conditions, matches, loops and inferable closures are supported without
 execution. Queries validate operators, arguments, literal ranges, declarations,
 match coverage, reference-use rules and intermediate constructed types.
@@ -785,7 +810,8 @@ Adjacent reversed inclusive bounds form an empty slice; an explicit end at `@len
 or any explicit inclusive end on an empty string rejects. Base/start/end evaluate once,
 left to right. Views are immutable, allocation-free and share the original GC owner
 without copying UTF-8 bytes; small views retain the full allocation. `@len(text)` counts
-Unicode scalars. Array slicing remains unsupported. Array/string iteration is supported
+Unicode scalars. Array slicing instead returns recursively independent copied
+`[]T` values, not shared views. Array/string iteration is supported
 as described below; see tests/string-slices.nov for slicing.
 
 Language tests are executable: `@[test]` marks top-level `() -> void` functions,
@@ -1403,7 +1429,8 @@ let myStruct = struct {}
 - type as values
 - add `any` similar to zig's `anytype`
 - assign destructure like zig
-- make slice immutable or find a way to differentiate ref from copy...
+- Deferred, unaccepted array-view proposal: make views immutable or distinguish
+  references from copies; delivered array slicing already returns copied `[]T` values.
 - embed tcc into the compilator? (revive the repl proposal)
 - arbitrary sized integers?
 - support relative import e.g. `@import("github.com/nov-lang/idk_lib")`
@@ -1640,8 +1667,9 @@ afterwards. Plain replacement retains its final-update bounds check; compounds
 check on the pre-RHS read. No new memory forms are introduced. See README's
 executable subset for precise limits and evaluation order. The proposals below
 remain proposals; array truncation APIs, length growth initialization,
-array slices, general pointer elements/aliases
-and capacity APIs are still deferred. Safe reference passing is delivered alongside
+array views/redesign, general pointer elements/aliases
+and capacity APIs are still deferred. Copied array slicing is delivered; the
+view/alias proposals remain unaccepted. Safe reference passing is delivered alongside
 local `&T` / `&mut T` references. Returning/storage remain accepted future work;
 reference returns are explicitly postponed pending an escape-lifetime decision.
 All further optimizations remain paused.
@@ -1728,9 +1756,14 @@ let result = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 # Slice
 
 String slicing is implemented as immutable shared-owner views (see above).
-Array slicing remains deferred: https://docs.vlang.io/v-types.html#array-slices
+Array slicing is implemented as fresh recursively copied `[]T` values, not views
+or references; see the current delivered status and README's Slice section.
 
-Array proposal: slicing creates a ref by default unless type attribute states otherwise?
+Deferred, unaccepted view/alias redesign reference:
+https://docs.vlang.io/v-types.html#array-slices
+
+Unaccepted array proposal (not current semantics): slicing creates a ref by
+default unless type attribute states otherwise?
 
 # Map
 TODO: https://docs.vlang.io/v-types.html#maps

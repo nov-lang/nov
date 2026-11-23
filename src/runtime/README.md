@@ -442,8 +442,8 @@ are checked before allocation; self-append copies from rooted inputs into fresh
 backing. Copies and updates are eager, not a copy-on-write or amortized-growth
 optimization. Bool elements are ordinary C bool objects, not bit-packed.
 
-Typed IR owns literal operand lists and represents clone, len, index, replacement
-and append explicitly, with exact element/index/result types and region privacy.
+Typed IR owns literal operand lists and represents clone, len, index, slice,
+replacement and append explicitly, with exact element/index/result types and region privacy.
 Array value boundaries clone unless a last-use transfer is proven; returns transfer backing without an
 intervening safepoint after popping the callee frame. The low-level C array helper
 allocates at most one outer backing per call and relies on compiler-rooted inputs;
@@ -467,8 +467,40 @@ across frames remain requirements. Tests run generated programs with collection
 on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
 -O0 and -O3 bounds checks, argument-order effects, nested loops and early returns.
 
-Array clear/truncation APIs, length growth initialization, array slices/invalidation,
-general pointer elements and managed FFI remain deferred. Local references and
+Array slicing returns the base's exact `[]T` type for every ordinary storable
+element type. It creates fresh recursively independent array backing, not an
+interior pointer, borrowed view or alias. Selected elements use ordinary recursive
+value copies, including nested arrays in records and active union payloads;
+immutable strings and closure environments retain their shared semantics. The
+base is evaluated and snapshotted before start and end, each once left-to-right,
+so bound effects cannot alter the captured input. Both the base snapshot and
+selected contents may require recursive copies and allocations; this is not an
+optimized or allocation-free view operation.
+
+Bounds have exact native signed `int` type, with negative values relative to
+length and omitted start/end defaulting to 0/length. `..` is exclusive. For `..=`,
+an explicit end is normalized, required to be below length, then incremented by
+1; an omitted inclusive end means through length without incrementing. Require
+`0 <= first <= exclusive_end <= len` after normalization, with no clamping.
+Adjacent reversed inclusive bounds can be empty. Empty `[..]` / `[..=]` work,
+but empty `[..=0]` panics. Invalid bounds panic `array slice out of bounds` in
+every runtime mode. Known-data global slices are supported; reached invalid
+bounds reject at compile time. `@TypeOf` validates types without effects or
+out-of-bounds evaluation.
+
+Slice expressions are not writable lvalues and cannot be borrowed as array
+views. References require explicit `r.*` slicing; no implicit autodereference
+is added. Direct array-literal suffixes such as `[1, 2][..]` remain unsupported;
+use a named array or `@as` expression instead, without a grammar expansion.
+User `std.array.reduce` can traverse `items[1..]`, retaining the recursive-copy
+costs above. See `tests/array-slices.nov` (five tests),
+`zig build test-cli-array-slices` and the existing `tests/array-reduce.nov`
+regression with the sliced implementation. Immutable string slicing remains an
+allocation-free shared-owner view, not an array-style recursive copy.
+
+Array view/invalidation redesign and alias proposals remain deferred and
+unaccepted. Array truncation APIs, length growth initialization, general pointer
+elements and managed FFI remain deferred. Local references and
 call-scoped reference parameters are delivered; returning and storing references
 remain accepted but unimplemented, as described above. These are not general
 storable aliases.

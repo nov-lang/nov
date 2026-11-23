@@ -46,9 +46,9 @@ Growable arrays use an internal libc-only nonmoving mark/sweep GC. The
 runtime is emitted for managed values and closures; programs using only scalars
 and ordinary functions retain scalar-only emission.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
-boundary, OOM, testing, and unsupported-reference contracts. Array slicing
-and general pointers remain deferred; bounded explicit local references and
-array-element borrowing are supported below. Immutable UTF-8 strings are supported below.
+boundary, OOM, testing, and unsupported-reference contracts. Array slicing returns
+independent copied values; array views and general pointers remain deferred.
+Bounded explicit local references and array-element borrowing are supported below. Immutable UTF-8 strings are supported below.
 
 ```sh
 zig build
@@ -658,7 +658,7 @@ formatting does not make those forms executable. Array formatting does not check
 expected literal types, scope, mutability, or whether a base is an array; it does
 not extend global initialization rules or add new language semantics. Other members,
 indexed compound stores and stores through computed bases remain unsupported.
-Array slicing, general pointers (beyond bounded local references), other unsupported
+Array views, general pointers (beyond bounded local references), other unsupported
 memory/container forms, labels, iterator/other unsupported loop forms, attributes, quoted identifiers,
 BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
 without modifying the file. Formatted output is reparsed and checked for structural,
@@ -2254,8 +2254,9 @@ let main: () -> void = {
   backing. Truncation, capacity APIs and initialization on length growth remain
   deferred. `@len(values)` is not assignable; `values = []` rebinds a mutable array
   to an empty value rather than retaining its buffer. Array equality compares
-  lengths and then elements recursively. No slices, pointer elements, general aliases,
-  or capacity API is delivered. Array globals support data-only initialization. Bounded value/reference iteration is
+  lengths and then elements recursively. Slicing returns copied arrays (see
+  [Slice](#slice)); no array views, pointer elements, general aliases or capacity
+  API is delivered. Array globals support data-only initialization. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
   Arrays print/interpolate as `[a, b]` when their elements are recursively
@@ -2546,7 +2547,49 @@ A broader bind operator remains a separate future proposal.
 
 ## Slice
 
-Strings support [immutable scalar-offset views](#strings). Array slicing remains unsupported.
+Array slicing returns the **same `[]T` type as the base**, with fresh, recursively
+independent array storage, not a borrow or view. All ordinary storable element
+types work. Nested array backing is copied recursively, including arrays in
+records and active union payloads; immutable strings and closure environments
+retain their ordinary sharing rules. Strings still use
+[immutable scalar-offset shared views](#strings), without copying bytes.
+
+Supported forms include `items[start..end]`, `items[..end]`, `items[start..]`
+and `items[..]`, with either exclusive `..` or inclusive `..=`:
+
+- Bounds must have exact native signed `int` type. Negative bounds are relative
+  to the array length; omitted start is 0 and omitted end is the length.
+- For `..=`, an explicit end is normalized first, must be less than the length,
+  then becomes an exclusive end by adding 1. An omitted inclusive end means
+  through the length, with no extra increment.
+- After normalization, `0 <= first <= exclusive_end <= len` is required, without
+  clamping. Adjacent reversed inclusive bounds can be empty: `items[2..=1]` is
+  empty when those bounds normalize validly. An empty array accepts `empty[..]`
+  and `empty[..=]`, but `empty[..=0]` panics.
+- Invalid bounds panic with `array slice out of bounds` in every runtime mode.
+  Known-data global initializers support slicing; reached invalid bounds are
+  rejected at compile time.
+
+The base is evaluated and snapshotted first, then start and end are evaluated
+once, left to right. Bound effects cannot change the captured base. `@TypeOf`
+validates the base and bound types without executing effects or evaluating
+out-of-bounds accesses/slices; `@TypeOf(items[..])` is the base's `[]T` type.
+
+A slice expression is not a writable lvalue and cannot be borrowed as an array
+view. Bind the result to a mutable local to edit its independent value. References
+require explicit dereferencing, as in `r.*[1..]`; slicing does not implicitly
+autodereference `r`. The parser does **not** support a direct array-literal
+suffix such as `[1, 2][..]`; use a named array or an explicitly typed `@as`
+expression instead. No grammar expansion is introduced.
+
+The ordinary user-library `std.array.reduce` can iterate `items[1..]` after
+seeding from the first element. This is not an optimization: slicing may copy
+both the base snapshot and the selected elements recursively, and further value
+boundaries retain their ordinary costs. Array/slice view redesigns and alias
+proposals remain deferred and unaccepted. See
+[`tests/array-slices.nov`](tests/array-slices.nov) (five tests),
+`zig build test-cli-array-slices`, and the existing
+[`tests/array-reduce.nov`](tests/array-reduce.nov) regression.
 
 ## Range
 
@@ -2816,8 +2859,9 @@ advances to the next element. With `else`, value breaks and exhaustion results
 must match exactly; without `else`, these loops yield `void` and reject value
 breaks. The item is scoped to the body, and `else` is outside the completed
 loop's control scope. See [`tests/iteration.nov`](tests/iteration.nov).
-General iterator protocols, array slices and labels remain unsupported; this
-does not enable arbitrary library-container iteration.
+General iterator protocols, array views and labels remain unsupported; copied
+array slices are ordinary `[]T` iteration sources. This does not enable arbitrary
+library-container iteration.
 
 ### Zip iteration and indices
 
@@ -2866,7 +2910,7 @@ these limits (see also [Range](#range)).
 
 ```nov
 ; items can be a supported array or a string; type is inferred
-; slices and general iterators are not supported
+; copied array slices work as arrays; array views and general iterators are not supported
 loop item in items {}
 
 ; n takes values [0;10[
@@ -3113,7 +3157,7 @@ numeric cast. See [tests/type-aliases.nov](tests/type-aliases.nov).
 `@TypeOf(expression)` returns an expression's canonical type at compile time,
 without evaluating it. It takes exactly one operand and supports existing value
 expressions: bindings, literals, arithmetic, calls (including inferred generic
-calls), fields, indexing, string slices, constructors, arrays, blocks, conditions,
+calls), fields, indexing, array/string slices, constructors, arrays, blocks, conditions,
 matches, loops and inferable closures. Ordinary scope and imported visibility
 rules apply. Literals follow normal inference and defaults: `@TypeOf(1)` is `int`,
 while `@TypeOf(@as(u8, 1))` is `u8`.
@@ -3124,8 +3168,9 @@ does not perform runtime overflow/division checks. Thus `@TypeOf(f())` reports
 the call result without calling `f`, `@TypeOf(values[999])` can report the element
 type without indexing, and `@TypeOf(1 / 0)` is `int`. Invalid names, operators,
 arguments, literals, match patterns, declarations and reference uses still diagnose.
-Unsupported language features, such as array slicing, do not become available
-inside a query.
+Array slices validate exact native `int` bounds without evaluating the base or
+bounds or checking their values for out-of-bounds failures. Unsupported language
+features do not become available inside a query.
 
 Queries do not emit runtime instructions, create loans, capture values, box mutable
 bindings or demand callee bodies/converters. They inspect lexical type metadata,
@@ -3663,7 +3708,8 @@ but `""[..=0]` panics because no scalar exists at index 0.
 The base, start and end evaluate once, left to right. Slicing returns an immutable,
 allocation-free UTF-8 view sharing the original GC owner, without copying bytes;
 even a small view retains the full allocation. `@len(text)` still counts Unicode scalars.
-For example, `"é😀x"[1..-1] == "😀"`. Array slicing remains unsupported. See
+For example, `"é😀x"[1..-1] == "😀"`. Unlike these string views,
+[array slices](#slice) recursively copy array storage. See
 [`tests/string-slices.nov`](tests/string-slices.nov).
 
 For editing, keep the distinction between a mutable binding and mutable storage:

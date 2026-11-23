@@ -460,6 +460,32 @@ for a runnable regression and six tests, including chaining and void outputs.
 ## Array helpers
 
 `array.nov` implements public generic collection helpers.
+Array slicing, including `items[1..]` in user `std.array.reduce`, returns the
+base's same `[]T` type for all ordinary storable elements. Results have fresh,
+recursively independent array storage, not a borrow/view; nested arrays in
+records and active union payloads copy too. Immutable strings and closure
+capture cells retain their ordinary sharing. String slices remain immutable
+shared-owner views, unchanged.
+
+Slice bounds must be exact native signed `int`. Negatives are relative to length;
+omitted start/end mean 0/length. `..` excludes the end; `..=` normalizes an
+explicit end, requires it below length, then adds 1. An omitted inclusive end
+means through length. Normalized bounds must satisfy
+`0 <= first <= exclusive_end <= len`, without clamping. Adjacent reversed
+inclusive bounds can be empty; empty `[..]` / `[..=]` work, but empty `[..=0]`
+panics. Failures use `array slice out of bounds` in all runtime modes.
+The base snapshot precedes once-only start/end evaluation, left-to-right.
+`@TypeOf` validates without effects or out-of-bounds evaluation. Known-data
+globals support slicing and reject reached bad bounds at compile time.
+Slice expressions are not writable lvalues or borrowable array views; references
+need explicit `r.*` slicing, without implicit autodereference. Direct array-literal
+suffixes such as `[1, 2][..]` are unsupported: use a named array or `@as`
+expression. No grammar expansion or array/slice view redesign is introduced;
+view/alias proposals remain deferred and unaccepted. Recursive copying of both
+the base snapshot and selected contents can be costly; no optimized slicing
+complexity is promised. See `tests/array-slices.nov` (five tests),
+`zig build test-cli-array-slices` and the main README's Slice section.
+
 Run `zig build test-cli-collection-helpers` for join/selection examples, imported
 aliases, invalid arguments and relocated-install checks.
 Signatures here use `T`/`U` for inferred backtick type variables:
@@ -511,8 +537,12 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   Managed results have recursively independent backing, while copied closures share
   their existing capture cells. Panics propagate normally; `@TypeOf` validates the
   call without evaluating arguments or invoking callbacks. This is ordinary Nov,
-  not a compiler builtin; recursive value copies can add substantial overhead.
-  See `tests/array-reduce.nov` and `zig build test-cli-array-reduce`.
+  not a compiler builtin. The implementation can traverse `items[1..]` after
+  seeding from the first element; this copies rather than borrowing a tail view.
+  Recursive value copies, including the slice's base snapshot and selected
+  elements, can add substantial overhead. The existing `tests/array-reduce.nov`
+  regression works with the sliced implementation; see also
+  `zig build test-cli-array-reduce`.
 
 - `array.count(items: []T, predicate: (T) -> bool) -> uint` counts matching elements,
   invoking the predicate exactly once per element in source order; empty input

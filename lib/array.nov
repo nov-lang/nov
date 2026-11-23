@@ -72,10 +72,8 @@ let reduce: (items: []`T, combine: (`T, `T) -> `T) -> Option(`T) = {
         return .none[]
     }
     let mut result: `T = items[0]
-    loop item, index in items, 0.. {
-        if index != 0 {
-            result = combine(result, item)
-        }
+    loop item in items[1..] {
+        result = combine(result, item)
     }
     .some[result]
 }

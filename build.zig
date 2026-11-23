@@ -282,6 +282,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_slice_tests = b.step("test-cli-string-slices", "Run immutable scalar string slicing CLI tests");
     addStringSliceCliTests(b, exe, string_slice_tests);
     test_step.dependOn(string_slice_tests);
+    const array_slice_tests = b.step("test-cli-array-slices", "Run independent copying array slice CLI tests");
+    addArraySliceCliTests(b, exe, array_slice_tests);
+    test_step.dependOn(array_slice_tests);
     const str_tests = b.step("test-cli-str", "Run renamed str type CLI tests");
     addStrCliTests(b, exe, str_tests);
     test_step.dependOn(str_tests);
@@ -2646,6 +2649,54 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
     }
 }
 
+fn addArraySliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "array-slices.nov", @embedFile("tests/array-slices.nov"), "Tail: [2, 3]\nInclusive: [1, 2]\n", "PASS omitted_negative_inclusive_and_empty_bounds\nPASS recursive_storage_is_independent\nPASS exact_types_generic_callbacks_and_storable_elements\nPASS base_precedes_bounds_and_queries_have_no_effects\nPASS known_data_and_slice_based_reduce\n5 passed; 0 failed; 5 total\n");
+    const fixtures = b.addWriteFiles();
+    for ([_][]const u8{ "[4..]", "[..4]", "[-4..]", "[..-4]", "[2..1]", "[..=3]", "[3..=3]" }, 0..) |suffix, index| {
+        const path = b.fmt("slice-bounds-{d}.nov", .{index});
+        _ = fixtures.add(path, b.fmt("let main:()={{let items=[1,2,3]\n@println(items{s})}}\n", .{suffix}));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", path });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrEqual("panic: array slice out of bounds\n");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_][]const u8{
+        "let f:(items:[]int,n:uint)->[]int=items[n..]",
+        "let f:(items:[]int,n:i8)->[]int=items[..n]",
+        "let f:(items:[]int)->[]int=items[true..]",
+        "let f:(items:[]int)->[]int=items[..='a']",
+        "let f:(items:[]int)->[]u8=items[..]",
+        "let f:(items:[]int)->str=items[..]",
+        "let f:(items:&[]int)->[]int=items[..]",
+        "let main:()={let mut items=[1,2]\nitems[..]=[3,4]\n}",
+        "let main:()={let mut items=[1,2]\nlet reference=&items[..]\n}",
+        "let main:()={let items=[1,2]\nlet query:@TypeOf(items[true..])=[]\n}",
+        "let items=[1,2]\nlet bad=items[..3]\nlet main:()={}",
+        "let items=[1,2]\nlet bad=items[..=2]\nlet main:()={}",
+    }, 0..) |source, index| {
+        const path = b.fmt("invalid-array-slice-{d}.nov", .{index});
+        _ = fixtures.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+}
+
 fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("string-slices.nov", @embedFile("tests/string-slices.nov"));
@@ -2730,8 +2781,8 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "result-rune", .source = "let f: (s: str) -> rune = s[..]\n", .diagnostic = mismatch },
         .{ .name = "inclusive-end-uint", .source = "let f: (s: str, n: uint) -> str = s[..=n]\n", .diagnostic = mismatch },
         .{ .name = "inclusive-start-uint", .source = "let f: (s: str, n: uint) -> str = s[n..=]\n", .diagnostic = mismatch },
-        .{ .name = "inclusive-array", .source = "let f: (s: []u8) -> str = s[..=1]\n", .diagnostic = "slicing requires a string value" },
-        .{ .name = "array", .source = "let f: (s: []u8) -> str = s[..]\n", .diagnostic = "slicing requires a string value" },
+        .{ .name = "inclusive-array", .source = "let f: (s: []u8) -> str = s[..=1]\n", .diagnostic = mismatch },
+        .{ .name = "array", .source = "let f: (s: []u8) -> str = s[..]\n", .diagnostic = mismatch },
         .{ .name = "write", .source = "let main: () = {let mut s = \"abc\"\ns[..] = \"x\"}\n", .diagnostic = "assignment target must be a mutable local, its struct field path, or its scalar-array element" },
     }) |case| {
         const source = b.fmt("invalid-{s}.nov", .{case.name});

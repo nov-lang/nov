@@ -945,7 +945,7 @@ test "inline range payloads reject omitted bounds and nonrange payloads under OO
         .{ .body = "let f:()->U=.number[0..=2]", .tag = .expression_type_mismatch },
         .{ .body = "let f:()->U=.range[-1..2]", .tag = .expression_type_mismatch },
         .{ .body = "let f:()->U=.range[true..false]", .tag = .operator_not_supported },
-        .{ .body = "let f:()->U={let xs=[0,1,2]\n.range[xs[0..2]]}", .tag = .string_slice_requires_string },
+        .{ .body = "let f:()->U={let xs=[0,1,2]\n.range[xs[0..2]]}", .tag = .expression_type_mismatch },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.body });
         defer std.testing.allocator.free(source);

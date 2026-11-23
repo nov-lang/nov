@@ -15,6 +15,29 @@ static inline nov_array nov_array_clone(nov_array a, const nov_gc_descriptor *el
     if (a.len) memcpy(b.data, a.data, (size_t)a.len * element->size);
     return b;
 }
+static inline uintptr_t nov_array_slice_bound(intptr_t bound, uintptr_t len) {
+    if (bound < 0) {
+        const uintptr_t magnitude = (uintptr_t)0 - (uintptr_t)bound;
+        if (magnitude > len) nov_rt_panic("array slice out of bounds");
+        return len - magnitude;
+    }
+    if ((uintptr_t)bound > len) nov_rt_panic("array slice out of bounds");
+    return (uintptr_t)bound;
+}
+static inline nov_array nov_array_slice(nov_array a, intptr_t start, intptr_t end, bool has_end, bool inclusive, const nov_gc_descriptor *element) {
+    const uintptr_t first = nov_array_slice_bound(start, a.len);
+    uintptr_t last = has_end ? nov_array_slice_bound(end, a.len) : a.len;
+    if (has_end && inclusive) {
+        if (last >= a.len) nov_rt_panic("array slice out of bounds");
+        ++last;
+    }
+    if (first > last) nov_rt_panic("array slice out of bounds");
+    nov_array result = nov_array_new(last - first, last - first, element);
+    /* Copy pointer slots before recursive allocations so the rooted result
+     * traces every selected child, including children not yet detached. */
+    if (result.len) memcpy(result.data, (const unsigned char *)a.data + (size_t)first * element->size, (size_t)result.len * element->size);
+    return result;
+}
 static inline void nov_array_clear(nov_array *a, const nov_gc_descriptor *element) {
     /* The GC traces capacity, not length. Remove managed children as well as
      * values, while retaining the backing allocation and its capacity. */

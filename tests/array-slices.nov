@@ -1,0 +1,133 @@
+let std = @import("std")
+
+let tail: (items: []`T) -> []`T = items[1..]
+
+let main: () = {
+    let values = [1, 2, 3]
+    @println("Tail:", tail(values))
+    @println("Inclusive:", values[..=1])
+}
+
+@[test]
+let omitted_negative_inclusive_and_empty_bounds: () = {
+    let values = [1, 2, 3, 4]
+    @assert(values[..] == values and values[1..] == [2, 3, 4])
+    @assert(values[..2] == [1, 2] and values[1..3] == [2, 3])
+    @assert(values[-2..] == [3, 4] and values[..-1] == [1, 2, 3])
+    @assert(values[-3..-1] == [2, 3])
+    @assert(values[1..=2] == [2, 3] and values[..=-1] == values)
+    @assert(values[2..=1] == [] and values[4..] == [])
+    @assert(values[..=] == values and values[1..=] == [2, 3, 4])
+    let empty: []int = []
+    @assert(empty[..] == [] and empty[0..0] == [] and empty[..=] == [])
+    @assert(tail([7]) == [])
+}
+
+@[test]
+let recursive_storage_is_independent: () = {
+    let mut source = [[1], [2], [3]]
+    let mut selected = source[1..]
+    let mut copied = selected
+    selected[0] = [9]
+    copied[1] = [8]
+    source[1] = [7]
+    @assert(source == [[1], [7], [3]])
+    @assert(selected == [[9], [3]] and copied == [[2], [8]])
+    let payloads: []std.Option([]int) = [.some[[1]], .some[[2]]]
+    let sliced = payloads[..=0]
+    let mut payload = sliced[0].unwrapOr([])
+    payload[0] = 9
+    @assert(payloads[0].unwrapOr([]) == [1] and sliced[0].unwrapOr([]) == [1])
+}
+
+let Choice = enum {
+    first,
+    second,
+}
+let Row = struct {
+    items: []int,
+    callback: () -> int,
+}
+
+@[test]
+let exact_types_generic_callbacks_and_storable_elements: () = {
+    let bytes: []u8 = [1, 2, 3]
+    let exact: @TypeOf(bytes[1..]) = [2, 3]
+    @assert(exact == tail(bytes))
+    let sliced = std.array.map(
+        [[1, 2], [3]],
+        (items) { items[1..] }
+    )
+    @assert(sliced == [[2], []])
+    let booleans = [true, false]
+    let runes = ['é', 'a']
+    let text = ["é", "😀"]
+    let choices = [Choice.first, .second]
+    let intervals = [1..3, 4..7]
+    @assert(booleans[1..] == [false])
+    @assert(runes[..1] == ['é'])
+    @assert(text[1..] == ["😀"])
+    @assert(choices[1..] == [Choice.second])
+    @assert(@len(intervals[1..][0]) == 3)
+    let zero: f64 = 0.0
+    let originalFloats = [zero / zero, -zero]
+    let floats = originalFloats[..]
+    @assert(floats[0] != floats[0] and 1.0 / floats[1] < 0.0)
+    let mut calls = 0
+    let tick = () -> int {
+        calls += 1
+        calls
+    }
+    let originalCallbacks = [tick, tick]
+    let callbacks = originalCallbacks[1..]
+    let originalRecords = [Row.[ items = [1], callback = tick ]]
+    let records = originalRecords[..]
+    @assert(callbacks[0]() == 1 and records[0].callback() == 2 and tick() == 3)
+    let mut values = [1, 2, 3]
+    let reference = &values
+    @assert(reference.*[1..] == [2, 3])
+}
+
+@[test]
+let base_precedes_bounds_and_queries_have_no_effects: () = {
+    let mut source = [1, 2, 3, 4]
+    let mut events: []int = []
+    let base = () -> []int {
+        events += [1]
+        source
+    }
+    let start = () -> int {
+        events += [2]
+        source = [99]
+        1
+    }
+    let end = () -> int {
+        events += [3]
+        source = []
+        3
+    }
+    let query: @TypeOf(base()[start()..end()]) = []
+    @assert(query == [] and events == [] and source == [1, 2, 3, 4])
+    let selected = base()[start()..end()]
+    @assert(selected == [2, 3] and events == [1, 2, 3] and source == [])
+}
+
+let knownBase = [1, 2, 3]
+let known = knownBase[1..]
+let knownCount = @len(knownBase[..=1])
+
+@[test]
+let known_data_and_slice_based_reduce: () = {
+    @assert(known == [2, 3] and knownCount == 2)
+    let result = std.array.reduce(
+        [20, 5, 3],
+        (a, b) { a - b }
+    )
+    @assert(result.unwrapOr(0) == 12)
+    @assert(
+        std.array.reduce(
+            @as([]int, []),
+            (a, b) { a + b }
+        ).isNone()
+    )
+}

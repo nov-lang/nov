@@ -155,6 +155,47 @@ pub fn checkWithIr(allocator: std.mem.Allocator, body: Ir.Body, ir: ?*const Ir) 
     return null;
 }
 
+fn testArraySliceLoans(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const integer = try ir.internType(.{ .integer = .{ .bits = Ir.native_pointer_bits, .signedness = .signed } });
+    const array = try ir.internType(.{ .array = integer });
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    for ([_]bool{ false, true }) |references| {
+        for ([_]bool{ false, true }) |global| {
+            const constant: Ir.Operation = .{ .constant = @fromBackingInt(0) };
+            var code = [_]Ir.Instruction{
+                .{ .ty = array, .span = span, .op = .{ .array_literal = &.{} } },
+                .{ .ty = array, .span = span, .op = if (global) .{ .global_slot = @fromBackingInt(0) } else .{ .local_slot = @fromBackingInt(0) }, .boxed = true },
+                .{ .ty = integer, .span = .{ .start = 2, .end = 3 }, .op = .{ .borrow_reserve = @fromBackingInt(1) } },
+                .{ .ty = integer, .span = span, .op = .{ .borrow_start = .{ .reservation = @fromBackingInt(2), .index = @fromBackingInt(0) } } },
+                .{ .ty = integer, .span = span, .op = if (references) .{ .reference_slot = @fromBackingInt(3) } else constant },
+                .{ .ty = array, .span = .{ .start = 5, .end = 6 }, .op = .{ .array_slice = .{ .base = @fromBackingInt(0), .start = null, .end = null } } },
+                .{ .ty = integer, .span = span, .op = if (references) .{ .reference_load = @fromBackingInt(4) } else constant },
+                .{ .ty = integer, .span = span, .op = .{ .borrow_read = @fromBackingInt(if (references) 6 else 3) } },
+            };
+            const body: Ir.Body = .{ .instructions = &code, .result = @fromBackingInt(7) };
+            // Copying an already evaluated array cannot call a captured closure
+            // or extend a loan.
+            try std.testing.expect(!mayCall(body, code[5], &ir));
+            try std.testing.expect(try check(allocator, body) == null);
+            try std.testing.expect(try checkWithIr(allocator, body, &ir) == null);
+            code[5].op = .{ .local_load = @fromBackingInt(1) };
+            const conflict = (try checkWithIr(allocator, body, &ir)).?;
+            try std.testing.expectEqual(code[5].span, conflict.access);
+            try std.testing.expectEqual(code[2].span, conflict.origin);
+            code[6].op = constant;
+            code[7].op = constant;
+            try std.testing.expect(try checkWithIr(allocator, body, &ir) == null);
+        }
+    }
+}
+
+test "array slice copies are not calls and owner reads respect both loan paths under OOM" {
+    try testArraySliceLoans(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArraySliceLoans, .{});
+}
+
 fn testExtremumHookLoans(allocator: std.mem.Allocator) !void {
     var ir = Ir.init(allocator);
     defer ir.deinit();

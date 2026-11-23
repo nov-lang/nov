@@ -284,6 +284,43 @@ fn resolveGraph(self: *Dependencies, module: *Module) std.mem.Allocator.Error!vo
     }
 }
 
+test "array slice dependencies retain base and optional bounds under OOM" {
+    const source =
+        \\let cut=items[first..=last]
+        \\let all=items[..=]
+        \\let suffix=items[first..]
+        \\let prefix=items[..last]
+        \\let items=[1,2,3]
+        \\let first:int=0
+        \\let last:int=-1
+    ;
+    var module = try Module.init(std.testing.allocator, "array-slice-dependencies.nov", source);
+    defer module.deinit();
+    var result = try analyze(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for ([_][]const u8{ "cut", "all", "suffix", "prefix" }, [_]usize{ 3, 1, 2, 2 }) |name, count| {
+        const edges = result.getEdges(module.lookup(name).?).?;
+        try std.testing.expectEqual(count, edges.len);
+        for (edges) |edge| try std.testing.expect(edge.target == module.lookup("items").? or edge.target == module.lookup("first").? or edge.target == module.lookup("last").?);
+    }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    for ([_][]const u8{
+        "let value=value[..]",
+        "let items=[1]\nlet value=items[value..]",
+        "let items=[1]\nlet value=items[..=value]",
+        "let mut items=[1]\nlet value=items[..]",
+        "let items=[1]\nlet mut bound:int=0\nlet value=items[bound..]",
+        "let items=[1]\nlet mut bound:int=0\nlet value=items[..bound]",
+    }) |invalid_source| {
+        var invalid = try Module.init(std.testing.allocator, "array-slice-dependencies-invalid.nov", invalid_source);
+        defer invalid.deinit();
+        var rejected = try analyze(&invalid);
+        defer rejected.deinit();
+        try std.testing.expect(invalid.hasErrors());
+    }
+}
+
 test "extremum dependencies scan every runtime argument including malformed calls" {
     const source = "let low=@min(first,second)\nlet high=@max(items)\nlet first=1\nlet second=2\nlet items=[first,second]";
     var module = try Module.init(std.testing.allocator, "extremum-dependencies.nov", source);
