@@ -60,6 +60,20 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+``std.array.reduce(items: []`T, combine: (`T, `T) -> `T) -> Option(`T)`` is
+implemented as ordinary Nov, without a compiler builtin. Empty input returns
+`.none[]`; singleton input returns `.some[first]` with no callback. Otherwise the
+first element seeds a stable left fold, calling `combine(accumulator, item)`
+left-to-right exactly `n - 1` times. Exact element/callback types are required;
+all ordinary storable types work without equality or ordering. Eager once-only
+arguments snapshot the input before callback construction/effects. Recursive
+managed backing is independent, closure cells stay shared, panics propagate,
+and `@TypeOf` has no effects. Ordinary recursive-copy costs remain. See
+`examples/array-reduce.nov` (five tests), `zig build test-cli-array-reduce`
+(all modes, relocated stdlib, import aliases and negative check/emit-C fixtures),
+and actual-stdlib source-free forced-GC O0/O3/runtime-OOM backend tests.
+`partition` remains deferred; no optimization work is resumed.
+
 ``std.math.abs(value: `T) -> `T`` is delivered as ordinary generic Nov for
 native `int`, `i8`/`i16`/`i32`/`i64` and `f32`/`f64`, with exact input/output
 types. Numeric-zero context rejects nonnumeric/nominal types; existing unary
@@ -1676,10 +1690,10 @@ See [1](https://docs.vlang.io/v-types.html#array-methods)
 
 # Higher-order functions
 
-`std.array.map`, `std.array.filter` and seeded left-fold `std.array.fold` are
-implemented as ordinary library functions; see the current status above.
-The method-chain, `reduce` and lambda syntax below remains a highly experimental
-proposal, not the executable helper API.
+`std.array.map`, `std.array.filter`, seeded left-fold `std.array.fold` and
+optional unseeded `std.array.reduce` are implemented as ordinary library functions;
+see the current status above. The method-chain and lambda syntax below remains a
+highly experimental proposal, not the executable helper API.
 ```nov
 ; Traditional imperative loop
 let num_list = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]

@@ -498,6 +498,22 @@ Signatures here use `T`/`U` for inferred backtick type variables:
 - `array.fold(items: []T, initial: U, combine: (U, T) -> U) -> U` is a left fold
   starting with `initial`, passing the accumulator before the element.
 
+- `array.reduce(items: []T, combine: (T, T) -> T) -> Option(T)` is an unseeded
+  stable left fold. Empty input returns `.none[]`; otherwise the first element
+  seeds the accumulator and each later element invokes `combine(accumulator, item)`
+  left-to-right, exactly `n - 1` times. A singleton returns `.some[first]` without
+  invoking the callback, preserving IEEE NaN and signed-zero seeds unchanged.
+  All ordinary storable types work, including arrays, records, unions, enums,
+  functions and ranges; no equality or ordering is required. Input, both callback
+  parameters and callback result must have exactly the same element type: no
+  numeric widening or signedness/float-width conversion. Arguments evaluate eagerly
+  once, with the by-value input snapshot taken before callback construction/effects.
+  Managed results have recursively independent backing, while copied closures share
+  their existing capture cells. Panics propagate normally; `@TypeOf` validates the
+  call without evaluating arguments or invoking callbacks. This is ordinary Nov,
+  not a compiler builtin; recursive value copies can add substantial overhead.
+  See `examples/array-reduce.nov` and `zig build test-cli-array-reduce`.
+
 - `array.any(items: []T, predicate: (T) -> bool) -> bool` stops at the first true
   predicate; `array.all` has the same signature and stops at the first false one.
 - `array.find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first

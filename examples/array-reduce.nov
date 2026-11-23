@@ -1,0 +1,173 @@
+let std = @import("std")
+let array = std.array
+let reduce = array.reduce
+
+let present: (value: std.Option(`T)) -> `T = match value {
+    .some[item] => item
+    .none => @panic("expected some")
+}
+let first: (a: `T, b: `T) -> `T = a
+let subtract: (a: `T, b: `T) -> `T = a - b
+
+let main: () = {
+    let prices: []int = [20, 5, 3]
+    @println("Remaining:", present(reduce(prices, subtract)))
+    @println("Empty:", reduce(@as([]int, []), subtract).isNone())
+}
+
+@[test]
+let empty_singleton_and_left_fold_order: () = {
+    let mut calls = 0
+    let mut trace: []int = []
+    let combine = (a: int, b: int) -> int {
+        calls += 1
+        trace += [a, b]
+        a - b
+    }
+    @assert(reduce(@as([]int, []), combine).isNone())
+    @assert(present(reduce([7], combine)) == 7 and calls == 0)
+    @assert(present(reduce([20, 5, 3, 2], combine)) == 10)
+    @assert(calls == 3 and trace == [20, 5, 15, 3, 12, 2])
+}
+
+@[test]
+let exact_numeric_types_and_ieee_seed_preservation: () = {
+    let a: std.Option(i8) = reduce([@as(i8, 7), 2], subtract)
+    let b: std.Option(u8) = reduce([@as(u8, 7), 2], subtract)
+    let c: std.Option(i16) = reduce([@as(i16, 7), 2], subtract)
+    let d: std.Option(u16) = reduce([@as(u16, 7), 2], subtract)
+    let e: std.Option(i32) = reduce([@as(i32, 7), 2], subtract)
+    let f: std.Option(u32) = reduce([@as(u32, 7), 2], subtract)
+    let g: std.Option(i64) = reduce([@as(i64, 7), 2], subtract)
+    let h: std.Option(u64) = reduce([@as(u64, 18446744073709551615)], first)
+    let i: std.Option(uint) = reduce([@as(uint, 7), 2], subtract)
+    @assert(present(a) == 5 and present(b) == 5 and present(c) == 5 and present(d) == 5)
+    @assert(present(e) == 5 and present(f) == 5 and present(g) == 5 and present(i) == 5)
+    @assert(present(h) == @as(u64, 18446744073709551615))
+    let small: std.Option(f32) = reduce([@as(f32, 7.5), 2.0], subtract)
+    let large: std.Option(f64) = reduce([@as(f64, 7.5), 2.0], subtract)
+    @assert(present(small) == @as(f32, 5.5) and present(large) == @as(f64, 5.5))
+    let zero: f64 = 0.0
+    let nan = zero / zero
+    let kept = present(
+        reduce(
+            [nan],
+            (left, right) { @panic("singleton callback") }
+        )
+    )
+    @assert(kept != kept)
+    let negative = present(reduce([-zero], first))
+    @assert(1.0 / negative < 0.0)
+    let negative32 = present(reduce([@as(f32, -0.0)], first))
+    @assert(@as(f32, 1.0) / negative32 < @as(f32, 0.0))
+    @assert(present(reduce([1.0 / zero], first)) > 1.0)
+}
+
+let Row = struct {
+    values: [][]int,
+    @[public]
+    @[operator(.equal)]
+    let equal: (a: Row, b: Row) -> bool = @panic("reduce needs no equality")
+}
+
+@[test]
+let managed_results_are_recursively_independent: () = {
+    let mut source = [Row.[ values = [[1], [2]] ], Row.[ values = [[3]] ]]
+    let result = reduce(source, first)
+    let mut selected = present(result)
+    let mut other = present(result)
+    selected.values[0] = [8]
+    other.values[1] = [9]
+    source[0] = Row.[ values = [[7]] ]
+    @assert(present(result).values == [[1], [2]])
+    @assert(selected.values == [[8], [2]] and other.values == [[1], [9]])
+    @assert(
+        present(
+            reduce(
+                [[[1]], [[2]]],
+                (a, b) { a + b }
+            )
+        ) == [[1], [2]]
+    )
+    let unions: []std.Option([][]int) = [.some[[[4]]], .none[]]
+    let mut payload = present(present(reduce(unions, first)))
+    payload[0] = [6]
+    @assert(present(unions[0]) == [[4]])
+}
+
+let Choice = enum {
+    one,
+    two,
+}
+
+@[test]
+let storable_types_and_shared_closure_cells: () = {
+    @assert(
+        present(
+            reduce(
+                [true, false],
+                (a, b) { a and b }
+            )
+        ) == false
+    )
+    @assert(
+        present(
+            reduce(
+                ["é", "😀"],
+                (a, b) { a + b }
+            )
+        ) == "é😀"
+    )
+    @assert(present(reduce(['é', 'a'], first)) == 'é')
+    @assert(present(reduce([Choice.one, .two], first)) == Choice.one)
+    @assert(@len(present(reduce([1..4, 5..9], first))) == 3)
+    let mut calls = 0
+    let tick = () -> int {
+        calls += 1
+        calls
+    }
+    let chosen = present(reduce([tick, tick], first))
+    @assert(chosen() == 1 and tick() == 2 and chosen() == 3)
+}
+
+@[test]
+let eager_snapshots_aliases_inference_and_pure_queries: () = {
+    let mut source = [20, 5, 3]
+    let mut effects = 0
+    let items = () -> []int {
+        effects += 1
+        @assert(effects == 1)
+        source
+    }
+    let callback = () -> (int, int) -> int {
+        effects += 1
+        @assert(effects == 2)
+        source = [99]
+        (a: int, b: int) -> int {
+            effects += 1
+            source = []
+            a - b
+        }
+    }
+    let query: @TypeOf(reduce(items(), callback())) = .none[]
+    @assert(query == std.Option(int).none[] and effects == 0 and source == [20, 5, 3])
+    @assert(present(reduce(items(), callback())) == 12 and effects == 4)
+    @assert(@len(source) == 0)
+    let concrete: ([]u8, (u8, u8) -> u8) -> std.Option(u8) = reduce
+    @assert(present(concrete([9, 2], subtract)) == @as(u8, 7))
+    @assert(
+        present(
+            reduce(
+                [9, 2],
+                (a, b) { a - b }
+            )
+        ) == 7
+    )
+    let mut constructed = 0
+    let make = () -> (int, int) -> int {
+        constructed += 1
+        (a, b) { a + b }
+    }
+    @assert(reduce(@as([]int, []), make()).isNone() and constructed == 1)
+    @assert(present(reduce([4], make())) == 4 and constructed == 2)
+}

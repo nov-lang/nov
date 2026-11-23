@@ -261,6 +261,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_reverse_tests = b.step("test-cli-array-reverse", "Run standard-library array reverse CLI tests");
     addArrayValueHelperCliTests(b, exe, array_reverse_tests, "array-reverse.nov", @embedFile("examples/array-reverse.nov"), "Reversed: [3, 2, 1]\nOriginal: [1, 2, 3]\n", "PASS order_empty_and_singleton\nPASS recursive_storage_independence\nPASS storable_types_and_shared_closure_cells\nPASS inferred_callback_and_unevaluated_query\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_reverse_tests);
+    const array_reduce_tests = b.step("test-cli-array-reduce", "Run standard-library array reduce CLI tests");
+    addArrayReduceCliTests(b, exe, array_reduce_tests);
+    test_step.dependOn(array_reduce_tests);
     const array_sort_tests = b.step("test-cli-array-sort", "Run standard-library stable array sort CLI tests");
     addArraySortCliTests(b, exe, array_sort_tests);
     test_step.dependOn(array_sort_tests);
@@ -5540,6 +5543,100 @@ fn addArrayValueHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
                 run.expectStdErrEqual("");
                 test_step.dependOn(&run.step);
             }
+        }
+    }
+}
+
+fn addArrayReduceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "array-reduce.nov", @embedFile("examples/array-reduce.nov"), "Remaining: 12\nEmpty: true\n", "PASS empty_singleton_and_left_fold_order\nPASS exact_numeric_types_and_ieee_seed_preservation\nPASS managed_results_are_recursively_independent\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n5 passed; 0 failed; 5 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const aliases =
+        \\let std = @import("std")
+        \\let direct = @import("lib/array.nov")
+        \\let alternate = @import("lib/./array.nov")
+        \\let api = @import("api.nov")
+        \\let combine: (a: `T, b: `T) -> `T = a - b
+        \\let verify: () = {
+        \\    let concrete: ([]int, (int, int) -> int) -> std.Option(int) = api.reduce
+        \\    @assert(concrete([9, 2], combine).unwrapOr(0) == 7)
+        \\    @assert(direct.reduce([9, 2], (a, b) { a - b }).unwrapOr(0) == 7)
+        \\    @assert(alternate.reduce([9, 2], combine).unwrapOr(0) == 7)
+        \\    @assert(std.array.reduce([9, 2], combine).unwrapOr(0) == 7)
+        \\}
+        \\@[test]
+        \\let imported_aliases: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    const api = "let arrays = @import(\"lib/array.nov\")\n@[public]\nlet reduce = arrays.reduce\n";
+    _ = fixtures.add("api.nov", api);
+    _ = fixtures.add("aliases.nov", aliases);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api, "lib/", "lib/nov/") catch @panic("OOM"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = if (installed) std.Build.Step.Run.create(b, "CLI reduce aliases: relocated install") else b.addRunArtifact(exe);
+                if (installed) run.addFileArg(installed_exe);
+                run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, "aliases.nov" });
+                if (mode.len != 0) run.addArg(mode);
+                if (!installed) {
+                    run.addArg("--lib-dir");
+                    run.addDirectoryArg(library);
+                }
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "PASS imported_aliases\n1 passed; 0 failed; 1 total\n" else "");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_][]const u8{ "aliases.nov", "api.nov", "lib/std.nov", "lib/array.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_]struct { expression: []const u8, diagnostic: []const u8 }{
+        .{ .expression = "std.array.reduce(@as([]int,[1]),(a:int,b:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]int,[1]),(a:bool,b:int)->int{b})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]int,[1]),(a:int,b:bool)->int{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]i8,[1]),(a:i16,b:i16)->i16{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]u8,[1]),(a:i8,b:i8)->i8{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]f32,[1.0]),(a:f64,b:f64)->f64{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]A,[A.[1]]),(a:B,b:B)->B{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]int,[1]),(a:int)->int{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .expression = "std.array.reduce(@as([]int,[1]))", .diagnostic = "argument" },
+        .{ .expression = "std.array.reduce(@as([]int,[1]),combine,combine)", .diagnostic = "argument" },
+        .{ .expression = "std.array.reduce(1,combine)", .diagnostic = "type" },
+        .{ .expression = "std.array.reduce(@as([]int,[1]),true)", .diagnostic = "type" },
+    }, 0..) |case, index| {
+        const source = b.fmt("invalid-reduce-{d}.nov", .{index});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet A=struct{{n:int,}}\nlet B=struct{{n:int,}}\nlet combine:(a:int,b:int)->int=a+b\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
+        for ([_][]const u8{ "check", "emit-c" }) |command| {
+            const check = b.addRunArtifact(exe);
+            check.setCwd(fixtures.getDirectory());
+            check.addArg(command);
+            if (std.mem.eql(u8, command, "check")) check.addArg("--semantic");
+            check.addArgs(&.{ source, "--lib-dir" });
+            check.addDirectoryArg(library);
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch("error:");
+            check.expectStdErrMatch(case.diagnostic);
+            test_step.dependOn(&check.step);
         }
     }
 }

@@ -11663,6 +11663,98 @@ test "array flatMap callback panic stops traversal after eager argument evaluati
         try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "IC12", "panic: callback stopped\n", mode);
 }
 
+test "array reduce actual stdlib source free recursive copies forced GC O0 O3 runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let make:()->[][][]int=[[[1],[2]],[[3]]]
+        \\let reduce:(items:[][][]int)->[][]int=std.array.reduce(items,(a,b){a+b}).unwrapOr([])
+        \\let empty:()->bool=std.array.reduce(@as([]int,[]),(a,b){a+b}).isNone()
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, result = {0};
+        \\    void **roots[] = {&input.data, &result.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    input = nov_make(); result = nov_reduce(input);
+        \\    nov_array *a = input.data, *b = result.data, *rows = a[0].data;
+        \\    if (result.len != 3 || b == rows || b[0].data == rows[0].data || b[1].data == rows[1].data) return 1;
+        \\    ((intptr_t *)rows[0].data)[0] = 9;
+        \\    if (((intptr_t *)b[0].data)[0] != 1 || ((intptr_t *)b[2].data)[0] != 3) return 2;
+        \\    ((intptr_t *)b[1].data)[0] = 8;
+        \\    if (((intptr_t *)rows[1].data)[0] != 2) return 3;
+        \\    input = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    b = result.data;
+        \\    if (((intptr_t *)b[0].data)[0] != 1 || ((intptr_t *)b[1].data)[0] != 8) return 4;
+        \\    fail_allocations = 1;
+        \\    if (!nov_empty()) return 5;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 6;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array input = {0};
+        \\    void **roots[] = {&input.data}; nov_gc_roots frame = {0};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    input = nov_make(); fail_allocations = 1;
+        \\    (void)nov_reduce(input); return 0;
+        \\}
+    , true);
+}
+
+test "array reduce actual stdlib source free snapshots shared cells queries forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let main:()={
+        \\let mut source=[20,5,3]
+        \\let mut effects=0
+        \\let items=()->[]int{effects+=1
+        \\@assert(effects==1)
+        \\source}
+        \\let callback=()->(int,int)->int{effects+=1
+        \\@assert(effects==2)
+        \\source=[99]
+        \\(a:int,b:int)->int{effects+=1
+        \\source=[]
+        \\a-b}}
+        \\let query:@TypeOf(std.array.reduce(items(),callback()))=.none[]
+        \\@assert(query==std.Option(int).none[] and effects==0)
+        \\@assert(std.array.reduce(items(),callback()).unwrapOr(0)==12)
+        \\@assert(effects==4 and @len(source)==0)
+        \\let tick=()->int{effects+=1
+        \\effects}
+        \\let chosen=std.array.reduce([tick,tick],(a,b){a}).unwrapOr(tick)
+        \\@assert(chosen()==5 and tick()==6)
+        \\}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "array reduce callback panic after eager arguments O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let items:()->[]int={@print("I")
+        \\[20,5,3]}
+        \\let callback:()->(int,int)->int={@print("C")
+        \\(a:int,b:int)->int{@print(a,b)
+        \\@panic("reduce stopped")}}
+        \\let main:()={let result=std.array.reduce(items(),callback())
+        \\@println("unreachable",result)}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "IC20 5", "panic: reduce stopped\n", mode);
+}
+
 test "array reverse actual stdlib source free recursive copies forced GC O0 O3 and runtime OOM" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let std=@import("std")

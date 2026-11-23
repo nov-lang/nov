@@ -67,6 +67,20 @@ let fold: (items: []`T, initial: `U, combine: (`U, `T) -> `U) -> `U = {
 }
 
 @[public]
+let reduce: (items: []`T, combine: (`T, `T) -> `T) -> Option(`T) = {
+    if @len(items) == 0 {
+        return .none[]
+    }
+    let mut result: `T = items[0]
+    loop item, index in items, 0.. {
+        if index != 0 {
+            result = combine(result, item)
+        }
+    }
+    .some[result]
+}
+
+@[public]
 let any: (items: []`T, predicate: (`T) -> bool) -> bool = {
     loop item in items {
         if predicate(item) {
