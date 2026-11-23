@@ -11755,6 +11755,165 @@ test "array reduce callback panic after eager arguments O0 O3" {
         try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "IC20 5", "panic: reduce stopped\n", mode);
 }
 
+test "array count actual stdlib source free order snapshots shared cells TypeOf empty forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let main:()={
+        \\let mut source=[1,2,3,4]
+        \\let mut effects=0
+        \\let mut seen=0
+        \\let items=()->[]int{effects+=1
+        \\@assert(effects==1)
+        \\source}
+        \\let callback=()->(int)->bool{effects+=1
+        \\@assert(effects==2)
+        \\source=[99]
+        \\(x:int)->bool{effects+=1
+        \\seen=seen*10+x
+        \\source=[]
+        \\x==1 or x==3}}
+        \\let query:@TypeOf(std.array.count(items(),callback()))=0
+        \\@assert(query==@as(uint,0) and effects==0 and seen==0)
+        \\let result:uint=std.array.count(items(),callback())
+        \\@assert(result==2 and effects==6 and seen==1234 and @len(source)==0)
+        \\@assert(std.array.count(@as([]int,[]),(x){@panic("empty predicate")})==0)
+        \\@assert(std.array.count([1],(x){false})==0)
+        \\@assert(std.array.count([1],(x){true})==1)
+        \\let tick=()->int{effects+=1
+        \\effects}
+        \\@assert(std.array.count([tick,tick],(f){f()>0})==2)
+        \\@assert(effects==8 and tick()==9)
+        \\}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "array findLastIndex actual stdlib source free reverse short circuit snapshots shared cells TypeOf empty forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let main:()={
+        \\let mut source=[1,2,3,4]
+        \\let mut effects=0
+        \\let mut seen=0
+        \\let items=()->[]int{effects+=1
+        \\@assert(effects==1)
+        \\source}
+        \\let callback=()->(int)->bool{effects+=1
+        \\@assert(effects==2)
+        \\source=[99]
+        \\(x:int)->bool{effects+=1
+        \\seen=seen*10+x
+        \\source=[]
+        \\if x<3 {@panic("short circuit failed")}
+        \\x==3}}
+        \\let query:@TypeOf(std.array.findLastIndex(items(),callback()))=.none[]
+        \\@assert(query==std.Option(uint).none[] and effects==0 and seen==0)
+        \\let result:std.Option(uint)=std.array.findLastIndex(items(),callback())
+        \\@assert(result.unwrapOr(99)==2 and effects==4 and seen==43 and @len(source)==0)
+        \\@assert(std.array.findLastIndex(@as([]int,[]),(x){@panic("empty predicate")}).isNone())
+        \\@assert(std.array.findLastIndex([7],(x){true}).unwrapOr(99)==0)
+        \\@assert(std.array.findLastIndex([7],(x){false}).isNone())
+        \\seen=0
+        \\@assert(std.array.findLastIndex([1,2,3],(x){seen=seen*10+x
+        \\false}).isNone())
+        \\@assert(seen==321)
+        \\@assert(std.array.findLastIndex([1,2,3],(x){x==1}).unwrapOr(99)==0)
+        \\@assert(std.array.findLastIndex([1,2,3],(x){true}).unwrapOr(99)==2)
+        \\let tick=()->int{effects+=1
+        \\effects}
+        \\@assert(std.array.findLastIndex([tick,tick],(f){f()==6}).unwrapOr(99)==0)
+        \\@assert(effects==6 and tick()==7)
+        \\}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "array count and array findLastIndex actual stdlib source free recursive callback copies forced GC O0 O3 runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\@[extern("predicate_called")]
+        \\let predicateCalled:()->bool
+        \\let mutateRow:(row:[][]int)->bool={let mut first=row[0]
+        \\let mut last=row[1]
+        \\first[0]=99
+        \\last[0]=88
+        \\@assert(first[0]==99 and last[0]==88 and row[0][0]!=99 and row[1][0]!=88)
+        \\predicateCalled()}
+        \\let make:()->[][][]int=[[[1],[2]],[[3],[4]]]
+        \\let countRows:(items:[][][]int)->uint=std.array.count(items,mutateRow)
+        \\let findRows:(items:[][][]int)->uint=std.array.findLastIndex(items,mutateRow).unwrapOr(99)
+        \\let empty:()->bool=std.array.count(@as([][][]int,[]),mutateRow)==0 and std.array.findLastIndex(@as([][][]int,[]),mutateRow).isNone()
+    );
+    defer test_gpa.free(library);
+    const mutate =
+        \\static int calls;
+        \\bool predicate_called(void) { ++calls; return true; }
+    ;
+    const success = try std.mem.concat(test_gpa, u8, &.{
+        mutate,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0};
+        \\    void **roots[] = {&input.data}; nov_gc_roots frame = {0};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    input = nov_make();
+        \\    if (nov_countRows(input) != 2 || calls != 2) return 1;
+        \\    if (nov_findRows(input) != 1 || calls != 3) return 2;
+        \\    nov_array *a = input.data, *first = a[0].data, *last = a[1].data;
+        \\    if (((intptr_t *)first[0].data)[0] != 1 || ((intptr_t *)first[1].data)[0] != 2) return 3;
+        \\    if (((intptr_t *)last[0].data)[0] != 3 || ((intptr_t *)last[1].data)[0] != 4) return 4;
+        \\    fail_allocations = 1;
+        \\    if (!nov_empty() || calls != 3) return 5;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 6;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+        \\
+    });
+    defer test_gpa.free(success);
+    try runApprovedHelperHarness(library, success, false);
+    for ([_][]const u8{ "countRows", "findRows" }) |name| {
+        const harness = try std.fmt.allocPrint(
+            test_gpa,
+            "{s}\nint main(void) {{ nov_array input = {{0}}; void **roots[] = {{&input.data}}; nov_gc_roots frame = {{0}}; nov_gc_push(&nov_rt_heap, &frame, roots, 1); nov_rt_heap.collect_every_allocation = 1; input = nov_make(); fail_allocations = 1; (void)nov_{s}(input); return 0; }}\n",
+            .{ mutate, name },
+        );
+        defer test_gpa.free(harness);
+        try runApprovedHelperHarness(library, harness, true);
+    }
+}
+
+test "array count and array findLastIndex callback panic after eager arguments O0 O3" {
+    for ([_]struct { name: []const u8, output: []const u8 }{
+        .{ .name = "count", .output = "IC12" },
+        .{ .name = "findLastIndex", .output = "IC32" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(
+            test_gpa,
+            "let std=@import(\"std\")\n" ++
+                "let items:()->[]int={{@print(\"I\")\n[1,2,3]}}\n" ++
+                "let callback:()->(int)->bool={{@print(\"C\")\n(x:int)->bool{{@print(x)\nif x==2 {{@panic(\"predicate stopped\")}}\nfalse}}}}\n" ++
+                "let main:()={{let result=std.array.{s}(items(),callback())\n@println(\"unreachable\",result)}}\n",
+            .{case.name},
+        );
+        defer test_gpa.free(source);
+        const library = try emitApprovedHelperSourceFree(test_gpa, source);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, case.output, "panic: predicate stopped\n", mode);
+    }
+}
+
 test "array reverse actual stdlib source free recursive copies forced GC O0 O3 and runtime OOM" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let std=@import("std")

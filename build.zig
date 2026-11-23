@@ -261,6 +261,14 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_reverse_tests = b.step("test-cli-array-reverse", "Run standard-library array reverse CLI tests");
     addArrayValueHelperCliTests(b, exe, array_reverse_tests, "array-reverse.nov", @embedFile("examples/array-reverse.nov"), "Reversed: [3, 2, 1]\nOriginal: [1, 2, 3]\n", "PASS order_empty_and_singleton\nPASS recursive_storage_independence\nPASS storable_types_and_shared_closure_cells\nPASS inferred_callback_and_unevaluated_query\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_reverse_tests);
+    const array_count_tests = b.step("test-cli-array-count", "Run standard-library array count CLI tests");
+    addArrayValueHelperCliTests(b, exe, array_count_tests, "array-count.nov", @embedFile("examples/array-count.nov"), "Passing: 3\n", "PASS source_order_empty_and_once_per_element\nPASS managed_snapshot_and_callback_copies\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayPredicateQueryCliTests(b, exe, array_count_tests, "count", "uint", "");
+    test_step.dependOn(array_count_tests);
+    const array_find_last_index_tests = b.step("test-cli-array-find-last-index", "Run standard-library array findLastIndex CLI tests");
+    addArrayValueHelperCliTests(b, exe, array_find_last_index_tests, "array-find-last-index.nov", @embedFile("examples/array-find-last-index.nov"), "Last high score index: 3\n", "PASS reverse_order_short_circuit_and_boundaries\nPASS managed_snapshot_and_callback_copies\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayPredicateQueryCliTests(b, exe, array_find_last_index_tests, "findLastIndex", "std.Option(uint)", ".unwrapOr(99)");
+    test_step.dependOn(array_find_last_index_tests);
     const array_reduce_tests = b.step("test-cli-array-reduce", "Run standard-library array reduce CLI tests");
     addArrayReduceCliTests(b, exe, array_reduce_tests);
     test_step.dependOn(array_reduce_tests);
@@ -5542,6 +5550,108 @@ fn addArrayValueHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
                 run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) output else tests);
                 run.expectStdErrEqual("");
                 test_step.dependOn(&run.step);
+            }
+        }
+    }
+}
+
+fn addArrayPredicateQueryCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, symbol: []const u8, result_type: []const u8, unwrap: []const u8) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const aliases = b.fmt(
+        \\let std = @import("std")
+        \\let direct = @import("lib/array.nov")
+        \\let alternate = @import("lib/./array.nov")
+        \\let api = @import("api.nov")
+        \\let query = api.{0s}
+        \\let predicate: (value: `T) -> bool = value > 2
+        \\let verify: () = {{
+        \\    let concrete: ([]int, (int) -> bool) -> {1s} = query
+        \\    @assert(concrete([1, 4, 5], predicate){2s} == 2)
+        \\    @assert(query([1, 4, 5], (value) {{ value > 2 }}){2s} == 2)
+        \\    @assert(direct.{0s}([1, 4, 5], (value) {{ value > 2 }}){2s} == 2)
+        \\    @assert(alternate.{0s}([1, 4, 5], predicate){2s} == 2)
+        \\    @assert(std.array.{0s}([1, 4, 5], predicate){2s} == 2)
+        \\    let typed: @TypeOf(query([1, 4, 5], predicate)) = concrete([1, 4, 5], predicate)
+        \\    @assert(typed{2s} == 2)
+        \\}}
+        \\@[test]
+        \\let imported_aliases: () = verify()
+        \\let main: () = verify()
+        \\
+    , .{ symbol, result_type, unwrap });
+    const api = b.fmt("let arrays = @import(\"lib/array.nov\")\n@[public]\nlet {0s} = arrays.{0s}\n", .{symbol});
+    _ = fixtures.add("api.nov", api);
+    _ = fixtures.add("aliases.nov", aliases);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api, "lib/", "lib/nov/") catch @panic("OOM"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = if (installed) std.Build.Step.Run.create(b, "CLI predicate query aliases: relocated install") else b.addRunArtifact(exe);
+                if (installed) run.addFileArg(installed_exe);
+                run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, "aliases.nov" });
+                if (mode.len != 0) run.addArg(mode);
+                if (!installed) {
+                    run.addArg("--lib-dir");
+                    run.addDirectoryArg(library);
+                }
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "PASS imported_aliases\n1 passed; 0 failed; 1 total\n" else "");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_][]const u8{ "aliases.nov", "api.nov", "lib/std.nov", "lib/array.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_]struct { arguments: []const u8, diagnostic: []const u8, query_diagnostic: ?[]const u8 = null }{
+        .{ .arguments = "@as([]int,[1]),(value:bool)->bool{value}", .diagnostic = "constraints require exactly identical types" },
+        .{ .arguments = "@as([]i8,[1]),(value:i16)->bool{true}", .diagnostic = "constraints require exactly identical types" },
+        .{ .arguments = "@as([]u8,[1]),(value:i8)->bool{true}", .diagnostic = "constraints require exactly identical types" },
+        .{ .arguments = "@as([]f32,[1.0]),(value:f64)->bool{true}", .diagnostic = "constraints require exactly identical types" },
+        .{ .arguments = "@as([]A,[A.[1]]),(value:B)->bool{true}", .diagnostic = "constraints require exactly identical types", .query_diagnostic = "expression does not match the expected type" },
+        .{ .arguments = "@as([]int,[1]),(value:int)->int{value}", .diagnostic = "type" },
+        .{ .arguments = "@as([]int,[1]),()->bool{true}", .diagnostic = "type" },
+        .{ .arguments = "@as([]int,[1]),(a:int,b:int)->bool{true}", .diagnostic = "type" },
+        .{ .arguments = "@as([]int,[1])", .diagnostic = "argument" },
+        .{ .arguments = "@as([]int,[1]),predicate,predicate", .diagnostic = "argument" },
+        .{ .arguments = "1,predicate", .diagnostic = "type" },
+        .{ .arguments = "@as([]int,[1]),true", .diagnostic = "type" },
+        .{ .arguments = "@as([]int,[1]),(value){value+1}", .diagnostic = "type" },
+    }, 0..) |case, index| {
+        for ([_]bool{ false, true }) |type_query| {
+            const source = b.fmt("invalid-{s}-{d}-{s}.nov", .{ symbol, index, if (type_query) "typeof" else "call" });
+            const call = b.fmt("std.array.{s}({s})", .{ symbol, case.arguments });
+            const body = if (type_query) b.fmt("let probe:(value:@TypeOf({s}))={{}}", .{call}) else b.fmt("let result={s}", .{call});
+            _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet A=struct{{n:int,}}\nlet B=struct{{n:int,}}\nlet predicate:(value:int)->bool=true\nlet main:()={{{s}\n}}\n", .{body}));
+            for ([_][]const u8{ "check", "emit-c" }) |command| {
+                const check = b.addRunArtifact(exe);
+                check.setCwd(fixtures.getDirectory());
+                check.addArg(command);
+                if (std.mem.eql(u8, command, "check")) check.addArg("--semantic");
+                check.addArgs(&.{ source, "--lib-dir" });
+                check.addDirectoryArg(library);
+                check.expectExitCode(1);
+                check.expectStdOutEqual("");
+                check.expectStdErrMatch("error:");
+                check.expectStdErrMatch(if (type_query) case.query_diagnostic orelse case.diagnostic else case.diagnostic);
+                test_step.dependOn(&check.step);
             }
         }
     }

@@ -1,0 +1,143 @@
+let std = @import("std")
+let count = std.array.count
+let yes: (value: `T) -> bool = true
+let no: (value: `T) -> bool = false
+
+let main: () = {
+    let passing = count(
+        [42, 81, 59, 90, 60],
+        (score) { score >= 60 }
+    )
+    @println("Passing:", passing)
+}
+
+@[test]
+let source_order_empty_and_once_per_element: () = {
+    let mut trace: []int = []
+    let predicate = (value: int) -> bool {
+        trace += [value]
+        value % 2 == 0
+    }
+    let empty: uint = count(@as([]int, []), predicate)
+    @assert(empty == 0 and @len(trace) == 0)
+    let result: uint = count([3, 2, 1, 4, 2], predicate)
+    @assert(result == 3 and trace == [3, 2, 1, 4, 2])
+    @assert(count([7], yes) == 1 and count([7], no) == 0)
+    @assert(count([1, 2, 1], yes) == 3 and count([1, 2, 1], no) == 0)
+}
+
+let Row = struct {
+    values: [][]int,
+    @[public]
+    @[operator(.equal)]
+    let equal: (a: Row, b: Row) -> bool = @panic("count needs no equality")
+    @[public]
+    @[operator(.less_than)]
+    let less: (a: Row, b: Row) -> bool = @panic("count needs no ordering")
+}
+
+@[test]
+let managed_snapshot_and_callback_copies: () = {
+    let mut source = [Row.[ values = [[1]] ], Row.[ values = [[2]] ]]
+    let mut seen: []int = []
+    let result = count(
+        source,
+        (row) {
+            seen += [row.values[0][0]]
+            source = [Row.[ values = [[99]] ]]
+            let mut copy = row
+            copy.values[0] = [88]
+            row.values[0][0] < 3
+        }
+    )
+    @assert(result == 2 and seen == [1, 2] and source[0].values == [[99]])
+    @assert(count([[[1]], [[2]]], yes) == 2)
+    let payloads: []std.Option([][]int) = [.some[[[4]]], .none[]]
+    @assert(
+        count(
+            payloads,
+            (value) { value.isSome() }
+        ) == 1
+    )
+}
+
+let Choice = enum {
+    one,
+    two,
+}
+
+@[test]
+let storable_types_and_shared_closure_cells: () = {
+    @assert(
+        count(
+            [true, false],
+            (value) { value }
+        ) == 1
+    )
+    @assert(count(["é", "😀"], yes) == 2 and count(['é', 'a'], no) == 0)
+    @assert(count([Choice.one, .two], yes) == 2)
+    @assert(
+        count(
+            [1..4, 5..9],
+            (value) { @len(value) == 4 }
+        ) == 1
+    )
+    @assert(count([@as(i8, 1)], yes) == 1 and count([@as(u8, 1)], yes) == 1)
+    @assert(count([@as(i16, 1)], yes) == 1 and count([@as(u16, 1)], yes) == 1)
+    @assert(count([@as(i32, 1)], yes) == 1 and count([@as(u32, 1)], yes) == 1)
+    @assert(count([@as(i64, 1)], yes) == 1 and count([@as(uint, 1)], yes) == 1)
+    @assert(count([@as(u64, 18446744073709551615)], yes) == 1)
+    @assert(count([@as(f32, -0.0)], yes) == 1)
+    let zero: f64 = 0.0
+    @assert(count([zero / zero, -zero, 1.0 / zero], yes) == 3)
+    let mut calls = 0
+    let tick = () -> int {
+        calls += 1
+        calls
+    }
+    let callbacks = [tick, tick, tick]
+    @assert(
+        count(
+            callbacks,
+            (callback) { callback() > 1 }
+        ) == 2
+    )
+    @assert(calls == 3 and callbacks[0]() == 4 and tick() == 5)
+}
+
+@[test]
+let eager_snapshots_aliases_inference_and_pure_queries: () = {
+    let mut source = [1, 2, 3]
+    let mut effects = 0
+    let items = () -> []int {
+        effects += 1
+        @assert(effects == 1)
+        source
+    }
+    let callback = () -> (int) -> bool {
+        effects += 1
+        @assert(effects == 2)
+        source = [99]
+        (value: int) -> bool {
+            effects += 1
+            source = []
+            value % 2 == 1
+        }
+    }
+    let query: @TypeOf(count(items(), callback())) = 0
+    @assert(query == 0 and effects == 0 and source == [1, 2, 3])
+    @assert(count(items(), callback()) == 2 and effects == 5 and @len(source) == 0)
+    let concrete: ([]u8, (u8) -> bool) -> uint = count
+    @assert(concrete([1, 2], yes) == 2)
+    let mut constructed = 0
+    let empty = () -> []int {
+        constructed += 1
+        []
+    }
+    let make = () -> (int) -> bool {
+        constructed += 1
+        @assert(constructed == 2)
+        (value) { @panic("empty predicate invoked") }
+    }
+    @assert(count(empty(), make()) == 0 and constructed == 2)
+}

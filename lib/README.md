@@ -514,6 +514,9 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   not a compiler builtin; recursive value copies can add substantial overhead.
   See `examples/array-reduce.nov` and `zig build test-cli-array-reduce`.
 
+- `array.count(items: []T, predicate: (T) -> bool) -> uint` counts matching elements,
+  invoking the predicate exactly once per element in source order; empty input
+  returns zero without invoking it. See `examples/array-count.nov` (four tests).
 - `array.any(items: []T, predicate: (T) -> bool) -> bool` stops at the first true
   predicate; `array.all` has the same signature and stops at the first false one.
 - `array.find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first
@@ -526,6 +529,10 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   elements and returns the remainder in source order.
 - `array.findIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` returns its
   zero-based, pointer-sized unsigned index.
+- `array.findLastIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` visits
+  elements last-to-first and stops at the first match. It returns the original
+  zero-based, pointer-sized unsigned index, not a reverse offset; empty input or
+  no match returns `.none[]`. See `examples/array-find-last-index.nov` (four tests).
 - `array.each(items: []T, action: (T) -> void) -> void` visits all elements without
   constructing an output array. Callbacks must return void.
 
@@ -558,8 +565,19 @@ nov test examples/array-sort.nov --debug --lib-dir lib
 nov test examples/array-sort.nov --release --lib-dir lib
 ```
 
-For the other helpers, callbacks run once per visited element in source order, except `findLast`, whose
-predicate runs in reverse source order and stops immediately on a match.
+`count` and `findLastIndex` accept all ordinary storable element types, including
+nested arrays, nominal records/unions/enums, functions and ranges, with no equality
+or ordering requirement. Predicates must accept the exact element type and return
+`bool`; no numeric widening or signedness/float-width conversion is introduced.
+Arguments evaluate eagerly once, left-to-right, snapshotting the input before
+callback construction can mutate its owner. Callbacks can safely replace captured
+source storage; recursive value copies remain independent and copied closures share
+capture cells. `@TypeOf` validates calls without evaluating arguments or predicates.
+These are ordinary Nov helpers with existing recursive-copy costs, not new builtins.
+
+For the other helpers, callbacks run once per visited element in source order,
+except `findLast` and `findLastIndex`, whose predicates run in reverse source order
+and stop immediately on a match.
 Empty input invokes no callback: map/filter/take/drop return empty arrays, fold
 returns `initial`, any returns false, all returns true, and all searches return
 `.none[]`. Searches also return

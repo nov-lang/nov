@@ -1,0 +1,157 @@
+let std = @import("std")
+let findLastIndex = std.array.findLastIndex
+let yes: (value: `T) -> bool = true
+let no: (value: `T) -> bool = false
+
+let main: () = {
+    let last = findLastIndex(
+        [42, 81, 59, 90, 60],
+        (score) { score >= 80 }
+    )
+    @println("Last high score index:", last.unwrapOr(99))
+}
+
+@[test]
+let reverse_order_short_circuit_and_boundaries: () = {
+    let mut trace: []int = []
+    let predicate = (value: int) -> bool {
+        trace += [value]
+        value == 4
+    }
+    let empty: std.Option(uint) = findLastIndex(@as([]int, []), predicate)
+    @assert(empty.isNone() and @len(trace) == 0)
+    let result: std.Option(uint) = findLastIndex([4, 1, 4, 2], predicate)
+    @assert(result.unwrapOr(99) == 2 and trace == [2, 4])
+    trace = []
+    @assert(findLastIndex([4, 1, 2], predicate).unwrapOr(99) == 0)
+    @assert(trace == [2, 1, 4])
+    trace = []
+    @assert(findLastIndex([3, 1, 2], predicate).isNone())
+    @assert(trace == [2, 1, 3])
+    @assert(findLastIndex([7], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([7], no).isNone())
+    @assert(findLastIndex([1, 2, 1], yes).unwrapOr(99) == 2)
+}
+
+let Row = struct {
+    values: [][]int,
+    @[public]
+    @[operator(.equal)]
+    let equal: (a: Row, b: Row) -> bool = @panic("findLastIndex needs no equality")
+    @[public]
+    @[operator(.less_than)]
+    let less: (a: Row, b: Row) -> bool = @panic("findLastIndex needs no ordering")
+}
+
+@[test]
+let managed_snapshot_and_callback_copies: () = {
+    let mut source = [Row.[ values = [[1]] ], Row.[ values = [[2]] ]]
+    let mut seen: []int = []
+    let result = findLastIndex(
+        source,
+        (row) {
+            seen += [row.values[0][0]]
+            source = [Row.[ values = [[99]] ]]
+            let mut copy = row
+            copy.values[0] = [88]
+            row.values[0][0] == 1
+        }
+    )
+    @assert(result.unwrapOr(99) == 0 and seen == [2, 1])
+    @assert(source[0].values == [[99]])
+    @assert(findLastIndex([[[1]], [[2]]], yes).unwrapOr(99) == 1)
+    let payloads: []std.Option([][]int) = [.some[[[4]]], .none[]]
+    @assert(
+        findLastIndex(
+            payloads,
+            (value) { value.isSome() }
+        ).unwrapOr(99) == 0
+    )
+}
+
+let Choice = enum {
+    one,
+    two,
+}
+
+@[test]
+let storable_types_and_shared_closure_cells: () = {
+    @assert(
+        findLastIndex(
+            [true, false],
+            (value) { value }
+        ).unwrapOr(99) == 0
+    )
+    @assert(findLastIndex(["é", "😀"], yes).unwrapOr(99) == 1)
+    @assert(findLastIndex(['é', 'a'], no).isNone())
+    @assert(findLastIndex([Choice.one, .two], yes).unwrapOr(99) == 1)
+    @assert(
+        findLastIndex(
+            [1..4, 5..9],
+            (value) { @len(value) == 3 }
+        ).unwrapOr(99) == 0
+    )
+    @assert(findLastIndex([@as(i8, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(u8, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(i16, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(u16, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(i32, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(u32, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(i64, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(uint, 1)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(u64, 18446744073709551615)], yes).unwrapOr(99) == 0)
+    @assert(findLastIndex([@as(f32, -0.0)], yes).unwrapOr(99) == 0)
+    let zero: f64 = 0.0
+    @assert(findLastIndex([zero / zero, -zero, 1.0 / zero], yes).unwrapOr(99) == 2)
+    let mut calls = 0
+    let tick = () -> int {
+        calls += 1
+        calls
+    }
+    let callbacks = [tick, tick, tick]
+    @assert(
+        findLastIndex(
+            callbacks,
+            (callback) { callback() == 2 }
+        ).unwrapOr(99) == 1
+    )
+    @assert(calls == 2 and callbacks[0]() == 3 and tick() == 4)
+}
+
+@[test]
+let eager_snapshots_aliases_inference_and_pure_queries: () = {
+    let mut source = [1, 2, 3]
+    let mut effects = 0
+    let items = () -> []int {
+        effects += 1
+        @assert(effects == 1)
+        source
+    }
+    let callback = () -> (int) -> bool {
+        effects += 1
+        @assert(effects == 2)
+        source = [99]
+        (value: int) -> bool {
+            effects += 1
+            source = []
+            value % 2 == 0
+        }
+    }
+    let query: @TypeOf(findLastIndex(items(), callback())) = .none[]
+    @assert(query.isNone() and effects == 0 and source == [1, 2, 3])
+    @assert(findLastIndex(items(), callback()).unwrapOr(99) == 1)
+    @assert(effects == 4 and @len(source) == 0)
+    let concrete: ([]u8, (u8) -> bool) -> std.Option(uint) = findLastIndex
+    @assert(concrete([1, 2], yes).unwrapOr(99) == 1)
+    let mut constructed = 0
+    let empty = () -> []int {
+        constructed += 1
+        []
+    }
+    let make = () -> (int) -> bool {
+        constructed += 1
+        @assert(constructed == 2)
+        (value) { @panic("empty predicate invoked") }
+    }
+    @assert(findLastIndex(empty(), make()).isNone() and constructed == 2)
+}

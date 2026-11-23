@@ -356,6 +356,20 @@ appear only between parts, including empty parts. Exact UTF-8 bytes and embedded
 NUL are preserved without normalization. Inputs remain unchanged and results
 retain valid immutable content. See `examples/string-join.nov` (five tests).
 
+`std.array.count(items: []T, predicate: (T) -> bool) -> uint` and
+`findLastIndex(items: []T, predicate: (T) -> bool) -> std.Option(uint)` are
+implemented as ordinary Nov helpers. Count visits every element exactly once in
+source order and returns zero for empty input. Last-index search visits last-to-first,
+stops immediately on a match and returns its original zero-based unsigned index,
+not a reverse offset; empty/no-match inputs return none. Both require an exact
+`(T) -> bool` predicate and support all storable types without equality or ordering.
+Eager left-to-right arguments snapshot input before callback construction effects;
+callbacks may replace captured owners safely. Recursive copies remain independent,
+closure cells remain shared, and `@TypeOf` performs no argument/callback effects.
+See `examples/array-count.nov` and `examples/array-find-last-index.nov` (four tests
+each), covering boundaries, visitation, managed copies, storable families, captures,
+aliases, inference and pure queries. No new builtin or optimization is introduced.
+
 `std.array.findLast`, `take` and `drop` are implemented for all supported storable
 element types. `findLast` evaluates predicates from the end, stopping immediately
 at the first reverse-order match, and returns canonical `std.Option(T)` or none.

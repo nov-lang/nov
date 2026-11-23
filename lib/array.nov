@@ -81,6 +81,17 @@ let reduce: (items: []`T, combine: (`T, `T) -> `T) -> Option(`T) = {
 }
 
 @[public]
+let count: (items: []`T, predicate: (`T) -> bool) -> uint = {
+    let mut result: uint = 0
+    loop item in items {
+        if predicate(item) {
+            result += 1
+        }
+    }
+    result
+}
+
+@[public]
 let any: (items: []`T, predicate: (`T) -> bool) -> bool = {
     loop item in items {
         if predicate(item) {
@@ -158,6 +169,21 @@ let findIndex: (items: []`T, predicate: (`T) -> bool) -> Option(uint) = {
         if predicate(item) {
             return .some[index]
         }
+    }
+    .none[]
+}
+
+@[public]
+let findLastIndex: (items: []`T, predicate: (`T) -> bool) -> Option(uint) = {
+    let mut index: int = -1
+    let mut position: uint = @len(items)
+    loop _ in items {
+        position -= 1
+        let item = items[index]
+        if predicate(item) {
+            return .some[position]
+        }
+        index -= 1
     }
     .none[]
 }
