@@ -69,7 +69,7 @@ NaN and ignore later NaNs. Empty typed arrays panic in every mode. Readonly
 `@TypeOf` validates without effects; globals allow known data but reject reached
 custom comparator calls. See `examples/extrema.nov` and `zig build test-cli-extrema`.
 
-`@default(T)`, argument-free `@[default]`, and `std.trivial.take` are delivered.
+`@default(T)`, argument-free `@[default]`, and `std.mem.take` are delivered.
 Builtin defaults are `false`, numeric zero, NUL rune, empty string, exact empty
 arrays (no element-default requirement), and empty exclusive integer ranges
 `0..0`. Struct fallback uses only existing declared field defaults: every field
@@ -93,7 +93,7 @@ Globals may use compile-time-known builtin/declared struct data defaults, but an
 reached custom factory call requires runtime initialization in `main` or a
 function called from it, including Option's factory.
 
-`std.trivial.take(&value)` wraps ``replace(dst, @default(`T))``. It evaluates the
+`std.mem.take(&value)` wraps ``replace(dst, @default(`T))``. It evaluates the
 destination once and the default source before `replace` reads the old value or
 stores the replacement. It returns the old value under ordinary recursive
 value-copy rules, not move semantics: arrays/records retain independent backing,

@@ -1,0 +1,81 @@
+let std = @import("std")
+
+let main: () = {
+    @println("Identity:", std.fn.identity(2))
+    @println("Constant:", std.fn.constant(2)())
+    let sub: (x: int, y: int) -> int = x - y
+    let reversed = std.fn.flip(sub)
+    @println("Flipped:", reversed(3, 10))
+    std.fn.noop()
+}
+
+let Row = struct {
+    values: []int,
+}
+
+@[test]
+let identity_values_and_copies: () = {
+    @assert(std.fn.identity(7) == 7)
+    @assert(std.fn.identity('é') == 'é')
+    @assert(std.fn.identity("hello") == "hello")
+    @assert(std.fn.identity(@as(f64, 1.5)) == 1.5)
+    let mut source = Row.[ values = [1, 2] ]
+    let mut result = std.fn.identity(source)
+    source.values[0] = 9
+    result.values[1] = 8
+    @assert(source.values == [9, 2] and result.values == [1, 8])
+    @assert(std.array.map([1, 2], std.fn.identity) == [1, 2])
+}
+
+@[test]
+let constant_snapshots_and_shared_closures: () = {
+    let mut source = [[1], [2]]
+    let get = std.fn.constant(source)
+    source[0] = [9]
+    let mut first = get()
+    first[1] = [8]
+    @assert(source == [[9], [2]] and first == [[1], [8]])
+    @assert(get() == [[1], [2]] and get() == [[1], [2]])
+    let mut calls = 0
+    let increment = () -> int {
+        calls += 1
+        calls
+    }
+    let callback = std.fn.constant(increment)
+    @assert(calls == 0)
+    @assert(callback()() == 1 and callback()() == 2)
+    @assert(calls == 2)
+}
+
+@[test]
+let flip_types_argument_order_and_shared_state: () = {
+    let mut calls = 0
+    let format = (label: str, value: uint) -> str {
+        calls += 1
+        "{label}:{value}"
+    }
+    let reversed = std.fn.flip(format)
+    @assert(calls == 0)
+    @assert(reversed(7, "count") == "count:7" and calls == 1)
+    let restored = std.fn.flip(reversed)
+    @assert(restored("total", 9) == "total:9" and calls == 2)
+    let sub: (x: int, y: int) -> int = x - y
+    @assert(std.fn.flip(sub)(3, 10) == 7)
+}
+
+@[test]
+let noop_and_unevaluated_queries: () = {
+    std.fn.noop()
+    std.fn.identity(std.fn.noop)()
+    let mut calls = 0
+    let make = () -> int {
+        calls += 1
+        calls
+    }
+    let query: @TypeOf(std.fn.identity(make())) = 0
+    let constant: @TypeOf(std.fn.constant(make())) = () -> int {
+        7
+    }
+    @assert(query == 0 and constant() == 7 and calls == 0)
+    @assert(std.fn.identity(make()) == 1 and calls == 1)
+}

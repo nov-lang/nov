@@ -14,7 +14,10 @@ let array = @import("array.nov")
 let string = @import("string.nov")
 
 @[public]
-let trivial = @import("trivial.nov")
+let mem = @import("mem.nov")
+
+@[public]
+let fn = @import("fn.nov")
 
 @[public]
 let range = @import("range.nov")

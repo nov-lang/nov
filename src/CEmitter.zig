@@ -11092,12 +11092,12 @@ test "default take actual stdlib source free fresh backing precise roots forced 
         \\let declared:()->[][]int=@default(Config).rows
         \\let make:()->[][]int=[[1],[2]]
         \\let takeRows:(input:[][]int)->[][]int={let mut current=input
-        \\let old=std.trivial.take(&current)
+        \\let old=std.mem.take(&current)
         \\@assert(@len(current)==0)
         \\old}
         \\let takeOption:(input:[][]int)->[][][]int={let mut current:std.Option([][]int)=.some[input]
         \\let snapshot=current
-        \\let old=std.trivial.take(&current)
+        \\let old=std.mem.take(&current)
         \\@assert(current.isNone())
         \\let saved=match old {.some[rows]=>rows
         \\.none=>@as([][]int,[])}
@@ -11110,9 +11110,9 @@ test "default take actual stdlib source free fresh backing precise roots forced 
         \\@assert(@len(@default([]()->int))==0)
         \\@assert(@default(std.Option([][]int)).isNone())
         \\let mut rows=@default([][]int)
-        \\@assert(@len(std.trivial.take(&rows))==0 and @len(rows)==0)
+        \\@assert(@len(std.mem.take(&rows))==0 and @len(rows)==0)
         \\let mut option:std.Option([][]int)=.none[]
-        \\@assert(std.trivial.take(&option).isNone() and option.isNone())}
+        \\@assert(std.mem.take(&option).isNone() and option.isNone())}
     );
     defer test_gpa.free(library);
     try runApprovedHelperHarness(library,
@@ -11157,14 +11157,14 @@ test "default take actual stdlib custom allocating factory once stdout panic O0 
         \\}
         \\let custom:()->[][]int=@default(Custom).rows
         \\let takeCustom:(input:[][]int)->[][]int={let mut current:Custom=.[rows=input]
-        \\let old=std.trivial.take(&current)
+        \\let old=std.mem.take(&current)
         \\@assert(@len(old.rows)==@len(input))
         \\current.rows}
         \\let main:()={let query:@TypeOf(@default(Custom))=.[rows=[[99]]]
         \\@assert(query.rows==[[99]])
         \\let first=@default(Custom)
         \\let mut current:Custom=.[rows=[[7],[8]]]
-        \\let old=std.trivial.take(&current)
+        \\let old=std.mem.take(&current)
         \\@assert(first.rows==[[4],[5]] and current.rows==[[4],[5]] and old.rows==[[7],[8]])
         \\current.rows[0]=[9]
         \\@assert(first.rows[0][0]==4 and old.rows[0][0]==7)
@@ -11199,7 +11199,7 @@ test "default take actual stdlib factory panic stops take and caller O0 O3" {
         \\}
         \\let main:()={let mut current:Broken=.[rows=[[7],[8]]]
         \\@println("before",current.rows)
-        \\let old=std.trivial.take(&current)
+        \\let old=std.mem.take(&current)
         \\@println("unreachable",old.rows,current.rows)}
     );
     defer test_gpa.free(library);
@@ -11209,16 +11209,16 @@ test "default take actual stdlib factory panic stops take and caller O0 O3" {
         try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "before [[7], [8]]\nfactory [[4], [5]]\n", "panic: default stopped\n", mode);
 }
 
-test "trivial replace actual stdlib source free independent backing forced GC O0 O3 and runtime OOM" {
+test "mem replace actual stdlib source free independent backing forced GC O0 O3 and runtime OOM" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let std=@import("std")
         \\let make:()->[][]int=[[1],[2]]
         \\let scalar:()->uint={let mut value:uint=7
-        \\let old=std.trivial.replace(&value,9)
+        \\let old=std.mem.replace(&value,9)
         \\@assert(old==7 and value==9)
         \\old}
         \\let replaceRows:(current:[][]int,replacement:[][]int)->[][][]int={let mut value=current
-        \\let old=std.trivial.replace(&value,replacement)
+        \\let old=std.mem.replace(&value,replacement)
         \\[old,value]}
     );
     defer test_gpa.free(library);

@@ -153,9 +153,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const extrema_tests = b.step("test-cli-extrema", "Run minimum and maximum builtin CLI tests");
     addExtremaCliTests(b, exe, extrema_tests);
     test_step.dependOn(extrema_tests);
-    const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
-    addTrivialCliTests(b, exe, trivial_tests);
-    test_step.dependOn(trivial_tests);
+    const mem_fn_tests = b.step("test-cli-mem-fn", "Run standard-library mem/fn migration CLI tests");
+    addMemFnCliTests(b, exe, mem_fn_tests);
+    test_step.dependOn(mem_fn_tests);
     const mixed_operator_tests = b.step("test-cli-mixed-operators", "Run exact mixed-signature operator overload CLI tests");
     addMixedOperatorCliTests(b, exe, mixed_operator_tests);
     test_step.dependOn(mixed_operator_tests);
@@ -1407,7 +1407,7 @@ fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         \\let main:()={let value:@TypeOf(@default(Alias))=@default(Alias)
         \\@assert(zero==0 and value.n==7 and initial.items==[1,2] and @len(box.items)==0)
         \\let mut custom=models.Created.[n=99]
-        \\let old=std.trivial.take(&custom)
+        \\let old=std.mem.take(&custom)
         \\@assert(old.n==99 and custom.n==4 and models.callCount()==1)
         \\@println("imported defaults")}
         \\
@@ -1445,8 +1445,8 @@ fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         "let S=struct{\n@[default]\nlet make:(value:S)->S=value\n}\nlet main:()={}",
         "let S=struct{\n@[default]\nlet first:()->S=S.[]\n@[default]\nlet second:()->S=S.[]\n}\nlet main:()={}",
         "let models=@import(\"models.nov\")\nlet value=@default(models.Created)\nlet main:()={}",
-        "let std=@import(\"std\")\nlet Required=struct{n:uint,}\nlet main:()={let mut value=Required.[n=7]\nlet old=std.trivial.take(&value)\n}",
-        "let std=@import(\"std\")\nlet noop:()={}\nlet mut callback:()->void=noop\nlet S=struct{n:int=0,\n@[public]\n@[default]\nlet make:()->S={callback()\nS.[n=99]}\n}\nlet main:()={let mut items=[S.[n=7]]\ncallback=(){items=[]}\nlet old=std.trivial.take(&items[0])\n}",
+        "let std=@import(\"std\")\nlet Required=struct{n:uint,}\nlet main:()={let mut value=Required.[n=7]\nlet old=std.mem.take(&value)\n}",
+        "let std=@import(\"std\")\nlet noop:()={}\nlet mut callback:()->void=noop\nlet S=struct{n:int=0,\n@[public]\n@[default]\nlet make:()->S={callback()\nS.[n=99]}\n}\nlet main:()={let mut items=[S.[n=7]]\ncallback=(){items=[]}\nlet old=std.mem.take(&items[0])\n}",
     }, 0..) |source, i| {
         const path = b.fmt("bad-default-{d}.nov", .{i});
         _ = fixtures.add(path, source);
@@ -1615,19 +1615,47 @@ fn addExtremaCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
     }
 }
 
-fn addTrivialCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "trivial.nov", @embedFile("examples/trivial.nov"), "Swapped: 2 1\nIdentity: 2\nConstant: 2\nFlipped: 7\nReplaced: 2 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS replace_scalars_preserves_exact_types\nPASS replace_nested_arrays_preserves_independent_storage\nPASS replace_records_and_union_payloads\nPASS replace_functions_share_cells_and_ranges_copy_bounds\nPASS replace_destinations_and_argument_order\nPASS replace_queries_do_not_mutate_or_evaluate_arguments\nPASS noop_and_unevaluated_queries\n12 passed; 0 failed; 12 total\n");
+fn addMemFnCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const removed = b.addWriteFiles();
+    const removed_library = removed.addCopyDirectory(b.path("lib"), "lib", .{});
+    const fmt = b.addRunArtifact(exe);
+    fmt.setCwd(removed.getDirectory());
+    fmt.addArgs(&.{ "fmt", "--check", "lib/std.nov", "lib/mem.nov", "lib/fn.nov" });
+    fmt.expectExitCode(0);
+    fmt.expectStdOutEqual("");
+    fmt.expectStdErrEqual("");
+    test_step.dependOn(&fmt.step);
+    for ([_][]const u8{
+        "let std=@import(\"std\")\nlet main:()=std.trivial.noop()\n",
+        "let old=@import(\"lib/trivial.nov\")\nlet main:()=old.noop()\n",
+    }, 0..) |source, i| {
+        const path = b.fmt("removed-helper-module-{d}.nov", .{i});
+        _ = removed.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(removed.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(removed_library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+    addArrayValueHelperCliTests(b, exe, test_step, "mem.nov", @embedFile("examples/mem.nov"), "Swapped: 2 1\nReplaced: 2 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS replace_scalars_preserves_exact_types\nPASS replace_nested_arrays_preserves_independent_storage\nPASS replace_records_and_union_payloads\nPASS replace_functions_share_cells_and_ranges_copy_bounds\nPASS replace_destinations_and_argument_order\nPASS replace_queries_do_not_mutate_or_evaluate_arguments\n8 passed; 0 failed; 8 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "fn.nov", @embedFile("examples/fn.nov"), "Identity: 2\nConstant: 2\nFlipped: 7\n", "PASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\n4 passed; 0 failed; 4 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     for ([_][]const u8{
-        "let n:uint=1\nlet old=std.trivial.replace(&n,2)",
-        "let mut n:u8=1\nlet replacement:u16=2\nlet old=std.trivial.replace(&n,replacement)",
-        "let mut n:uint=1\nlet old=std.trivial.replace(n,2)",
-        "let mut n:uint=1\nlet old=std.trivial.replace(&n)",
-        "let n:uint=1\nlet query:@TypeOf(std.trivial.replace(&n,2))=0",
-        "let mut items=[1]\nlet change=()->[]int{items=[9]\n[2]}\nlet old=std.trivial.replace(&items,change())",
+        "let n:uint=1\nlet old=std.mem.replace(&n,2)",
+        "let mut n:u8=1\nlet replacement:u16=2\nlet old=std.mem.replace(&n,replacement)",
+        "let mut n:uint=1\nlet old=std.mem.replace(n,2)",
+        "let mut n:uint=1\nlet old=std.mem.replace(&n)",
+        "let n:uint=1\nlet query:@TypeOf(std.mem.replace(&n,2))=0",
+        "let mut items=[1]\nlet change=()->[]int{items=[9]\n[2]}\nlet old=std.mem.replace(&items,change())",
     }, 0..) |body, i| {
-        const path = b.fmt("bad-trivial-replace-{d}.nov", .{i});
+        const path = b.fmt("bad-mem-replace-{d}.nov", .{i});
         _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet main:()={{\n{s}\n}}\n", .{body}));
         for ([_]bool{ false, true }) |emit| {
             const reject = b.addRunArtifact(exe);

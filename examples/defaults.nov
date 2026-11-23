@@ -12,7 +12,7 @@ let main: () = {
     @println("Number:", @default(int))
     @println("Config:", @default(Config))
     let mut items = [1, 2]
-    @println("Taken:", std.trivial.take(&items))
+    @println("Taken:", std.mem.take(&items))
     @println("Remaining:", items)
     @println("Option:", @default(std.Option(u8)))
 }
@@ -82,24 +82,24 @@ let custom_constructors_override_and_select_variants: () = {
 @[test]
 let take_returns_old_values_and_installs_defaults: () = {
     let mut number: uint = 7
-    @assert(std.trivial.take(&number) == 7 and number == 0)
+    @assert(std.mem.take(&number) == 7 and number == 0)
     let mut flag = true
-    @assert(std.trivial.take(&flag) and flag == false)
+    @assert(std.mem.take(&flag) and flag == false)
     let mut text = "hello"
-    @assert(std.trivial.take(&text) == "hello" and text == "")
+    @assert(std.mem.take(&text) == "hello" and text == "")
     let mut record = @default(Config)
     record.count = 8
-    let original = std.trivial.take(&record)
+    let original = std.mem.take(&record)
     @assert(original.count == 8 and record == Config.[])
     let mut custom = Override.[ value = 2 ]
-    @assert(std.trivial.take(&custom).value == 2 and custom.value == 9)
+    @assert(std.mem.take(&custom).value == 2 and custom.value == 9)
 }
 
 @[test]
 let take_managed_payloads_preserves_independence: () = {
     let mut items = [[1], [2]]
     let snapshot = items
-    let mut previous = std.trivial.take(&items)
+    let mut previous = std.mem.take(&items)
     @assert(@len(items) == 0 and previous == [[1], [2]])
     previous[0] = [9]
     @assert(snapshot == [[1], [2]])
@@ -109,7 +109,7 @@ let take_managed_payloads_preserves_independence: () = {
             calls += 1
             calls
         }]
-    let saved = std.trivial.take(&option)
+    let saved = std.mem.take(&option)
     @assert(option.isNone() and calls == 0)
     let value = match saved {
         .some[callable] => callable()
@@ -138,7 +138,7 @@ let runtime_factories_and_unevaluated_type_queries: () = {
     let second = @default(Instrumented)
     @assert(first.value == 1 and second.value == 2 and constructions == 2)
     let mut current = Instrumented.[ value = 99 ]
-    let taken = std.trivial.take(&current)
+    let taken = std.mem.take(&current)
     @assert(taken.value == 99 and current.value == 3 and constructions == 3)
 }
 
@@ -152,6 +152,6 @@ let generic_default_inference_and_reference_places: () = {
     let defaults = std.array.map([Config.[ count = 8 ], Config.[ count = 9 ]], defaultLike)
     @assert(defaults == [Config.[], Config.[]])
     let mut values: []uint = [1, 2]
-    @assert(std.trivial.take(&values[-1]) == 2)
+    @assert(std.mem.take(&values[-1]) == 2)
     @assert(values == @as([]uint, [1, 0]))
 }

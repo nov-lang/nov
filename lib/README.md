@@ -11,19 +11,22 @@ let array = std.array
 let range = std.range
 let string = std.string
 let Operator = std.builtin.Operator
-let trivial = std.trivial
+let mem = std.mem
+let fn = std.fn
 ```
 
 `std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`,
 `Option` from `option.nov`, the `array` namespace from `array.nov`, the
 `range` namespace from `range.nov`, the `string` namespace from `string.nov`,
+the `mem` namespace from `mem.nov`, the `fn` namespace from `fn.nov`,
 and the `builtin` namespace from
 `builtin.nov` (including its public `Operator` enum). These are
 ordinary library declarations, not compiler builtins or automatically injected
 bare names. String values use the `str` type; the module remains `std.string`.
 
-`std.trivial` provides `swap(&mut T, &mut T)`, `replace(&mut T, T) -> T`,
-`take(&mut T) -> T`, `identity(T) -> T`, `constant(T) -> () -> T`, `noop()`, and
+`std.mem` provides `swap(&mut T, &mut T)`, `replace(&mut T, T) -> T`, and
+`take(&mut T) -> T`. `std.fn` provides `identity(T) -> T`,
+`constant(T) -> () -> T`, `noop()`, and
 `flip((A, B) -> C) -> (B, A) -> C`.
 Types are inferred at each call. Ordinary value-copy rules apply; `constant`
 captures its argument by value, while copied closures share their captured cells.
@@ -32,7 +35,10 @@ The destination must be mutable and the replacement must match its type exactly.
 Normal recursive value-copy rules apply to both the returned and stored values;
 function copies retain shared captured cells. Arguments evaluate once, destination
 before replacement; an unevaluated `@TypeOf` query neither borrows nor mutates.
-See [`examples/trivial.nov`](../examples/trivial.nov) for usage and twelve tests.
+See [`examples/mem.nov`](../examples/mem.nov) (eight tests) and
+[`examples/fn.nov`](../examples/fn.nov) (four tests) for usage.
+`fn` is an ordinary identifier, not a reserved keyword.
+Run `zig build test-cli-mem-fn` for the migration CLI coverage.
 
 `take(&value)` returns the old value and installs its inferred type's default.
 Its source is the ordinary wrapper ``replace(dst, @default(`T))``: the destination

@@ -3202,7 +3202,7 @@ data. Any custom factory call reached during initializer evaluation rejects,
 including `std.Option`'s factory; perform such initialization in `main` or a
 function called from it. Unevaluated queries do not call factories.
 
-`std.trivial.take(&value)` returns the old value and replaces it with
+`std.mem.take(&value)` returns the old value and replaces it with
 `@default` of its inferred type. It is an ordinary library wrapper around
 ``replace(dst, @default(`T))``: the destination evaluates once, then the default
 source evaluates before `replace` reads the old value or stores the replacement.

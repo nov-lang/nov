@@ -841,6 +841,10 @@ test "rune literal token spans include multiple scalars and malformed UTF8" {
     }
 }
 
+test "fn is an ordinary identifier" {
+    try testTokenize("let fn = std.fn", &.{ .keyword_let, .identifier, .equal, .identifier, .period, .identifier });
+}
+
 test "all keywords" {
     const source = try std.mem.joinZ(std.testing.allocator, " ", Token.keywords.keys());
     defer std.testing.allocator.free(source);

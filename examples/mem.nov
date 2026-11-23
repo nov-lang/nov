@@ -1,0 +1,157 @@
+let std = @import("std")
+
+let main: () = {
+    let mut a = 1
+    let mut b = 2
+    std.mem.swap(&a, &b)
+    @println("Swapped:", a, b)
+    let old = std.mem.replace(&a, 7)
+    @println("Replaced:", old, a)
+}
+
+@[test]
+let swap_scalars: () = {
+    let mut a: uint = 1
+    let mut b: uint = 2
+    std.mem.swap(&a, &b)
+    @assert(a == 2 and b == 1)
+    std.mem.swap(&a, &b)
+    @assert(a == 1 and b == 2)
+    let mut left = "é"
+    let mut right = "😀"
+    std.mem.swap(&left, &right)
+    @assert(left == "😀" and right == "é")
+    let mut yes = true
+    let mut no = false
+    std.mem.swap(&yes, &no)
+    @assert(yes == false and no)
+}
+
+let Row = struct {
+    values: []int,
+}
+
+@[test]
+let swap_aggregates_preserves_independence: () = {
+    let mut a = [[1], [2]]
+    let mut b: [][]int = []
+    let saved = a
+    std.mem.swap(&a, &b)
+    @assert(a == [] and b == saved)
+    b[0] = [9]
+    @assert(saved == [[1], [2]])
+    let mut left = Row.[ values = [1] ]
+    let mut right = Row.[ values = [2, 3] ]
+    let original = left
+    std.mem.swap(&left, &right)
+    left.values[0] = 8
+    right.values[0] = 9
+    @assert(left.values == [8, 3] and right.values == [9])
+    @assert(original.values == [1])
+    let mut some: std.Option([]int) = .some[[4]]
+    let mut none: std.Option([]int) = .none[]
+    std.mem.swap(&some, &none)
+    @assert(some.isNone() and none == std.Option([]int).some[[4]])
+}
+
+@[test]
+let replace_scalars_preserves_exact_types: () = {
+    let mut number: u8 = 7
+    let previous = std.mem.replace(&number, 9)
+    @assert(previous == @as(u8, 7) and number == 9)
+    let mut flag = true
+    @assert(std.mem.replace(&flag, false) and flag == false)
+    let mut letter: rune = 'é'
+    @assert(std.mem.replace(&letter, '😀') == 'é' and letter == '😀')
+    let mut text = "old"
+    @assert(std.mem.replace(&text, "new") == "old" and text == "new")
+    let mut fraction: f32 = 1.5
+    @assert(std.mem.replace(&fraction, 2.5) == @as(f32, 1.5) and fraction == 2.5)
+}
+
+@[test]
+let replace_nested_arrays_preserves_independent_storage: () = {
+    let original = [[1], [2]]
+    let replacement = [[3], [4]]
+    let mut value = original
+    let mut previous = std.mem.replace(&value, replacement)
+    previous[0] = [8]
+    value[1] = [9]
+    @assert(previous == [[8], [2]] and value == [[3], [9]])
+    @assert(original == [[1], [2]] and replacement == [[3], [4]])
+}
+
+@[test]
+let replace_records_and_union_payloads: () = {
+    let original = Row.[ values = [1, 2] ]
+    let replacement = Row.[ values = [3, 4] ]
+    let mut value = original
+    let mut previous = std.mem.replace(&value, replacement)
+    previous.values[0] = 8
+    value.values[1] = 9
+    @assert(previous.values == [8, 2] and value.values == [3, 9])
+    @assert(original.values == [1, 2] and replacement.values == [3, 4])
+    let mut option: std.Option([]int) = .some[[5]]
+    let saved = std.mem.replace(&option, .none[])
+    @assert(saved == std.Option([]int).some[[5]] and option.isNone())
+    let empty = std.mem.replace(&option, .some[[6]])
+    @assert(empty.isNone() and option == std.Option([]int).some[[6]])
+}
+
+@[test]
+let replace_functions_share_cells_and_ranges_copy_bounds: () = {
+    let mut calls = 0
+    let increment = () -> int {
+        calls += 1
+        calls
+    }
+    let mut callback = increment
+    let previous = std.mem.replace(
+        &callback,
+        () -> int {
+            calls += 10
+            calls
+        }
+    )
+    @assert(calls == 0)
+    @assert(previous() == 1 and callback() == 11 and increment() == 12)
+    let mut bounds: ..i8 = -2..2
+    let original = std.mem.replace(&bounds, 1..=3)
+    @assert("{original}" == "-2..2" and "{bounds}" == "1..=3")
+}
+
+let replaceThrough: (destination: &mut `T, replacement: `T) -> `T = std.mem.replace(destination, replacement)
+
+@[test]
+let replace_destinations_and_argument_order: () = {
+    let mut order: []int = []
+    let index = () -> int {
+        order += [1]
+        return -1
+    }
+    let replacement = () -> uint {
+        order += [2]
+        9
+    }
+    let mut values: []uint = [1, 2]
+    let previous = std.mem.replace(&values[index()], replacement())
+    @assert(previous == 2 and values == @as([]uint, [1, 9]))
+    @assert(order == [1, 2])
+    let mut number: uint = 3
+    let reference = &number
+    @assert(replaceThrough(reference, 4) == 3 and number == 4)
+}
+
+@[test]
+let replace_queries_do_not_mutate_or_evaluate_arguments: () = {
+    let mut calls = 0
+    let replacement = () -> uint {
+        calls += 1
+        9
+    }
+    let mut number: uint = 1
+    let query: @TypeOf(std.mem.replace(&number, replacement())) = 0
+    @assert(query == 0 and number == 1 and calls == 0)
+    @assert(std.mem.replace(&number, replacement()) == 1)
+    @assert(number == 9 and calls == 1)
+}
