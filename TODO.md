@@ -60,6 +60,18 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`std.array.min(items: []T) -> Option(T)` and `std.array.max` are delivered as
+ordinary Nov wrappers: empty input returns `.none[]`, otherwise
+`.some[@min(items)]` / `.some[@max(items)]`. No new builtins or ordering rules:
+even empty input requires ordered `T` (builtin integers/floats or accessible exact
+nominal less-than hooks; no mixed-only/private imported hooks). Exact types,
+first ties/NaNs/signed zero, eager input snapshots, independent recursive backing,
+shared callback cells and effect-free `@TypeOf` queries follow existing extrema
+and value-copy semantics. See `examples/array-extrema.nov` (six tests),
+`zig build test-cli-array-extrema` (semantic/emit-C rejection fixtures and relocated
+installs included), and the actual-stdlib source-free forced-GC O0/O3 backend test.
+No optimization work is resumed.
+
 `@min` / `@max` accept one `[]T` or at least two exact `T` values, returning `T`.
 Ordering uses builtin integers/floats or an accessible exact `(T,T)->bool`
 `@[operator(.less_than)]` nominal hook, not mixed-only hooks. Eager left-to-right

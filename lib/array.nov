@@ -110,6 +110,20 @@ let findLast: (items: []`T, predicate: (`T) -> bool) -> Option(`T) = {
 }
 
 @[public]
+let min: (items: []`T) -> Option(`T) = if @len(items) == 0 {
+    .none[]
+} else {
+    .some[@min(items)]
+}
+
+@[public]
+let max: (items: []`T) -> Option(`T) = if @len(items) == 0 {
+    .none[]
+} else {
+    .some[@max(items)]
+}
+
+@[public]
 let take: (items: []`T, count: uint) -> []`T = {
     let mut result: []`T = []
     loop item, index in items, 0.. {

@@ -249,6 +249,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_flat_map_tests = b.step("test-cli-array-flat-map", "Run standard-library array flatMap CLI tests");
     addArrayValueHelperCliTests(b, exe, array_flat_map_tests, "array-flat-map.nov", @embedFile("examples/array-flat-map.nov"), "Expanded: [1, 1, 2, 2, 3, 3]\n", "PASS order_empty_results_and_callback_count\nPASS flatten_one_layer_and_recursive_independence\nPASS storable_outputs_and_shared_closures\nPASS snapshots_inference_and_queries\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_flat_map_tests);
+    const array_extrema_tests = b.step("test-cli-array-extrema", "Run standard-library optional array extrema CLI tests");
+    addArrayExtremaCliTests(b, exe, array_extrema_tests);
+    test_step.dependOn(array_extrema_tests);
     const array_reverse_tests = b.step("test-cli-array-reverse", "Run standard-library array reverse CLI tests");
     addArrayValueHelperCliTests(b, exe, array_reverse_tests, "array-reverse.nov", @embedFile("examples/array-reverse.nov"), "Reversed: [3, 2, 1]\nOriginal: [1, 2, 3]\n", "PASS order_empty_and_singleton\nPASS recursive_storage_independence\nPASS storable_types_and_shared_closure_cells\nPASS inferred_callback_and_unevaluated_query\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_reverse_tests);
@@ -1460,6 +1463,68 @@ fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
             reject.expectStdOutEqual("");
             reject.expectStdErrMatch("error:");
             test_step.dependOn(&reject.step);
+        }
+    }
+}
+
+fn addArrayExtremaCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "array-extrema.nov", @embedFile("examples/array-extrema.nov"), "Minimum: 3\nMaximum: 8\nEmpty: true\n", "PASS empty_singleton_and_exact_numeric_types\nPASS stable_ties_and_recursive_storage_independence\nPASS enum_union_generic_hooks_and_callbacks\nPASS float_nan_and_signed_zero_preserve_first\nPASS eager_arguments_comparison_order_and_shared_cells\nPASS snapshots_and_typeof_queries_are_pure\n6 passed; 0 failed; 6 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("models.nov",
+        \\@[public]
+        \\let Private=struct{n:int,
+        \\@[operator(.less_than)]
+        \\let less:(a:Private,b:Private)->bool=a.n<b.n
+        \\}
+        \\@[public]
+        \\let Mixed=struct{n:int,
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let less:(a:Mixed,b:int)->bool=a.n<b
+        \\}
+        \\@[public]
+        \\let Unordered=struct{n:int,}
+        \\@[public]
+        \\let Plain=enum{a,b,}
+        \\@[public]
+        \\let Payload=union{some:int,none,}
+        \\
+    );
+    for ([_][]const u8{ "min", "max" }) |name| {
+        for ([_][]const u8{
+            "@as([]bool,[])",
+            "@as([]str,[])",
+            "@as([]rune,[])",
+            "@as([][]int,[])",
+            "@as([]models.Unordered,[])",
+            "@as([]models.Plain,[])",
+            "@as([]models.Payload,[])",
+            "@as([]models.Mixed,[])",
+            "@as([]models.Private,[])",
+            "[models.Private.[n=1]]",
+            "[models.Mixed.[n=1],models.Mixed.[n=2]]",
+            "[@as(i8,1),@as(i16,2)]",
+            "[@as(i8,1),@as(u8,2)]",
+            "[@as(f32,1.0),@as(f64,2.0)]",
+            "[@as(int,1),@as(f64,2.0)]",
+            "[]",
+            "1",
+        }, 0..) |argument, index| {
+            const path = b.fmt("bad-array-{s}-{d}.nov", .{ name, index });
+            _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet models=@import(\"models.nov\")\nlet main:()={{let result=std.array.{s}({s})\n}}\n", .{ name, argument }));
+            for ([_]bool{ false, true }) |emit_c| {
+                const reject = b.addRunArtifact(exe);
+                reject.step.name = b.fmt("CLI array extrema: reject {s} ({s})", .{ path, if (emit_c) "emit-c" else "check" });
+                reject.setCwd(fixtures.getDirectory());
+                reject.addArgs(if (emit_c) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+                reject.addArg("--lib-dir");
+                reject.addDirectoryArg(library);
+                reject.expectExitCode(1);
+                reject.expectStdOutEqual("");
+                reject.expectStdErrMatch("error:");
+                test_step.dependOn(&reject.step);
+            }
         }
     }
 }

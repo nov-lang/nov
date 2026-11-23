@@ -11259,6 +11259,78 @@ test "mem replace actual stdlib source free independent backing forced GC O0 O3 
     , true);
 }
 
+test "array extrema actual stdlib source free snapshots independent nested storage forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let present:(value:std.Option(`T))->`T=match value{
+        \\.some[item]=>item
+        \\.none=>@panic("expected some")
+        \\}
+        \\let Row=struct{key:int,items:[][]int,run:()->bool,
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let less:(a:Row,b:Row)->bool=a.run() and a.key<b.key
+        \\}
+        \\let yes:()->bool=true
+        \\let make:()->[][]int=[[1],[2]]
+        \\let choose:(items:[][]int,maximum:bool)->[][]int={
+        \\let low=Row.[key=1,items,run=yes]
+        \\let high=Row.[key=2,items,run=yes]
+        \\let selected=present(if maximum {std.array.max([low,high])} else {std.array.min([high,low])})
+        \\selected.items}
+        \\let main:()={let mut source:[]Row=[]
+        \\let mut calls:uint=0
+        \\let run=()->bool{calls+=1
+        \\@clear(source)
+        \\let garbage:[][]int=[[1],[2]]
+        \\@assert(garbage[1][0]==2)
+        \\true}
+        \\let a=Row.[key=3,items=[[3]],run]
+        \\let b=Row.[key=1,items=[[1]],run]
+        \\let c=Row.[key=2,items=[[2]],run]
+        \\source=[a,b,c]
+        \\let low=std.array.min(source)
+        \\@assert(present(low).items==[[1]] and @len(source)==0 and calls==2)
+        \\source=[b,a,c]
+        \\let high=std.array.max(source)
+        \\@assert(present(high).items==[[3]] and @len(source)==0 and calls==4)
+        \\let mut changed=present(low)
+        \\changed.items=[[9]]
+        \\@assert(present(low).items==[[1]] and b.items==[[1]])
+        \\@assert(present(std.array.max([a,a])).key==3 and calls==5)
+        \\@assert(present(std.array.min([b])).key==1 and calls==5)
+        \\@assert(std.array.min(@as([]Row,[])).isNone())
+        \\@assert(std.array.max(@as([]Row,[])).isNone() and calls==5)
+        \\let query:@TypeOf(std.array.min({calls+=1
+        \\source}))=.none[]
+        \\@assert(query.isNone() and calls==5)}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_main();
+        \\    nov_array input = {0}, result = {0};
+        \\    void **roots[] = {&input.data, &result.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    for (int maximum = 0; maximum < 2; ++maximum) {
+        \\    input = nov_make(); result = nov_choose(input, maximum != 0);
+        \\    nov_array *a = input.data, *b = result.data;
+        \\    if (result.len != 2 || a == b || a[0].data == b[0].data || a[1].data == b[1].data) return 1;
+        \\    ((intptr_t *)a[0].data)[0] = 9;
+        \\    if (((intptr_t *)b[0].data)[0] != 1 || ((intptr_t *)b[1].data)[0] != 2) return 2;
+        \\    input = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    b = result.data;
+        \\    if (((intptr_t *)b[0].data)[0] != 1) return 3;
+        \\    result = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    }
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 4;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
 test "extremum source free managed snapshots copies callbacks and forced GC O0 O3" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let S=struct{key:int,name:str,items:[]int,run:()->bool,

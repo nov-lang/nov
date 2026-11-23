@@ -433,6 +433,23 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   environments. It uses ordinary Nov indexing/append, with the existing copy costs
   and no in-place capacity reuse. See `examples/array-reverse.nov` and
   `zig build test-cli-array-reverse`.
+- `array.min(items: []T) -> Option(T)` and `array.max(items: []T) -> Option(T)`
+  return `.none[]` for empty input, otherwise `.some[@min(items)]` or
+  `.some[@max(items)]`. These are ordinary Nov functions, not new builtins.
+  `T` must support builtin integer/float ordering or an accessible exact
+  `(T, T) -> bool` `@[operator(.less_than)]` hook, even for empty/singleton
+  calls. Mixed-only and private imported hooks do not qualify.
+  Exact numeric widths/signedness and nominal types are preserved, without widening.
+  Comparisons form a stable left fold: first ties and signed zero survive, a leading
+  NaN survives, and later NaNs are ignored. Minimum compares `(candidate, best)`;
+  maximum compares `(best, candidate)`, once per later element. Empty/singleton
+  inputs invoke no hook. Arguments evaluate eagerly once; the by-value input
+  snapshot precedes comparisons, so hooks may mutate a captured source owner safely.
+  Returned payloads have recursively independent array backing; copied callbacks
+  retain shared capture cells. Hook failures propagate normally; `@TypeOf` does not
+  evaluate arguments or invoke hooks. See `examples/array-extrema.nov` and
+  `zig build test-cli-array-extrema` for executable coverage, including inferred
+  callbacks, concrete function aliases and negative semantic/emit-C fixtures.
 - `array.filter(items: []T, predicate: (T) -> bool) -> []T` keeps matching elements
   in stable source order.
 - `array.fold(items: []T, initial: U, combine: (U, T) -> U) -> U` is a left fold
@@ -494,7 +511,9 @@ left-to-right order, including callback construction and the seed.
 `find` and `findLast` support the existing `Option` payload types: bool, integers, floats,
 runes, strings, enums, arrays (including nested arrays), and supported acyclic
 records, including array fields, as well as nested unions, functions/closures
-and ranges. All helpers accept every currently supported array element type. The returned `Option` is the same canonical type as `std.Option`.
+and ranges. Except for `min`/`max`, which require ordered elements as described
+above, these helpers accept every currently supported array element type. The
+returned `Option` is the same canonical type as `std.Option`.
 
 ```nov
 let found = array.find([1, 2, 3], (x) { x > 1 })
