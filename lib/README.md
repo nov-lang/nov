@@ -26,17 +26,20 @@ bare names. String values use the `str` type; the module remains `std.string`.
 
 `std.mem` provides `swap(&mut T, &mut T)`, `replace(&mut T, T) -> T`, and
 `take(&mut T) -> T`. `std.fn` provides `identity(T) -> T`,
-`constant(T) -> () -> T`, `noop()`, and
-`flip((A, B) -> C) -> (B, A) -> C`.
-Types are inferred at each call. Ordinary value-copy rules apply; `constant`
+`const(T) -> () -> T`, `noop()`, `compose((B) -> C, (A) -> B) -> (A) -> C`,
+`flip((A, B) -> C) -> (B, A) -> C`, and `neg((T) -> bool) -> (T) -> bool`.
+Types are inferred at each call. Ordinary value-copy rules apply; `const`
 captures its argument by value, while copied closures share their captured cells.
+`compose(f, g)(x)` calls `g(x)` then `f` on its result, once each.
+`neg(predicate)(x)` calls the predicate once and negates its boolean result.
+Neither helper invokes its callbacks during construction.
 `replace(&value, replacement)` installs the replacement and returns the old value.
 The destination must be mutable and the replacement must match its type exactly.
 Normal recursive value-copy rules apply to both the returned and stored values;
 function copies retain shared captured cells. Arguments evaluate once, destination
 before replacement; an unevaluated `@TypeOf` query neither borrows nor mutates.
 See [`examples/mem.nov`](../examples/mem.nov) (eight tests) and
-[`examples/fn.nov`](../examples/fn.nov) (four tests) for usage.
+[`examples/fn.nov`](../examples/fn.nov) (seven tests) for usage.
 `fn` is an ordinary identifier, not a reserved keyword.
 Run `zig build test-cli-mem-fn` for the migration CLI coverage.
 

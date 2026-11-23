@@ -1693,6 +1693,9 @@ fn addMemFnCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std
     for ([_][]const u8{
         "let std=@import(\"std\")\nlet main:()=std.trivial.noop()\n",
         "let old=@import(\"lib/trivial.nov\")\nlet main:()=old.noop()\n",
+        "let std=@import(\"std\")\nlet main:()={let old=std.fn.constant(1)\n}\n",
+        "let std=@import(\"std\")\nlet f:(text:str)->uint=@len(text)\nlet g:(value:bool)->bool=value\nlet main:()={let bad=std.fn.compose(f,g)\n}\n",
+        "let std=@import(\"std\")\nlet f:(value:int)->int=value\nlet main:()={let bad=std.fn.neg(f)\n}\n",
     }, 0..) |source, i| {
         const path = b.fmt("removed-helper-module-{d}.nov", .{i});
         _ = removed.add(path, source);
@@ -1709,7 +1712,7 @@ fn addMemFnCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std
         }
     }
     addArrayValueHelperCliTests(b, exe, test_step, "mem.nov", @embedFile("examples/mem.nov"), "Swapped: 2 1\nReplaced: 2 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS replace_scalars_preserves_exact_types\nPASS replace_nested_arrays_preserves_independent_storage\nPASS replace_records_and_union_payloads\nPASS replace_functions_share_cells_and_ranges_copy_bounds\nPASS replace_destinations_and_argument_order\nPASS replace_queries_do_not_mutate_or_evaluate_arguments\n8 passed; 0 failed; 8 total\n");
-    addArrayValueHelperCliTests(b, exe, test_step, "fn.nov", @embedFile("examples/fn.nov"), "Identity: 2\nConstant: 2\nFlipped: 7\n", "PASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "fn.nov", @embedFile("examples/fn.nov"), "Identity: 2\nConstant: 2\nFlipped: 7\nComposed: 8\nNegated: true\n", "PASS identity_values_and_copies\nPASS const_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\nPASS compose_distinct_types_order_and_shared_state\nPASS compose_managed_results_and_unevaluated_queries\nPASS neg_inverts_once_and_preserves_shared_captures\n7 passed; 0 failed; 7 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     for ([_][]const u8{

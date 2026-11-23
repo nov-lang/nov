@@ -2,7 +2,7 @@
 let identity: (x: `T) -> `T = x
 
 @[public]
-let constant: (x: `T) -> () -> `T = () {
+let const: (x: `T) -> () -> `T = () {
     x
 }
 
@@ -10,6 +10,16 @@ let constant: (x: `T) -> () -> `T = () {
 let noop: () = {}
 
 @[public]
+let compose: (f: (`B) -> `C, g: (`A) -> `B) -> (`A) -> `C = (a) {
+    f(g(a))
+}
+
+@[public]
 let flip: (f: (`A, `B) -> `C) -> (`B, `A) -> `C = (b, a) {
     f(a, b)
+}
+
+@[public]
+let neg: (f: (`T) -> bool) -> (`T) -> bool = (x) {
+    !f(x)
 }
