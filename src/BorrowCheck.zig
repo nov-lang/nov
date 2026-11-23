@@ -12,6 +12,7 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
 
 fn mayCall(body: Ir.Body, instruction: Ir.Instruction, ir: ?*const Ir) bool {
     if (instruction.op == .call) return true;
+    if (instruction.op == .extremum) return instruction.op.extremum.comparator != null;
     const metadata = ir orelse return false;
     const operand: Ir.ValueId = switch (instruction.op) {
         .binary => |binary| if (!binary.enum_tag and (binary.op == .eq or binary.op == .ne)) binary.lhs else return false,
@@ -152,6 +153,52 @@ pub fn checkWithIr(allocator: std.mem.Allocator, body: Ir.Body, ir: ?*const Ir) 
         }
     }
     return null;
+}
+
+fn testExtremumHookLoans(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    for ([_]bool{ false, true }) |references| {
+        for ([_]bool{ false, true }) |global| {
+            for ([_]bool{ false, true }) |hooked| {
+                for ([_]bool{ false, true }) |array| {
+                    const constant: Ir.Operation = .{ .constant = @fromBackingInt(0) };
+                    var code = [_]Ir.Instruction{
+                        .{ .ty = integer, .span = span, .op = constant },
+                        .{ .ty = integer, .span = span, .op = if (global) .{ .global_slot = @fromBackingInt(0) } else .{ .local_slot = @fromBackingInt(0) }, .boxed = true },
+                        .{ .ty = integer, .span = .{ .start = 2, .end = 3 }, .op = .{ .borrow_reserve = @fromBackingInt(1) } },
+                        .{ .ty = integer, .span = span, .op = .{ .borrow_start = .{ .reservation = @fromBackingInt(2), .index = @fromBackingInt(0) } } },
+                        .{ .ty = integer, .span = span, .op = if (references) .{ .reference_slot = @fromBackingInt(3) } else constant },
+                        .{ .ty = integer, .span = .{ .start = 5, .end = 6 }, .op = .{ .extremum = .{ .maximum = false, .array = array, .args = if (array) &.{@fromBackingInt(0)} else &.{ @fromBackingInt(0), @fromBackingInt(0) }, .comparator = if (hooked) @fromBackingInt(0) else null } } },
+                        .{ .ty = integer, .span = span, .op = if (references) .{ .reference_load = @fromBackingInt(4) } else constant },
+                        .{ .ty = integer, .span = span, .op = .{ .borrow_read = @fromBackingInt(if (references) 6 else 3) } },
+                    };
+                    const body: Ir.Body = .{ .instructions = &code, .result = @fromBackingInt(7) };
+                    try std.testing.expectEqual(hooked, try check(allocator, body) != null);
+                    const conflict = try checkWithIr(allocator, body, &ir);
+                    try std.testing.expectEqual(hooked, conflict != null);
+                    if (conflict) |found| {
+                        try std.testing.expectEqual(code[5].span, found.access);
+                        try std.testing.expectEqual(code[2].span, found.origin);
+                    }
+                    code[1].boxed = false;
+                    try std.testing.expect(try checkWithIr(allocator, body, &ir) == null);
+                    try std.testing.expectEqual(hooked and global, try ir.borrowConflict(body) != null);
+                    code[1].boxed = true;
+                    code[6].op = constant;
+                    code[7].op = constant;
+                    try std.testing.expect(try ir.borrowConflict(body) == null);
+                }
+            }
+        }
+    }
+}
+
+test "extremum hooks are calls in both loan paths including expired loans under OOM" {
+    try testExtremumHookLoans(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExtremumHookLoans, .{});
 }
 
 fn testEqualityHookLoans(allocator: std.mem.Allocator) !void {

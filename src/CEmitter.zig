@@ -2183,6 +2183,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(binary.lhs)] = true;
             value_used[@backingInt(binary.rhs)] = true;
         },
+        .extremum => |extremum| for (extremum.args) |arg| {
+            value_used[@backingInt(arg)] = true;
+        },
         .call => |call| {
             if (!call.noreturn or sameFunction(ir.functions.items[@backingInt(body.instructions[@backingInt(call.callee)].op.function_ref)], function)) value_used[@backingInt(call.callee)] = true;
             for (call.args) |arg| value_used[@backingInt(arg)] = true;
@@ -2565,6 +2568,16 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             try w.print("    (void)v{d};\n", .{i});
             continue;
         }
+        if (instruction.op == .extremum) {
+            if (!managedType(ir, ty)) {
+                try w.writeAll("    ");
+                try writeType(ir, w, instruction.ty);
+                try w.print(" v{d};\n", .{i});
+            }
+            try writeExtremum(ir, root_counts, w, instruction, i);
+            if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
+            continue;
+        }
         if (ty == .void) {
             // Void values have no C object; emit their effects as statements.
             if (instruction.op == .print) try writePrint(ir, w, body, instruction.op.print);
@@ -2773,7 +2786,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 try w.print("v{d} {s} v{d}", .{ @backingInt(binary.lhs), operator, @backingInt(binary.rhs) });
             },
             .call => |call| try writeCall(ir, w, body, call),
-            .global_slot, .string_slice, .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
+            .extremum, .global_slot, .string_slice, .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
@@ -2793,6 +2806,9 @@ fn markCopyTypes(allocator: std.mem.Allocator, ir: *const Ir, copied: []bool) st
         const transfers = try ArrayTransfers.init(allocator, ir, body);
         defer transfers.deinit(allocator);
         for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+            .extremum => if (try ir.needsArrayCopy(instruction.ty)) {
+                copied[@backingInt(instruction.ty)] = true;
+            },
             .array_clone => |value| if (!transfers.canElideClone(body, value, i)) {
                 copied[@backingInt(instruction.ty)] = true;
             },
@@ -2938,6 +2954,60 @@ fn writePayloadChecks(allocator: std.mem.Allocator, ir: *const Ir, copy_types: [
         if (ty.record.tagged) try w.writeAll("    default: nov_rt_panic(\"invalid union tag\");\n    }\n");
         try w.writeAll("    (void)value;\n    return result;\n}\n");
     }
+}
+
+fn writeExtremum(ir: *const Ir, counts: []const usize, w: *std.Io.Writer, instruction: Ir.Instruction, index: usize) WriteError!void {
+    const op = instruction.op.extremum;
+    const rooted = counts[@backingInt(instruction.ty)] != 0;
+    const copy = try ir.needsArrayCopy(instruction.ty);
+    try w.writeAll("    {\n");
+    for (0..4) |i| {
+        try w.writeAll("    ");
+        try writeType(ir, w, instruction.ty);
+        try w.print(" nov_ext_{d} = {{0}};\n", .{i});
+    }
+    if (rooted) {
+        try w.writeAll("    void **nov_ext_roots[] = {");
+        for (0..4) |i| try writeRoots(ir, counts, w, instruction.ty, "nov_ext_", i);
+        try w.print(" }};\n    nov_gc_roots nov_ext_frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &nov_ext_frame, nov_ext_roots, {d});\n", .{counts[@backingInt(instruction.ty)] * 4});
+    }
+    if (op.array) {
+        const array = @backingInt(op.args[0]);
+        try w.print("    if (!v{d}.len) nov_rt_panic(\"@{s} requires a nonempty array\");\n    nov_ext_0 = ((", .{ array, if (op.maximum) "max" else "min" });
+        try writeType(ir, w, instruction.ty);
+        try w.print(" *)v{d}.data)[0];\n    for (uintptr_t nov_ext_i = 1; nov_ext_i < v{d}.len; ++nov_ext_i) {{\n    nov_ext_1 = ((", .{ array, array });
+        try writeType(ir, w, instruction.ty);
+        try w.print(" *)v{d}.data)[nov_ext_i];\n", .{array});
+        try writeExtremumStep(ir, w, instruction, copy);
+        try w.writeAll("    }\n");
+    } else {
+        try w.print("    nov_ext_0 = v{d};\n", .{@backingInt(op.args[0])});
+        for (op.args[1..]) |arg| {
+            try w.print("    nov_ext_1 = v{d};\n", .{@backingInt(arg)});
+            try writeExtremumStep(ir, w, instruction, copy);
+        }
+    }
+    try w.print("    v{d} = ", .{index});
+    if (copy) try w.print("nov_copy_{d}(nov_ext_0)", .{@backingInt(instruction.ty)}) else try w.writeAll("nov_ext_0");
+    try w.writeAll(";\n    (void)nov_ext_1; (void)nov_ext_2; (void)nov_ext_3;\n");
+    if (rooted) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &nov_ext_frame);\n");
+    try w.writeAll("    }\n");
+}
+
+fn writeExtremumStep(ir: *const Ir, w: *std.Io.Writer, instruction: Ir.Instruction, copy: bool) WriteError!void {
+    const op = instruction.op.extremum;
+    const lhs: usize = if (op.maximum) 0 else 1;
+    const rhs: usize = 1 - lhs;
+    if (op.comparator) |id| {
+        for ([_]usize{ lhs, rhs }, 2..) |source, target| {
+            try w.print("    nov_ext_{d} = ", .{target});
+            if (copy) try w.print("nov_copy_{d}(nov_ext_{d})", .{ @backingInt(instruction.ty), source }) else try w.print("nov_ext_{d}", .{source});
+            try w.writeAll(";\n");
+        }
+        try w.writeAll("    if (");
+        try writeScopedFunctionName(w, ir.getFunction(id).?);
+        try w.writeAll("(nov_ext_2, nov_ext_3)) nov_ext_0 = nov_ext_1;\n");
+    } else try w.print("    if (nov_ext_{d} < nov_ext_{d}) nov_ext_0 = nov_ext_1;\n", .{ lhs, rhs });
 }
 
 // Unproven values retain eager recursive copies for independent value storage.
@@ -11187,6 +11257,159 @@ test "trivial replace actual stdlib source free independent backing forced GC O0
         \\    (void)nov_replaceRows(input, replacement); return 0;
         \\}
     , true);
+}
+
+test "extremum source free managed snapshots copies callbacks and forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let S=struct{key:int,name:str,items:[]int,run:()->bool,
+        \\@[operator(.less_than)]
+        \\let less:(a:S,b:S)->bool=a.run() and a.key<b.key
+        \\}
+        \\let main:()={let mut source:[]S=[]
+        \\let mut calls:uint=0
+        \\let run=()->bool{calls+=1
+        \\@clear(source)
+        \\let garbage:[][]int=[[1],[2]]
+        \\@assert(garbage[1][0]==2)
+        \\true}
+        \\let a=S.[key=3,name="a",items=[3],run]
+        \\let b=S.[key=1,name="b",items=[1],run]
+        \\let c=S.[key=2,name="c",items=[2],run]
+        \\source=[a,b,c]
+        \\let chosen=@min(source)
+        \\@assert(chosen.name=="b" and chosen.items[0]==1 and @len(source)==0 and calls==2)
+        \\let mut changed=chosen
+        \\changed.items[0]=9
+        \\@assert(chosen.items[0]==1 and b.items[0]==1)
+        \\@assert(@max(a,a).name=="a" and calls==3)
+        \\@assert(@min([b]).name=="b" and calls==3)
+        \\@println("extrema")}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "extrema\n", "", mode);
+}
+
+test "extremum scalar only nominal values compile as strict C11 O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let S=struct{n:int,
+        \\@[operator(.less_than)]
+        \\let less:(a:S,b:S)->bool=a.n<b.n
+        \\}
+        \\let main:()={let a=S.[n=1]
+        \\let b=S.[n=2]
+        \\@assert(@min(a,b).n==1 and @max([a,b]).n==2)
+        \\@println("scalar extrema")}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "scalar extrema\n", "", mode);
+}
+
+test "extremum source free IEEE payloads zero ties and allocation free scalar reductions O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let min32:(a:f32,b:f32)->f32=@min(a,b)
+        \\let max32:(a:f32,b:f32)->f32=@max(a,b)
+        \\let min64:(a:f64,b:f64)->f64=@min(a,b)
+        \\let max64:(a:f64,b:f64)->f64=@max(a,b)
+        \\let arrayMin:(a:f64,b:f64)->f64=@min([a,b])
+        \\let arrayMax:(a:f64,b:f64)->f64=@max([a,b])
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    uint64_t inputs[][2] = {
+        \\        {UINT64_C(0x7ff8000000000017), UINT64_C(0x3ff0000000000000)},
+        \\        {UINT64_C(0x3ff0000000000000), UINT64_C(0x7ff8000000000017)},
+        \\        {UINT64_C(0x8000000000000000), 0}, {0, UINT64_C(0x8000000000000000)}
+        \\    };
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    for (size_t i = 0; i < 4; ++i) {
+        \\        double a, b; uint64_t bits;
+        \\        memcpy(&a, &inputs[i][0], sizeof a); memcpy(&b, &inputs[i][1], sizeof b);
+        \\        fail_allocations = 1;
+        \\        double result = nov_min64(a, b); memcpy(&bits, &result, sizeof bits);
+        \\        if (bits != inputs[i][0]) return 1;
+        \\        result = nov_max64(a, b); memcpy(&bits, &result, sizeof bits);
+        \\        if (bits != inputs[i][0]) return 2;
+        \\        fail_allocations = 0;
+        \\        result = nov_arrayMin(a, b); memcpy(&bits, &result, sizeof bits);
+        \\        if (bits != inputs[i][0]) return 3;
+        \\        result = nov_arrayMax(a, b); memcpy(&bits, &result, sizeof bits);
+        \\        if (bits != inputs[i][0]) return 4;
+        \\    }
+        \\    uint32_t small[][2] = {{UINT32_C(0x7fc00017), UINT32_C(0x3f800000)}, {UINT32_C(0x3f800000), UINT32_C(0x7fc00017)}, {UINT32_C(0x80000000), 0}, {0, UINT32_C(0x80000000)}};
+        \\    fail_allocations = 1;
+        \\    for (size_t i = 0; i < 4; ++i) {
+        \\        float a, b; uint32_t bits;
+        \\        memcpy(&a, &small[i][0], sizeof a); memcpy(&b, &small[i][1], sizeof b);
+        \\        float result = nov_min32(a, b); memcpy(&bits, &result, sizeof bits);
+        \\        if (bits != small[i][0]) return 5;
+        \\        result = nov_max32(a, b); memcpy(&bits, &result, sizeof bits);
+        \\        if (bits != small[i][0]) return 6;
+        \\    }
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 7;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
+test "extremum empty arrays panic and comparator allocation failures propagate O0 O3" {
+    for ([_][]const u8{ "min", "max" }) |name| {
+        const source = try std.fmt.allocPrint(test_gpa, "let empty:()->int=@{s}(@as([]int,[]))", .{name});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const stderr = try std.fmt.allocPrint(test_gpa, "panic: @{s} requires a nonempty array\n", .{name});
+        defer test_gpa.free(stderr);
+        const program = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { (void)nov_empty(); return 0; }\n" });
+        defer test_gpa.free(program);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "", stderr, mode);
+    }
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\@[extern("enable_failure")]
+        \\let enableFailure:()
+        \\let S=struct{key:int,items:[]int,
+        \\@[operator(.less_than)]
+        \\let less:(a:S,b:S)->bool={enableFailure()
+        \\a.key<b.key}
+        \\}
+        \\let select:()->S=@min([S.[key=1,items=[1]],S.[key=2,items=[2]]])
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\void enable_failure(void) { fail_allocations = 1; }
+        \\int main(void) { nov_rt_heap.collect_every_allocation = 1; (void)nov_select(); return 0; }
+    , true);
+}
+
+fn testExtremumCompilerAllocations(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "extremum-oom.nov",
+        \\let S=struct{key:int,
+        \\@[operator(.less_than)]
+        \\let less:(a:S,b:S)->bool=a.key<b.key
+        \\}
+        \\let pick:(a:S,b:S)->S=@max(a,b)
+        \\let plain:(values:[]i8)->i8=@min(values)
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    const c = try emit(allocator, &result.ir, null);
+    defer allocator.free(c);
+}
+
+test "extremum frontend IR and emission roll back every compiler allocation failure" {
+    try testExtremumCompilerAllocations(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testExtremumCompilerAllocations, .{});
 }
 
 test "array flatMap actual stdlib source free recursive copies forced GC O0 O3 and runtime OOM" {

@@ -2354,6 +2354,134 @@ test "default builtin readonly custom metadata and deferred constraints roll bac
     }
 }
 
+fn testMinMaxQuery(allocator: std.mem.Allocator, source: [:0]const u8, valid: bool) !void {
+    try testDefaultTypeQuery(allocator, source, valid);
+}
+
+test "min max solver exact owning result types and readonly availability" {
+    for ([_][:0]const u8{
+        "let expected:int\nlet query=@min(3,1,2)",
+        "let expected:f64\nlet query=@max(1,2.5)",
+        "let expected:f64\nlet query=@min([1,2.5])",
+
+        "let expected:u8\nlet query=@min(1,@as(u8,2),3)",
+        "let expected:f32\nlet query=@max(1.5,@as(f32,2.5))",
+        "let expected:u8\nlet query=@as(u8,@min([]))",
+        "let expected:u8\nlet query=@as(@TypeOf(@min(@as([]u8,[]))),0)",
+        "let expected:u8\nlet query=@max(@as([]u8,[]))",
+        "let expected:u8\nlet query=@as(u8,@max([1,2]))",
+        "let expected:f32\nlet query=@as(f32,@min(1,2))",
+        "let Alias=u16\nlet expected:Alias\nlet query=@min(@as(Alias,1),2)",
+        "let touch:()->[]u8=unresolved_body\nlet expected:u8\nlet query=@min(touch())",
+        "let pick:(a:`T,b:`T)->`T=@max(a,b)\nlet alias=pick\nlet expected:u8\nlet query=alias(1,@as(u8,2))",
+        "let expected:u8\nlet query={let pick=(a:u8,b:u8)->u8{@min(a,b)}\npick(1,2)}",
+        "let S=struct{items:[]u8,}\nlet expected:u8\nlet query=@max(S.[items=[]].items)",
+        "let E=enum{low,high,\n@[operator(.less_than)]\nlet less:(a:E,b:E)->bool=a==.low and b==.high\n}\nlet expected:E\nlet query=@min([.high,E.low])",
+        "let S=struct{n:int,\n@[operator(.less_than)]\nlet less:(a:S,b:S)->bool=a.n<b.n\n}\nlet expected:S\nlet query=@max([.[n=1],S.[n=2]])",
+        "let Box:(T:type)->type=struct{value:T,\n@[operator(.less_than)]\nlet less:(a:@This(),b:@This())->bool=unresolved_body\n}\nlet Alias=Box(u8)\nlet expected:Alias\nlet query=@min(.[value=1],Alias.[value=2])",
+        "let S=struct{n:int,\n@[operator(.less_than)]\nlet less:(a:S,b:S)->bool=@panic(\"must not run\")\n}\nlet expected:S\nlet query=@max(@as([]S,[]))",
+        "let S=struct{n:int,\n@[operator(.less_than)]\nlet less:(a:S,b:S)->bool=unresolved_body\n@[operator(.less_than)]\nlet mixed:(a:S,b:int)->bool=unresolved_body\n}\nlet expected:S\nlet query=@min(S.[n=1],.[n=2])",
+    }) |source| try testMinMaxQuery(std.testing.allocator, source, true);
+}
+
+test "min max solver rejects mixed types nonordering hooks and invalid arity" {
+    for ([_][:0]const u8{
+        "let query=@min()",
+        "let query=@max(1)",
+        "let query=@min([])",
+        "let query=@max(@as(u8,1),@as(u16,2))",
+        "let query=@min(@as(f32,1),@as(f64,2))",
+        "let query=@max(@as(int,1),@as(f64,2))",
+        "let query=@min(true,false)",
+        "let query=@max('a','b')",
+        "let query=@max(\"a\",\"b\")",
+        "let query=@min([[1],[2]])",
+        "let query=@max(@as([]bool,[]))",
+        "let S=struct{n:int,}\nlet query=@min(S.[n=1],S.[n=2])",
+        "let S=struct{n:int,\n@[operator(.less_than)]\nlet mixed:(a:S,b:int)->bool=unresolved_body\n}\nlet query=@min(S.[n=1],2)",
+        "let S=struct{n:int,\n@[operator(.less_than)]\nlet mixed:(a:S,b:int)->bool=unresolved_body\n}\nlet query=@max(S.[n=1],S.[n=2])",
+        "let S=struct{n:int,\n@[operator(.less_than)]\nlet mixed:(a:int,b:S)->bool=unresolved_body\n}\nlet query=@min(@as([]S,[]))",
+    }) |source| try testMinMaxQuery(std.testing.allocator, source, false);
+}
+
+test "min max solver readonly query purity and OOM" {
+    for ([_]struct { source: [:0]const u8, valid: bool = true }{
+        .{ .source = "let expected:u8\nlet query=@as(u8,@min([]))" },
+        .{ .source = "let pick:(a:`T,b:`T)->`T=@min(a,b)\nlet expected:u8\nlet query={let f:(u8,u8)->u8=pick\nf(1,2)}" },
+        .{ .source = "let S=struct{n:int,\n@[operator(.less_than)]\nlet less:(a:S,b:S)->bool=unresolved_body\n}\nlet expected:S\nlet query=@max(@as([]S,[]))" },
+        .{ .source = "let query=@min(@as(u8,1),@as(u16,2))", .valid = false },
+        .{ .source = "let query=@max(@as([]bool,[]))", .valid = false },
+    }) |case| {
+        try testMinMaxQuery(std.testing.allocator, case.source, case.valid);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMinMaxQuery, .{ case.source, case.valid });
+    }
+}
+
+fn testMinMaxDemand(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "min-max-demand.nov",
+        \\let smallest:(items:[]`T)->`T=@min(items)
+        \\let greatest:(a:`T,b:`T)->`T=@max(a,b)
+        \\let alias=greatest
+        \\let unused:(x:`T)->`T=@min(true,false)
+        \\let S=struct{n:int,
+        \\@[operator(.less_than)]
+        \\let less:(a:S,b:S)->bool=a.n<b.n
+        \\}
+        \\let main:()={let a:u8=smallest([3,1,2])
+        \\let b:u8=alias(1,2)
+        \\let f=(x:u8)->u8{@max(x,2)}
+        \\let s=@min(S.[n=1],.[n=2])
+        \\@print(a,b,f(1),s.n)}
+    );
+    defer module.deinit();
+    const declarations = module.declarations.items.len;
+    var result = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(declarations, module.declarations.items.len);
+        return err;
+    };
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("min max demand diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    var instances: usize = 0;
+    for (module.declarations.items) |decl| if (decl.function_template != null) {
+        instances += 1;
+        try std.testing.expect(decl.function_template.? != module.lookup("unused").?);
+    };
+    try std.testing.expectEqual(@as(usize, 2), instances);
+    try result.ir.verify();
+}
+
+test "min max solver executable generic closure and nominal demands under OOM" {
+    try testMinMaxDemand(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMinMaxDemand, .{});
+}
+
+fn testMinMaxGenericChecking(allocator: std.mem.Allocator, valid: bool) !void {
+    var module = try Module.init(allocator, "min-max-generic.nov", "let pick:(x:`T)->`T=@min(@max(x,x),x)");
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const ref: Ref = .{ .module = &module, .id = module.lookup("pick").? };
+    const ty = try ir.internType(if (valid) .{ .integer = .{ .signedness = .unsigned, .bits = 8 } } else .boolean);
+    const bindings = try infer(&module, &ir, ref, &.{.{ .ty = ty, .span = ref.span() }}, null, ref.span());
+    defer if (bindings) |items| allocator.free(items);
+    try std.testing.expectEqual(valid, bindings != null);
+    try std.testing.expectEqual(!valid, module.hasErrors());
+    if (bindings) |items| try std.testing.expectEqual(ty, items[0].ty);
+    try std.testing.expectEqual(@as(usize, 1), module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+}
+
+test "min max solver ordinary generic calls validate ordering under OOM" {
+    for ([_]bool{ false, true }) |valid| {
+        try testMinMaxGenericChecking(std.testing.allocator, valid);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMinMaxGenericChecking, .{valid});
+    }
+}
+
 const Solver = struct {
     allocator: std.mem.Allocator,
     caller: *Module,
@@ -2373,6 +2501,7 @@ const Solver = struct {
     query_printables: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index, interpolation: bool = true }) = .empty,
     query_types: std.ArrayList(*Term) = .empty,
     default_types: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
+    ordered_types: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_locals: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_assignments: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_unions: std.ArrayList(struct { payload_type: *Term, module: *Module, node: Ast.Node.Index, payload: Ast.Node.Index, enum_payload: bool }) = .empty,
@@ -2676,6 +2805,18 @@ const Solver = struct {
             var validation = try BodyChecker.QueryValidation.init(self.ir);
             defer validation.deinit();
             if (!try validation.defaultType(default.module, default.node, ty)) {
+                self.failed = true;
+                return;
+            }
+        }
+        for (self.ordered_types.items) |ordered| {
+            const ty = (try self.materialize(ordered.operand, 0)) orelse {
+                if (!self.failed) try self.fail(.generic_function_ambiguous, self.call_span, ordered.operand.span);
+                return;
+            };
+            var validation = try BodyChecker.QueryValidation.init(self.ir);
+            defer validation.deinit();
+            if (!try validation.ordered(ordered.module, ordered.node, ty)) {
                 self.failed = true;
                 return;
             }
@@ -4358,7 +4499,24 @@ const Solver = struct {
                     .array_init, .array_init_comma => ast.extra_data[data.lhs..data.rhs],
                     else => buf[0 .. @as(usize, @intFromBool(data.lhs != 0)) + @as(usize, @intFromBool(data.rhs != 0))],
                 };
-                for (elements) |item| {
+                // Infer shorthand from a typed sibling without revisiting any
+                // expression. This changes inference order, not runtime order.
+                var first: usize = 0;
+                if (elements.len != 0 and root(element).value == .unknown and needsOperandContext(ast, elements[0])) {
+                    for (elements, 0..) |item, index| {
+                        if (!needsOperandContext(ast, item)) {
+                            first = index;
+                            break;
+                        }
+                    }
+                }
+                if (elements.len != 0) {
+                    const value = try self.expressionExpected(frame, elements[first], element, depth + 1);
+                    if (root(value).value == .never) return value;
+                    try self.unify(element, value, span, 0);
+                }
+                for (elements, 0..) |item, index| {
+                    if (index == first) continue;
                     const value = try self.expressionExpected(frame, item, element, depth + 1);
                     if (root(value).value == .never) return value;
                     try self.unify(element, value, span, 0);
@@ -4502,6 +4660,46 @@ const Solver = struct {
                     return ty;
                 }
                 const callee_name = ast.tokenSlice(ast.firstToken(call.ast.fn_expr));
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
+                    (std.mem.eql(u8, callee_name, "@min") or std.mem.eql(u8, callee_name, "@max")))
+                {
+                    if (call.ast.args.len == 0) {
+                        try self.fail(.argument_count_mismatch, span, null);
+                        return self.term(.unknown, span);
+                    }
+                    const element = expected orelse try self.term(.unknown, span);
+                    if (call.ast.args.len == 1) {
+                        const array = try self.term(.{ .array = element }, span);
+                        const operand = try self.expressionExpected(frame, call.ast.args[0], array, depth + 1);
+                        if (root(operand).value == .never) return operand;
+                        try self.unify(array, operand, span, 0);
+                    } else {
+                        // A typed sibling supplies shorthand context, but every
+                        // operand still unifies with the same exact result T.
+                        var first: usize = 0;
+                        if (root(element).value == .unknown and needsOperandContext(ast, call.ast.args[0])) {
+                            for (call.ast.args, 0..) |arg, index| {
+                                if (!needsOperandContext(ast, arg)) {
+                                    first = index;
+                                    break;
+                                }
+                            }
+                        }
+                        const operand = try self.expressionExpected(frame, call.ast.args[first], element, depth + 1);
+                        if (root(operand).value == .never) return operand;
+                        try self.unify(element, operand, span, 0);
+                        for (call.ast.args, 0..) |arg, index| {
+                            if (index == first) continue;
+                            const value = try self.expressionExpected(frame, arg, element, depth + 1);
+                            if (root(value).value == .never) return value;
+                            try self.unify(element, value, span, 0);
+                        }
+                    }
+                    // Availability is required during ordinary generic checking
+                    // too, not only during readonly TypeOf queries.
+                    try self.ordered_types.append(self.allocator, .{ .operand = element, .module = module, .node = node });
+                    return element;
+                }
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, callee_name, "@default")) {
                     if (call.ast.args.len != 1) {
                         try self.fail(.argument_count_mismatch, span, null);

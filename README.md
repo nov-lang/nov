@@ -3945,8 +3945,8 @@ TODO
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
 <!-- - `@printf(fmt: #str, args: ...)` works like std.fmt.format and print to stdout -->
 - `@panic(s: str)`: A terminal, void-returning builtin following the `@[noreturn]` contract. Evaluate exactly one string argument once, attempt to flush stdout, write `panic: <message>\n` to stderr, then exit with code 1. Messages are length-based UTF-8 bytes, including embedded NUL. No backtrace is produced; debug and release behave identically.
-- `@max(a: T, b: T, ...)`: Returns the maximum value between all the supplied arguments
-- `@min(a: T, b: T, ...)`: Returns the minimum value between all the supplied arguments
+- `@max(values: []T) -> T` / `@max(a: T, b: T, ...) -> T`: Maximum of one array or at least two same-type values; see [Minimum and maximum](#minimum-and-maximum).
+- `@min(values: []T) -> T` / `@min(a: T, b: T, ...) -> T`: Minimum under the same rules.
 - `@dump(expr)`: TODO: https://docs.vlang.io/builtin-functions.html#dumping-expressions-at-runtime
 - `@embedFile()`: TODO, also allow for compressing the file
 - `@sizeOf()`: TODO
@@ -3962,6 +3962,38 @@ TODO
 - `@call()`: TODO
 - `@volatile_load()`: TODO
 - `@volatile_store()`: TODO
+
+### Minimum and maximum
+
+`@min` and `@max` accept one array `[]T`, or at least two values of the exact
+same type `T`, and return `T`. Numeric literals use ordinary contextual inference;
+there is no implicit conversion between differently typed values. Builtin ordering
+supports integers and floats. Structs, unions and enums require an accessible
+`@[operator(.less_than)]` hook with exact `(T, T) -> bool` signature; a mixed-type
+hook alone is insufficient. Other types, including rune, bool and `str`, have no
+ordering for these builtins.
+
+```nov
+let smallest = @min(9, 3, 7)  ; 3
+let largest = @max([2, 8, 3]) ; 8
+let byte: u8 = @min(3, 1, 2)
+```
+
+Arguments evaluate once, left to right, and are snapshotted before any comparison.
+Array input is also snapshotted, so a comparator changing its owner cannot change
+the scan. Results follow ordinary independent-copy semantics. The reduction is a
+stable left fold: min tests `candidate < best`, max tests `best < candidate`, and
+false keeps the first value. Thus ties retain the first value, including signed
+zero; a leading NaN remains and later NaNs are ignored. Singleton arrays perform
+no comparisons, but still require an ordered element type.
+
+Zero arguments and a single non-array argument are compile errors. An empty typed
+array panics identically in all modes (`@min requires a nonempty array` or
+`@max requires a nonempty array`); untyped `[]` needs an element-type context.
+Readonly `@TypeOf` validates types, ordering and visibility without evaluating
+arguments, comparing or panicking. Globals may reduce compile-time-known data,
+but a reached user comparator requires runtime initialization in `main` or a
+function called from it. See [`examples/extrema.nov`](examples/extrema.nov).
 
 ### Variables
 - os type

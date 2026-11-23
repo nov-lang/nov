@@ -166,6 +166,7 @@ pub const Operation = union(enum) {
     unary: struct { op: UnaryOp, operand: ValueId },
     /// enum_tag compares exact enum discriminants, bypassing equality hooks.
     binary: struct { op: BinaryOp, lhs: ValueId, rhs: ValueId, enum_tag: bool = false },
+    extremum: struct { maximum: bool, array: bool, args: []const ValueId, comparator: ?FunctionId = null },
     call: struct { callee: ValueId, args: []const ValueId, noreturn: bool = false },
     print: struct { args: []const ValueId, newline: bool },
     /// Instructions [rhs_start, this instruction) form a conditional RHS region.
@@ -610,6 +611,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
     for (owned) |*instruction| {
         switch (instruction.op) {
             .closure_init => |*closure| closure.captures = try self.allocator.dupe(ValueId, closure.captures),
+            .extremum => |*extremum| extremum.args = try self.allocator.dupe(ValueId, extremum.args),
             .call => |*call| call.args = try self.allocator.dupe(ValueId, call.args),
             .print => |*print| print.args = try self.allocator.dupe(ValueId, print.args),
             .assertion => |*assertion| assertion.location = try self.allocator.dupe(u8, assertion.location),
@@ -627,6 +629,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
 fn freeOperands(self: *Ir, op: Operation) void {
     switch (op) {
         .closure_init => |closure| self.allocator.free(closure.captures),
+        .extremum => |extremum| self.allocator.free(extremum.args),
         .call => |call| self.allocator.free(call.args),
         .print => |print| self.allocator.free(print.args),
         .assertion => |assertion| self.allocator.free(assertion.location),
@@ -1592,6 +1595,27 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                     .bit_not => if (ty != .integer) return error.InvalidOperation,
                     .bool_not => if (ty != .boolean) return error.InvalidOperation,
                 }
+            },
+            .extremum => |extremum| {
+                if (extremum.array) {
+                    if (extremum.args.len != 1) return error.InvalidOperation;
+                    const array = self.getType(try operandType(body, extremum.args[0], i)) orelse return error.InvalidTypeId;
+                    if (array != .array) return error.InvalidOperation;
+                    if (array.array != instruction.ty) return error.OperandTypeMismatch;
+                } else {
+                    if (extremum.args.len < 2) return error.InvalidOperation;
+                    for (extremum.args) |arg| if (try operandType(body, arg, i) != instruction.ty) return error.OperandTypeMismatch;
+                }
+                if (extremum.comparator) |id| {
+                    if (ty != .record and ty != .enumeration) return error.InvalidOperation;
+                    if (ty == .record and ty.record.anonymous != .none) return error.InvalidOperation;
+                    const comparator = self.getFunction(id) orelse return error.InvalidFunctionId;
+                    try self.validateFunction(comparator);
+                    const comparator_type = self.getType(comparator.ty) orelse return error.InvalidTypeId;
+                    if (comparator_type != .function or comparator.is_closure or comparator.is_test or comparator.noreturn) return error.InvalidOperation;
+                    const sig = comparator_type.function;
+                    if (sig.params.len != 2 or sig.params[0] != instruction.ty or sig.params[1] != instruction.ty or (self.getType(sig.result) orelse return error.InvalidTypeId) != .boolean) return error.OperandTypeMismatch;
+                } else if (ty != .integer and ty != .float) return error.InvalidOperation;
             },
             .binary => |binary| {
                 const lhs = try operandType(body, binary.lhs, i);
@@ -3309,6 +3333,80 @@ test "to_string verifies printable prior operands result types spans and slot is
     try std.testing.expectError(error.InvalidSourceSpan, ir.verify());
     owned[9] = body[9];
     try ir.verify();
+}
+
+fn testExtremumOwnedArguments(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const array = try ir.internType(.{ .array = integer });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ integer, integer, array }, .result = integer } });
+    const function = try ir.addFunction("extreme", signature, span);
+    var args = [_]ValueId{ @fromBackingInt(0), @fromBackingInt(1) };
+    const body = [_]Instruction{
+        .{ .ty = integer, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = integer, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = array, .span = span, .op = .{ .parameter = 2 } },
+        .{ .ty = integer, .span = span, .op = .{ .extremum = .{ .maximum = true, .array = false, .args = &args } } },
+    };
+    try ir.setFunctionBody(function, &body, @fromBackingInt(3));
+    args[0] = @fromBackingInt(99);
+    try std.testing.expectEqual(@as(ValueId, @fromBackingInt(0)), ir.getFunction(function).?.body.?.instructions[3].op.extremum.args[0]);
+    try ir.verify();
+}
+
+test "extremum IR owns argument lists and rolls back every allocation failure" {
+    try testExtremumOwnedArguments(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExtremumOwnedArguments, .{});
+}
+
+test "extremum IR rejects invalid arity operands forward values and comparator signatures" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const boolean = try ir.internType(.boolean);
+    const array = try ir.internType(.{ .array = integer });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ integer, integer, array }, .result = integer } });
+    const function = try ir.addFunction("extreme", signature, span);
+    var body = [_]Instruction{
+        .{ .ty = integer, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = integer, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = array, .span = span, .op = .{ .parameter = 2 } },
+        .{ .ty = integer, .span = span, .op = .{ .extremum = .{ .maximum = false, .array = true, .args = &.{@fromBackingInt(2)} } } },
+    };
+    for ([_]struct { array: bool, args: []const ValueId, err: BuildError }{
+        .{ .array = false, .args = &.{}, .err = error.InvalidOperation },
+        .{ .array = false, .args = &.{@fromBackingInt(0)}, .err = error.InvalidOperation },
+        .{ .array = false, .args = &.{ @fromBackingInt(2), @fromBackingInt(0) }, .err = error.OperandTypeMismatch },
+        .{ .array = false, .args = &.{ @fromBackingInt(3), @fromBackingInt(0) }, .err = error.InvalidValueId },
+        .{ .array = true, .args = &.{@fromBackingInt(0)}, .err = error.InvalidOperation },
+        .{ .array = true, .args = &.{ @fromBackingInt(2), @fromBackingInt(2) }, .err = error.InvalidOperation },
+    }) |case| {
+        body[3].op.extremum.array = case.array;
+        body[3].op.extremum.args = case.args;
+        try std.testing.expectError(case.err, ir.setFunctionBody(function, &body, @fromBackingInt(3)));
+        try std.testing.expect(ir.getFunction(function).?.body == null);
+    }
+    body[3].op.extremum = .{ .maximum = false, .array = true, .args = &.{@fromBackingInt(2)} };
+    try ir.setFunctionBody(function, &body, @fromBackingInt(3));
+    try ir.verify();
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const compare_signature = try ir.internType(.{ .function = .{ .params = &.{ record, integer }, .result = boolean } });
+    const comparator = try ir.addFunction("badCompare", compare_signature, span);
+    const select_signature = try ir.internType(.{ .function = .{ .params = &.{ record, record }, .result = record } });
+    const select = try ir.addFunction("select", select_signature, span);
+    var select_body = [_]Instruction{
+        .{ .ty = record, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = record, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = record, .span = span, .op = .{ .extremum = .{ .maximum = true, .array = false, .args = &.{ @fromBackingInt(0), @fromBackingInt(1) }, .comparator = comparator } } },
+    };
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(select, &select_body, @fromBackingInt(2)));
+    select_body[2].op.extremum.comparator = @fromBackingInt(99);
+    try std.testing.expectError(error.InvalidFunctionId, ir.setFunctionBody(select, &select_body, @fromBackingInt(2)));
+    select_body[2].op.extremum.comparator = null;
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(select, &select_body, @fromBackingInt(2)));
 }
 
 test "membership verifies exact prior values result spans and slot isolation" {

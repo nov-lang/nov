@@ -150,6 +150,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const default_tests = b.step("test-cli-defaults", "Run default values, constructors and generic take CLI tests");
     addDefaultCliTests(b, exe, default_tests);
     test_step.dependOn(default_tests);
+    const extrema_tests = b.step("test-cli-extrema", "Run minimum and maximum builtin CLI tests");
+    addExtremaCliTests(b, exe, extrema_tests);
+    test_step.dependOn(extrema_tests);
     const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
     addTrivialCliTests(b, exe, trivial_tests);
     test_step.dependOn(trivial_tests);
@@ -1446,6 +1449,157 @@ fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         "let std=@import(\"std\")\nlet noop:()={}\nlet mut callback:()->void=noop\nlet S=struct{n:int=0,\n@[public]\n@[default]\nlet make:()->S={callback()\nS.[n=99]}\n}\nlet main:()={let mut items=[S.[n=7]]\ncallback=(){items=[]}\nlet old=std.trivial.take(&items[0])\n}",
     }, 0..) |source, i| {
         const path = b.fmt("bad-default-{d}.nov", .{i});
+        _ = fixtures.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+}
+
+fn addExtremaCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "extrema.nov", @embedFile("examples/extrema.nov"), "Minimum: 3\nMaximum: 8\nBest: second\n", "PASS exact_contextual_types_and_numeric_bounds\nPASS custom_order_stable_ties_and_independent_results\nPASS enum_union_and_generic_ordering\nPASS float_nan_and_signed_zero_keep_the_first_value\nPASS arguments_are_eager_and_comparisons_run_afterwards\nPASS array_snapshot_survives_comparator_owner_mutation\nPASS known_data_globals_and_unevaluated_queries\n7 passed; 0 failed; 7 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("models.nov",
+        \\@[public]
+        \\let Ordered=struct{n:int,
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let before:(a:Ordered,b:Ordered)->bool=a.n<b.n
+        \\}
+        \\@[public]
+        \\let Box:(T:type)->type=struct{n:T,
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let before:(a:@This(),b:@This())->bool=a.n<b.n
+        \\}
+        \\@[public]
+        \\let Private=struct{n:int,
+        \\@[operator(.less_than)]
+        \\let before:(a:Private,b:Private)->bool=a.n<b.n
+        \\}
+        \\@[public]
+        \\let Mixed=struct{n:int,
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let before:(a:Mixed,b:int)->bool=a.n<b
+        \\}
+        \\@[public]
+        \\let Unordered=struct{n:int,}
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let models=@import("models.nov")
+        \\let Alias=models.Ordered
+        \\let minimum=@min([4,1,3])
+        \\let maximum=@max(2,7,1)
+        \\let main:()={
+        \\@assert(minimum==1 and maximum==7)
+        \\let first=Alias.[n=1]
+        \\let second=Alias.[n=2]
+        \\@assert(@min(second,first).n==1 and @max([first,second]).n==2)
+        \\let low=models.Box(uint).[n=1]
+        \\let high=models.Box(uint).[n=3]
+        \\@assert(@min([high,low]).n==1 and @max(low,high).n==3)
+        \\@println("imported extrema")
+        \\}
+        \\
+    );
+    const check = b.addRunArtifact(exe);
+    check.setCwd(fixtures.getDirectory());
+    check.addArgs(&.{ "check", "--semantic", "imported.nov", "--lib-dir" });
+    check.addDirectoryArg(library);
+    check.expectExitCode(0);
+    check.expectStdOutEqual("");
+    check.expectStdErrEqual("");
+    test_step.dependOn(&check.step);
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "imported.nov", "--lib-dir" });
+        run.addDirectoryArg(library);
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("imported extrema\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "min", "max" }) |builtin_name| {
+        for ([_]struct { name: []const u8, args: []const u8 }{
+            .{ .name = "missing", .args = "" },
+            .{ .name = "scalar-singleton", .args = "1" },
+            .{ .name = "bool", .args = "true,false" },
+            .{ .name = "string", .args = "\"a\",\"b\"" },
+            .{ .name = "rune", .args = "'a','b'" },
+            .{ .name = "integer-width", .args = "@as(i8,1),@as(i16,2)" },
+            .{ .name = "integer-signedness", .args = "@as(i8,1),@as(u8,2)" },
+            .{ .name = "float-width", .args = "@as(f32,1.0),@as(f64,2.0)" },
+            .{ .name = "integer-float", .args = "@as(int,1),@as(f64,2.0)" },
+            .{ .name = "literal-overflow", .args = "@as(i8,1),128" },
+            .{ .name = "multiple-arrays", .args = "[1],[2]" },
+            .{ .name = "array-and-scalar", .args = "[1],2" },
+            .{ .name = "bool-array", .args = "@as([]bool,[])" },
+            .{ .name = "rune-array", .args = "['a','b']" },
+            .{ .name = "nested-array", .args = "[[1],[2]]" },
+            .{ .name = "private-order", .args = "models.Private.[n=1],models.Private.[n=2]" },
+            .{ .name = "mixed-only-order", .args = "models.Mixed.[n=1],models.Mixed.[n=2]" },
+            .{ .name = "no-order", .args = "models.Unordered.[n=1],models.Unordered.[n=2]" },
+            .{ .name = "nominal-mismatch", .args = "models.Ordered.[n=1],models.Box(int).[n=2]" },
+        }) |case| {
+            const path = b.fmt("bad-{s}-{s}.nov", .{ builtin_name, case.name });
+            _ = fixtures.add(path, b.fmt("let models=@import(\"models.nov\")\nlet main:()={{let value=@{s}({s})\n}}\n", .{ builtin_name, case.args }));
+            for ([_]bool{ false, true }) |emit| {
+                const reject = b.addRunArtifact(exe);
+                reject.step.name = b.fmt("CLI extrema: reject {s} ({s})", .{ path, if (emit) "emit-c" else "check" });
+                reject.setCwd(fixtures.getDirectory());
+                reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+                reject.addArg("--lib-dir");
+                reject.addDirectoryArg(library);
+                reject.expectExitCode(1);
+                reject.expectStdOutEqual("");
+                reject.expectStdErrMatch("error:");
+                test_step.dependOn(&reject.step);
+            }
+        }
+        const path = b.fmt("empty-{s}.nov", .{builtin_name});
+        _ = fixtures.add(path, b.fmt("let verify:()={{let items:[]int=[]\nlet value=@{s}(items)\n@println(\"unreachable\",value)\n}}\n@[test]\nlet empty_array:()=verify()\nlet main:()=verify()\n", .{builtin_name}));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI extrema: {s} {s} {s}", .{ command, path, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, path, "--lib-dir" });
+                run.addDirectoryArg(library);
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "FAIL empty_array (exit 1)\n0 passed; 1 failed; 1 total\n" else "");
+                run.expectStdErrEqual(b.fmt("panic: @{s} requires a nonempty array\n", .{builtin_name}));
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_][]const u8{
+        "let main:()={let mut n=0\nlet value=@min(&n,&n)\n}",
+        "let f:()->int=0\nlet main:()={let value=@max(f,f)\n}",
+        "let S=struct{n:int,let lessThan:(a:S,b:S)->bool=a.n<b.n\n}\nlet main:()={let value=@min(S.[n=1],S.[n=2])\n}",
+        "let models=@import(\"models.nov\")\nlet value=@min(models.Ordered.[n=1],models.Ordered.[n=2])\nlet main:()={}",
+        "let noop:()={}\nlet mut callback:()->void=noop\nlet S=struct{n:int,\n@[operator(.less_than)]\nlet less:(a:S,b:S)->bool={callback()\na.n<b.n}\n}\nlet main:()={let mut items=[S.[n=7]]\ncallback=(){items=[]}\nlet reference=&items[0]\nlet old=@min(items)\n@println(reference.*)\n}",
+    }, 0..) |source, index| {
+        const path = b.fmt("bad-extrema-effects-{d}.nov", .{index});
         _ = fixtures.add(path, source);
         for ([_]bool{ false, true }) |emit| {
             const reject = b.addRunArtifact(exe);

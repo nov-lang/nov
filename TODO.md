@@ -60,6 +60,15 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`@min` / `@max` accept one `[]T` or at least two exact `T` values, returning `T`.
+Ordering uses builtin integers/floats or an accessible exact `(T,T)->bool`
+`@[operator(.less_than)]` nominal hook, not mixed-only hooks. Eager left-to-right
+snapshots precede comparisons; array input and managed results preserve ordinary
+copy independence. Stable left folds retain first ties/signed zero, retain leading
+NaN and ignore later NaNs. Empty typed arrays panic in every mode. Readonly
+`@TypeOf` validates without effects; globals allow known data but reject reached
+custom comparator calls. See `examples/extrema.nov` and `zig build test-cli-extrema`.
+
 `@default(T)`, argument-free `@[default]`, and `std.trivial.take` are delivered.
 Builtin defaults are `false`, numeric zero, NUL rune, empty string, exact empty
 arrays (no element-default requirement), and empty exclusive integer ranges

@@ -37,6 +37,157 @@ test "len builtin global known data folds Unicode scalars including NUL" {
     try std.testing.expectEqual(@as(usize, 2), lengths);
 }
 
+fn testExtremumGlobalData(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "global-extremum.nov",
+        \\let small:i16=@min(later,@as(i16,-7),@as(i16,4))
+        \\let large:u8=@max([@as(u8,2),@as(u8,255),@as(u8,9)])
+        \\let middle:u16=@min(@as(u16,9),@as(u16,3),@as(u16,7))
+        \\let zero:f32=@max(@as(f32,-0.0),@as(f32,0.0))
+        \\let single:i16=@min([later])
+        \\let later:i16=12
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for (result.ir.globals.items) |global| {
+        const body = result.ir.getFunction(global.initializer).?.body.?;
+        const instruction = body.instructions[@backingInt(body.result)];
+        try std.testing.expectEqual(global.ty, instruction.ty);
+        try std.testing.expect(instruction.op == .constant);
+        const value = result.ir.getConstant(instruction.op.constant).?.value;
+        if (std.mem.eql(u8, global.name, "small")) try std.testing.expectEqual(@as(i128, -7), value.signed_integer);
+        if (std.mem.eql(u8, global.name, "large")) try std.testing.expectEqual(@as(u128, 255), value.unsigned_integer);
+        if (std.mem.eql(u8, global.name, "middle")) try std.testing.expectEqual(@as(u128, 3), value.unsigned_integer);
+        if (std.mem.eql(u8, global.name, "zero")) try std.testing.expectEqual(@as(u64, 0x80000000), value.float_bits);
+        if (std.mem.eql(u8, global.name, "single")) try std.testing.expectEqual(@as(i128, 12), value.signed_integer);
+    }
+}
+
+test "extremum globals preserve scalar and array known data under OOM" {
+    try testExtremumGlobalData(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExtremumGlobalData, .{});
+}
+
+test "extremum global evaluator preserves NaN payloads and signed zero ties" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    for ([_]u16{ 32, 64 }) |bits| {
+        const ty = try ir.internType(.{ .float = bits });
+        const nan: u64 = if (bits == 32) 0x7fc00017 else 0x7ff8000000000017;
+        const negative_zero: u64 = if (bits == 32) 0x80000000 else 0x8000000000000000;
+        const one: u64 = if (bits == 32) 0x3f800000 else 0x3ff0000000000000;
+        for ([_][2]u64{ .{ nan, one }, .{ one, nan }, .{ negative_zero, 0 }, .{ 0, negative_zero } }) |pair| {
+            const data = [_]Data{ .{ .scalar = .{ .float_bits = pair[0] } }, .{ .scalar = .{ .float_bits = pair[1] } } };
+            const values = [_]Data{ data[0], data[1], .{ .aggregate = &data } };
+            const evaluator: Evaluator = .{ .allocator = std.testing.allocator, .ir = &ir, .globals = &.{}, .values = &values, .instructions = &.{} };
+            for ([_]bool{ false, true }) |maximum| {
+                for ([_]bool{ false, true }) |array| {
+                    const actual = try evaluator.evaluate(.{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .extremum = .{
+                        .maximum = maximum,
+                        .array = array,
+                        .args = if (array) &.{@fromBackingInt(2)} else &.{ @fromBackingInt(0), @fromBackingInt(1) },
+                    } } });
+                    try std.testing.expectEqual(pair[0], actual.scalar.float_bits);
+                }
+            }
+        }
+    }
+}
+
+test "extremum globals reject empty arrays runtime calls and reached factories" {
+    for ([_][]const u8{
+        "@min(@as([]int,[]))",
+        "@max(@as([]int,[]))",
+        "@min(f(),1)",
+        "@max([@default(S).value])",
+    }) |expression| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{
+            "let S=struct{value:int=0,\n@[default]\nlet make:()->S=S.[value=9]\n}\nlet f:()->int=1\nlet value=", expression,
+        });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "global-extremum-invalid.nov", source);
+        defer module.deinit();
+        try expectParsed(&module);
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
+test "extremum globals reject reached hooks without field fallback" {
+    for ([_][]const u8{ "@min(S.[value=1],S.[value=2])", "@max([S.[value=1],S.[value=2]])", "true and @min(S.[value=1],S.[value=2]).value==1" }) |expression| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{
+            "let S=struct{value:int,\n@[operator(.less_than)]\nlet before:(a:S,b:S)->bool=a.value<b.value\n}\nlet value=", expression,
+        });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "global-extremum-hook.nov", source);
+        defer module.deinit();
+        try expectParsed(&module);
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_global_initializer, module.diagnostics.items[0].tag);
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
+test "extremum globals skip unreachable hooks and singleton comparisons" {
+    var module = try Module.init(std.testing.allocator, "global-extremum-hook-skip.nov",
+        \\let S=struct{value:int,
+        \\@[operator(.less_than)]
+        \\let before:(a:S,b:S)->bool=a.value<b.value
+        \\}
+        \\let single=@min([S.[value=7]]).value
+        \\let no=false and @min(S.[value=1],S.[value=2]).value==1
+        \\let yes=true or @max([S.[value=1],S.[value=2]]).value==2
+        \\let Alias=@TypeOf(@min(S.[value=1],S.[value=2]))
+        \\let value:Alias=S.[value=3]
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for (result.ir.globals.items) |global| {
+        if (!std.mem.eql(u8, global.name, "single")) continue;
+        const body = result.ir.getFunction(global.initializer).?.body.?;
+        const instruction = body.instructions[@backingInt(body.result)];
+        try std.testing.expect(instruction.op == .constant);
+        try std.testing.expectEqual(@as(i128, 7), result.ir.getConstant(instruction.op.constant).?.value.signed_integer);
+    }
+}
+
+test "extremum globals isolate queries and skip unreachable factories" {
+    var module = try Module.init(std.testing.allocator, "global-extremum-query.nov",
+        \\let S=struct{value:int=0,
+        \\@[default]
+        \\let make:()->S=S.[value=9]
+        \\}
+        \\let Alias=@TypeOf(@min(@default(S).value,1))
+        \\let no=false and @min(@default(S).value,1)==1
+        \\let yes=true or @max(@default(S).value,1)==1
+        \\let value:Alias=3
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for (result.ir.functions.items) |function| try std.testing.expect(!std.mem.eql(u8, function.name, "make"));
+}
+
 fn testArrayConcatenationData(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "global-array-concat.nov",
         \\let rows=first+[[2]]
@@ -639,6 +790,7 @@ pub fn validateData(root: *Module, sema: *Sema) Sema.Error!void {
                     },
                     else => return err,
                 };
+                if (instruction.op == .extremum) sema.ir.allocator.free(instruction.op.extremum.args);
                 instruction.op = .{ .constant = constant };
             }
         }
@@ -834,6 +986,28 @@ const Evaluator = struct {
                 }
                 break :blk .{ .boolean = false };
             },
+            .extremum => |extremum| {
+                var best: Data = undefined;
+                if (extremum.array) {
+                    if (extremum.args.len != 1) return error.InvalidData;
+                    const array = self.get(extremum.args[0]);
+                    if (array != .aggregate or array.aggregate.len == 0) return error.InvalidData;
+                    best = array.aggregate[0];
+                    for (array.aggregate[1..]) |candidate| {
+                        if (extremum.comparator != null) return error.InvalidData;
+                        if (try self.extremumLess(instruction.ty, if (extremum.maximum) best else candidate, if (extremum.maximum) candidate else best)) best = candidate;
+                    }
+                } else {
+                    if (extremum.args.len < 2) return error.InvalidData;
+                    best = self.get(extremum.args[0]);
+                    for (extremum.args[1..]) |id| {
+                        if (extremum.comparator != null) return error.InvalidData;
+                        const candidate = self.get(id);
+                        if (try self.extremumLess(instruction.ty, if (extremum.maximum) best else candidate, if (extremum.maximum) candidate else best)) best = candidate;
+                    }
+                }
+                return best;
+            },
             .short_circuit => |short| blk: {
                 const lhs = try self.scalar(short.lhs);
                 if (lhs != .boolean) return error.InvalidData;
@@ -847,6 +1021,29 @@ const Evaluator = struct {
             else => return error.InvalidData,
         };
         return .{ .scalar = value };
+    }
+
+    // Compare without rebuilding the selected value: ties, NaNs and signed
+    // zeros retain the first candidate's exact representation.
+    fn extremumLess(self: Evaluator, id: Ir.TypeId, lhs: Data, rhs: Data) error{InvalidData}!bool {
+        if (lhs != .scalar or rhs != .scalar) return error.InvalidData;
+        const ty = self.ir.getType(id) orelse return error.InvalidData;
+        switch (ty) {
+            .integer, .rune => return try integer(lhs.scalar) < try integer(rhs.scalar),
+            .float => |bits| {
+                if (lhs.scalar != .float_bits or rhs.scalar != .float_bits) return error.InvalidData;
+                if (bits == 32) {
+                    const a: f32 = @bitCast(@as(u32, @intCast(lhs.scalar.float_bits)));
+                    const b: f32 = @bitCast(@as(u32, @intCast(rhs.scalar.float_bits)));
+                    return a < b;
+                }
+                if (bits != 64) return error.InvalidData;
+                const a: f64 = @bitCast(lhs.scalar.float_bits);
+                const b: f64 = @bitCast(rhs.scalar.float_bits);
+                return a < b;
+            },
+            else => return error.InvalidData,
+        }
     }
 
     fn dataEqual(self: Evaluator, id: Ir.TypeId, lhs: Data, rhs: Data) (std.mem.Allocator.Error || error{InvalidData})!bool {

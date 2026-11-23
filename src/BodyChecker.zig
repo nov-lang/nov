@@ -529,6 +529,11 @@ pub const QueryValidation = struct {
         return try context.defaultPlan(node, ty) != null;
     }
 
+    pub fn ordered(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
+        return context.ordered(node, ty);
+    }
+
     pub fn comparable(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
         var visited: Context.PrintableTypes = .empty;
@@ -3312,6 +3317,76 @@ const Context = struct {
             std.mem.eql(u8, ast.tokenSlice(ast.firstToken(node)), "@clear");
     }
 
+    fn extremum(self: *Context, node: Ast.Node.Index) ?bool {
+        const ast = &self.module.source.ast;
+        if (ast.nodes.items(.tag)[node] != .builtin_literal) return null;
+        const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
+        if (std.mem.eql(u8, name, "@min")) return false;
+        if (std.mem.eql(u8, name, "@max")) return true;
+        return null;
+    }
+
+    fn ordered(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        switch (self.ir.getType(ty).?) {
+            .integer, .float => return true,
+            else => return try self.checkOperator(node, ty, .less_than) != null,
+        }
+    }
+
+    fn probeExtremum(self: *Context, args: []const Ast.Node.Index, depth: usize) Error!?Known {
+        if (args.len == 0) return null;
+        if (args.len == 1) {
+            const known = (try self.probe(args[0], depth + 1)) orelse return null;
+            const ty = self.ir.getType(known.ty).?;
+            return if (ty == .array) .{ .ty = ty.array } else null;
+        }
+        // Search every exact sibling before allowing any soft numeric defaults.
+        const defaulting = self.defaulting;
+        self.defaulting = false;
+        defer self.defaulting = defaulting;
+        for (args) |arg| if (try self.probe(arg, depth + 1)) |known| return known;
+        if (defaulting) {
+            self.defaulting = true;
+            var fallback: ?Known = null;
+            for (args) |arg| if (try self.probe(arg, depth + 1)) |known| {
+                if (self.hasFloatDefault(known.ty, depth + 1)) return known;
+                if (fallback == null) fallback = known;
+            };
+            return fallback;
+        }
+        return null;
+    }
+
+    fn extremumExpression(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, maximum: bool, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const args = call.ast.args;
+        if (args.len == 0) return self.fail(.argument_count_mismatch, node, null);
+        const candidate = (try self.probeExtremum(args, depth)) orelse expected orelse (try self.probeDefault(node, depth)) orelse return self.fail(.literal_needs_type, node, null);
+        const array = args.len == 1;
+        const argument: Known = if (array) .{ .ty = try self.ir.internType(.{ .array = candidate.ty }) } else candidate;
+        const scalar = self.ir.getType(candidate.ty).?;
+        const hook = switch (scalar) {
+            .integer, .float => null,
+            else => (try self.checkOperator(node, candidate.ty, .less_than)) orelse return null,
+        };
+        for (args) |arg| {
+            if (try self.expression(arg, argument, depth + 1) == null) return null;
+            if (self.terminated) return if (expected) |want| want.ty else candidate.ty;
+            try self.copyNode(arg, argument.ty);
+        }
+        if (hook != null and !try self.checkCallEffects(node)) return null;
+        if (self.emitter) |emitter| {
+            const values = try emitter.allocator.alloc(Ir.ValueId, args.len);
+            for (args, values) |arg, *value| value.* = try emitter.value(arg);
+            try emitter.record(node, candidate.ty, self.irSpan(node), .{ .extremum = .{
+                .maximum = maximum,
+                .array = array,
+                .args = values,
+                .comparator = if (hook) |selected| emitter.functions[@backingInt(selected.method)] orelse return error.InvalidFunctionId else null,
+            } });
+        }
+        return self.fit(candidate.ty, expected, node);
+    }
+
     fn isLen(self: *Context, node: Ast.Node.Index) bool {
         const ast = &self.module.source.ast;
         return ast.nodes.items(.tag)[node] == .builtin_literal and
@@ -3618,6 +3693,7 @@ const Context = struct {
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
                     break :blk if (try self.resolveType(call.ast.args[0])) |ty| .{ .ty = ty } else null;
                 }
+                if (self.extremum(call.ast.fn_expr) != null) break :blk try self.probeExtremum(call.ast.args, depth);
                 if (self.isClear(call.ast.fn_expr)) break :blk .{ .ty = try self.ir.internType(.void) };
                 if (self.isLen(call.ast.fn_expr)) {
                     if (call.ast.args.len != 1) break :blk null;
@@ -5782,6 +5858,7 @@ const Context = struct {
                     }
                     return self.fit(unit, expected, node);
                 }
+                if (self.extremum(call.ast.fn_expr)) |maximum| return self.extremumExpression(node, call, maximum, expected, depth);
                 if (self.isClear(call.ast.fn_expr)) {
                     if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
                     return self.clearArray(node, call.ast.args[0], expected, depth);
@@ -5939,6 +6016,77 @@ const Context = struct {
         }
     }
 };
+
+fn testExtremumFrontend(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "extremum.nov",
+        \\let R=struct{n:int,@[operator(.less_than)]
+        \\let before:(a:R,b:R)->bool=a.n<b.n
+        \\}
+        \\let value:(n:int)->R=R.[n=n]
+        \\let small:()->i8=@min(1,2)
+        \\let empty:()->int=@max([])
+        \\let main:()={
+        \\let a=@min(3,1,2)
+        \\let b=@max(1,2.5)
+        \\let c=@min([3,1])
+        \\let d=@min(value(2),value(1),value(3))
+        \\let e=@max([value(2),value(1)])
+        \\let q:@TypeOf(@min(@as([]int,[])))=a
+        \\let r:@TypeOf(@max(value(1),value(2)))=d
+        \\@print(a,b,c,d,e,q,r,small())
+        \\}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) for (module.diagnostics.items) |diagnostic| std.debug.print("extremum: {any} at {s}\n", .{ diagnostic.tag, module.sourceSlice(diagnostic.span).? });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var count: usize = 0;
+    var custom: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions, 0..) |instruction, index| {
+            if (instruction.op != .extremum) continue;
+            const operation = instruction.op.extremum;
+            count += 1;
+            if (operation.comparator != null) custom += 1;
+            try std.testing.expectEqual(operation.array, operation.args.len == 1);
+            for (operation.args) |arg| try std.testing.expect(@backingInt(arg) < index);
+            if (!operation.array) for (operation.args[1..], operation.args[0 .. operation.args.len - 1]) |later, earlier| {
+                try std.testing.expect(@backingInt(earlier) < @backingInt(later));
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 7), count);
+    try std.testing.expectEqual(@as(usize, 2), custom);
+}
+
+test "extremum frontend exact inference snapshots queries and lowering under OOM" {
+    try testExtremumFrontend(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExtremumFrontend, .{});
+}
+
+test "extremum frontend rejects arity inexact operands and unavailable self order" {
+    for ([_][]const u8{
+        "@min()",                     "@max(1)",             "@min(true,false)",      "@max(\"a\",\"b\")",
+        "@min(@as(i8,1),@as(i16,2))", "@max([1],[2])",       "@min(R.[n=1],R.[n=2])", "@min(M.[n=1],M.[n=2])",
+        "@min(@as([]bool,[]))",       "@min(@as(i8,1),128)",
+    }) |expression_source| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=struct{{n:int,let less_than:(a:R,b:R)->bool=true\n}}\n" ++
+            "let M=struct{{n:int,@[operator(.less_than)]\nlet mixed:(a:M,b:int)->bool=true\n}}\n" ++
+            "let main:()={{let x={s}\n}}", .{expression_source});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "extremum-invalid.nov", source);
+        defer module.deinit();
+        if (module.hasErrors()) std.debug.print("invalid extremum fixture {s}: parse={any}, diagnostics={any}\n", .{ source, module.source.ast.errors, module.diagnostics.items });
+        try std.testing.expect(!module.hasErrors());
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+    }
+}
 
 test "default frontend emits approved primitive array range and declared field values" {
     var module = try Module.init(std.testing.allocator, "default-values.nov",

@@ -258,7 +258,7 @@ fn checkSupported(ast: Ast) !void {
             },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@len") and !std.mem.eql(u8, name, "@clear") and !std.mem.eql(u8, name, "@stringToBytes") and !std.mem.eql(u8, name, "@stringFromBytes") and !std.mem.eql(u8, name, "@import") and !std.mem.eql(u8, name, "@default"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@len") and !std.mem.eql(u8, name, "@clear") and !std.mem.eql(u8, name, "@stringToBytes") and !std.mem.eql(u8, name, "@stringFromBytes") and !std.mem.eql(u8, name, "@import") and !std.mem.eql(u8, name, "@default") and !std.mem.eql(u8, name, "@min") and !std.mem.eql(u8, name, "@max"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -450,6 +450,15 @@ test "match bracket captures preserve comments and reject removed syntax" {
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
     try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, "let f=match u{.ok=>|value|value\n_=>0}"));
+}
+
+test "min max builtin forms and comments format idempotently under OOM" {
+    try expectFormatted("let value=@max(1,2,3)\nlet other=@min([3,1,2])", "let value = @max(1, 2, 3)\nlet other = @min([3, 1, 2])\n");
+    const source = "let f:(items:[]`T)->`T=@min(items)\nlet value=@max(\n1, ; first\n2,\n3,\n)\nlet query:@TypeOf(@min(@as([]u8,[])))=0";
+    const rendered = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(rendered);
+    try expectFormatted(source, rendered);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
 test "test attributes and assert arguments format and survive OOM" {

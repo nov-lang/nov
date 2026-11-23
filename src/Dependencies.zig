@@ -158,7 +158,9 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
                     try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_global_initializer, .span = span });
                     entry.state = .failed;
                 } else if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
-                    std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@len"))
+                    (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@len") or
+                        std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@min") or
+                        std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@max")))
                 {
                     try work.appendSlice(self.allocator, call.ast.args);
                 } else {
@@ -279,6 +281,32 @@ fn resolveGraph(self: *Dependencies, module: *Module) std.mem.Allocator.Error!vo
                 .resolved => {},
             }
         }
+    }
+}
+
+test "extremum dependencies scan every runtime argument including malformed calls" {
+    const source = "let low=@min(first,second)\nlet high=@max(items)\nlet first=1\nlet second=2\nlet items=[first,second]";
+    var module = try Module.init(std.testing.allocator, "extremum-dependencies.nov", source);
+    defer module.deinit();
+    var result = try analyze(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expectEqual(@as(usize, 2), result.getEdges(module.lookup("low").?).?.len);
+    try std.testing.expectEqual(@as(usize, 1), result.getEdges(module.lookup("high").?).?.len);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    for ([_][]const u8{
+        "let x=@min(x,1)",
+        "let x=@max(1,x)",
+        "let x=@min(missing)",
+        "let x=@max(1,2,missing)",
+        "let x=@min(f(),1)\nlet f:()->int=1",
+    }) |invalid_source| {
+        var invalid = try Module.init(std.testing.allocator, "invalid-extremum-dependencies.nov", invalid_source);
+        defer invalid.deinit();
+        var rejected = try analyze(&invalid);
+        defer rejected.deinit();
+        try std.testing.expect(invalid.hasErrors());
+        try std.testing.expectEqual(State.failed, rejected.entries[0].state);
     }
 }
 
