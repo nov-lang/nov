@@ -112,15 +112,9 @@ let nested_strings_and_arrays_of_unions: () = {
 let closure_snapshots_and_shared_cells: () = {
     let mut current: Option([]int) = .some[[1]]
     let saved = current
-    let snapshot = () -> Option([]int) {
-        saved
-    }
-    let update = () {
-        current = advance(current)
-    }
-    let read = () -> int {
-        current.unwrapOr([])[0]
-    }
+    let snapshot = () -> Option([]int) { saved }
+    let update = () { current = advance(current) }
+    let read = () -> int { current.unwrapOr([])[0] }
     update()
     update()
     @assert(read() == 3)
@@ -140,9 +134,7 @@ let closure_snapshots_and_shared_cells: () = {
     let mut first = functions.unwrapOr([])
     let second = copied.unwrapOr([])
     @assert(first[0]() == 1 and second[0]() == 2 and count == 2)
-    first[0] = () -> int {
-        99
-    }
+    first[0] = () -> int { 99 }
     @assert(first[0]() == 99 and second[0]() == 3)
 }
 
@@ -151,39 +143,29 @@ let mapping_and_finding_arrays: () = {
     let some: Option(int) = .some[7]
     let none: Option(int) = .none[]
     let mapped: Option([]int) = some.map(
-        (value) {
-            [value, value + 1]
-        }
+        (value) { [value, value + 1] }
     )
     @assert(mapped.unwrapOr([])[1] == 8)
     @assert(
         none.map(
-            (value) -> []int {
-                @panic("none must skip array callback")
-            }
+            (value) -> []int { @panic("none must skip array callback") }
         ).isNone()
     )
     let good: Result(int, []str) = .ok[4]
     let bad: Result(int, []str) = .err[["missing"]]
     let result: Result([]int, []str) = good.map(
-        (value) {
-            [value]
-        }
+        (value) { [value] }
     )
     @assert(result.unwrapOr([])[0] == 4)
     @assert(
         bad.map(
-            (value) -> []int {
-                @panic("error must skip array callback")
-            }
+            (value) -> []int { @panic("error must skip array callback") }
         ).isErr()
     )
     let mut rows: [][]int = [[1], [2, 3]]
     let found: Option([]int) = std.array.find(
         rows,
-        (row) {
-            @len(row) == 2
-        }
+        (row) { @len(row) == 2 }
     )
     rows[1] = [9]
     let mut detached = found.unwrapOr([])
@@ -191,9 +173,7 @@ let mapping_and_finding_arrays: () = {
     @assert(found.unwrapOr([])[0] == 2)
     let missing = std.array.find(
         rows,
-        (row) {
-            @len(row) == 0
-        }
+        (row) { @len(row) == 0 }
     )
     @assert(missing.isNone())
 }
@@ -219,9 +199,7 @@ let inactive_payloads_and_storable_elements: () = {
     let wrapped = Option(@TypeOf(ranges)).some[ranges]
     let mut total = 0
     loop range in wrapped.unwrapOr([]) {
-        loop value in range {
-            total += value
-        }
+        loop value in range { total += value }
     }
     @assert(total == 9)
 }

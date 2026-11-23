@@ -1,9 +1,7 @@
 let std = @import("std")
 let abs = std.math.abs
 
-let main: () = {
-    @println("Absolute:", abs(-12))
-}
+let main: () = { @println("Absolute:", abs(-12)) }
 
 @[test]
 let exact_signed_numeric_types: () = {
@@ -67,9 +65,7 @@ let eager_once_only_arguments_and_pure_type_queries: () = {
     @assert(query == 3 and minimum == 4 and calls == 1)
     let stop = () -> int {
         abs(
-            {
-                return 9
-            }
+            { return 9 }
         )
     }
     @assert(stop() == 9)

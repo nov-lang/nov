@@ -25,18 +25,14 @@ let map_types_and_generic_callbacks: () = {
     )
     @assert(@len(labels) == 3 and labels[0] == "item 1" and labels[2] == "item 3")
     @assert(calls == 3)
-    let identity = (value: `T) -> `T {
-        value
-    }
+    let identity = (value: `T) -> `T { value }
     let local: (value: `U) -> `U = value
     let numbers = std.array.map(items, identity)
     let words = std.array.map(labels, local)
     @assert(numbers[1] == 2 and words[1] == "item 2")
     let booleans = std.array.map(
         [true, false],
-        (value: `V) -> `V {
-            value
-        }
+        (value: `V) -> `V { value }
     )
     @assert(booleans[0] and booleans[1] == false)
     let empty: []int = []
@@ -97,9 +93,7 @@ let fold_left_seed_and_empty: () = {
     let text = std.array.fold(
         @as([]int, [1, 2, 3]),
         "seed",
-        (total: str, value: int) -> str {
-            "({total}-{value})"
-        }
+        (total: str, value: int) -> str { "({total}-{value})" }
     )
     @assert(text == "(((seed-1)-2)-3)")
 }
@@ -111,9 +105,7 @@ let recursive_array_record_and_union_copies: () = {
     let mut mapped = std.array.map(source, identity)
     let selected = std.array.filter(
         source,
-        (value: Row) -> bool {
-            true
-        }
+        (value: Row) -> bool { true }
     )
     let seed: []Row = []
     let mut folded = std.array.fold(
@@ -143,9 +135,7 @@ let recursive_array_record_and_union_copies: () = {
     let mut unions = std.array.map(payloads, identity)
     let kept = std.array.filter(
         unions,
-        (value: Payload) -> bool {
-            true
-        }
+        (value: Payload) -> bool { true }
     )
     unions[0] = .none[]
     @assert(
@@ -174,16 +164,12 @@ let function_elements_share_environments: () = {
     let mapped = std.array.map(functions, identity)
     let selected = std.array.filter(
         mapped,
-        (value: () -> int) -> bool {
-            true
-        }
+        (value: () -> int) -> bool { true }
     )
     let folded = std.array.fold(
         selected,
         next,
-        (previous: () -> int, current: () -> int) -> () -> int {
-            current
-        }
+        (previous: () -> int, current: () -> int) -> () -> int { current }
     )
     @assert(count == 0)
     @assert(functions[0]() == 1 and mapped[1]() == 2)
@@ -246,22 +232,16 @@ let main: () = {
     let numbers: []int = [1, 2, 3, 4]
     let doubled = std.array.map(
         numbers,
-        (value: int) -> int {
-            value * 2
-        }
+        (value: int) -> int { value * 2 }
     )
     let selected = std.array.filter(
         doubled,
-        (value: int) -> bool {
-            value > 4
-        }
+        (value: int) -> bool { value > 4 }
     )
     let total = std.array.fold(
         selected,
         @as(int, 0),
-        (sum: int, value: int) -> int {
-            sum + value
-        }
+        (sum: int, value: int) -> int { sum + value }
     )
     @println("Numbers:", numbers)
     @println("Mapped:", doubled)

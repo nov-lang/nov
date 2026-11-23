@@ -4,9 +4,7 @@
 
 ; let makeAdder: (base: int) -> (int) -> int = (value: int) -> int { base + value }
 let makeAdder = (base: int) -> (int) -> int {
-    (value: int) -> int {
-        base + value
-    }
+    (value: int) -> int { base + value }
 }
 
 let makeCounter = () -> () -> uint {
@@ -23,9 +21,7 @@ let Box: (T: type) -> type = struct {
     let Self = @This()
 
     let bind = (self: Self) -> () -> T {
-        () -> T {
-            self.value
-        }
+        () -> T { self.value }
     }
 }
 
@@ -37,12 +33,8 @@ let main = () {
     @println("Shared counter:", next(), sameCounter(), next())
     let mut count: uint = 1
     let saved = count
-    let snapshot = () -> uint {
-        saved
-    }
-    let increment = () {
-        count += 1
-    }
+    let snapshot = () -> uint { saved }
+    let increment = () { count += 1 }
     increment()
     @println("Snapshot:", snapshot(), "Current:", count)
 }
@@ -65,9 +57,7 @@ let shared_counter = () {
 @[test]
 let outer_updates = () {
     let mut count: uint = 0
-    let increment = () {
-        count += 1
-    }
+    let increment = () { count += 1 }
     increment()
     @assert(count == 1)
     count = 10
@@ -79,12 +69,8 @@ let outer_updates = () {
 let array_copies = () {
     let mut items: []int = [1]
     let saved = items
-    let snapshot = () -> int {
-        saved[0]
-    }
-    let update = () {
-        items[0] += 1
-    }
+    let snapshot = () -> int { saved[0] }
+    let update = () { items[0] += 1 }
     update()
     @assert(items[0] == 2)
     @assert(snapshot() == 1)
@@ -105,9 +91,7 @@ let generic_method = () {
 let nested_capture = () {
     let label = "hello" + "!"
     let factory = () -> () -> str {
-        () -> str {
-            label
-        }
+        () -> str { label }
     }
     let inner = factory()
     @assert(inner() == "hello!")

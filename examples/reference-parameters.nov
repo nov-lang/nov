@@ -6,9 +6,7 @@
 ; Even readonly simultaneous arguments require distinct possible owners.
 ; No returning, storing, capturing, copying or reborrowing references.
 
-let add: (p: &mut int, amount: int) = {
-    p.* += amount
-}
+let add: (p: &mut int, amount: int) = { p.* += amount }
 let sum: (a: &int, b: &int) -> int = a.* + b.*
 let swap: (a: &mut `T, b: &mut `T) = {
     let saved = a.*
@@ -26,14 +24,10 @@ let recurse: (p: &mut int, count: int) = {
 let apply: (f: (&mut int, int), p: &mut int, amount: int) = f(p, amount)
 let total: (values: &[]int) -> int = {
     let mut result: int = 0
-    loop value in values.* {
-        result += value
-    }
+    loop value in values.* { result += value }
     result
 }
-let append: (values: &mut []str, value: str) = {
-    values.* += [value]
-}
+let append: (values: &mut []str, value: str) = { values.* += [value] }
 let Record = struct {
     name: str,
     values: []str,
@@ -42,9 +36,7 @@ let update: (record: &mut Record) = {
     record.*.name += "!"
     record.*.values += ["new"]
 }
-let suffix: (text: &mut str, ending: str) = {
-    text.* += ending
-}
+let suffix: (text: &mut str, ending: str) = { text.* += ending }
 let Tools = struct {
     let exchange: (self: Tools, a: &mut `T, b: &mut `T) = swap(a, b)
 }
@@ -71,9 +63,7 @@ let mutation_readonly_and_direct_borrows: () = {
     let mut values: []int = [1, 2, 3]
     add(&values[-1], 5)
     @assert(total(&values) == 11)
-    loop &item in values {
-        add(item, 1)
-    }
+    loop &item in values { add(item, 1) }
     @assert(total(&values) == 14)
 }
 
@@ -99,9 +89,7 @@ let callbacks_closures_forwarding_recursion_and_pipes: () = {
     apply(callback, &value, 2)
     let amount: int = 3
     ; Capture only the amount, never the actual borrowed owner.
-    let closure = (p: &mut int, extra: int) {
-        add(p, amount + extra)
-    }
+    let closure = (p: &mut int, extra: int) { add(p, amount + extra) }
     apply(closure, &value, 1)
     forward(&value, 2)
     recurse(&value, 3)

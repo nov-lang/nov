@@ -2,11 +2,7 @@ let std = @import("std")
 let Option = std.Option
 
 let divide: (numerator: uint, denominator: uint) -> Option(uint) = {
-    if denominator == 0 {
-        .none[]
-    } else {
-        .some[numerator / denominator]
-    }
+    if denominator == 0 { .none[] } else { .some[numerator / denominator] }
 }
 
 let describeDivision: (numerator: uint, denominator: uint) -> Option(str) = {

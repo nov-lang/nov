@@ -239,6 +239,11 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             const block = ast.fullBlock(&buffer, node).?;
             if (block.ast.statements.len == 0 and !hasComment(ast, block.ast.lbrace, block.ast.rbrace)) {
                 try self.renderToken(block.ast.lbrace, .none);
+            } else if (block.ast.statements.len == 1 and self.inlineBlockExpression(block.ast.statements[0]) and
+                !hasComment(ast, block.ast.lbrace, block.ast.rbrace))
+            {
+                try self.renderToken(block.ast.lbrace, .space);
+                try self.renderExpression(block.ast.statements[0], .space);
             } else {
                 try ais.pushIndent(.normal);
                 try self.renderToken(block.ast.lbrace, .newline);
@@ -642,13 +647,28 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
     }
 }
 
+fn inlineBlockExpression(self: *Render, node: Ast.Node.Index) bool {
+    const ast = self.ast;
+    if (ast.nodes.items(.tag)[node] == .decl) return false;
+    const first = ast.firstToken(node);
+    const last = ast.lastToken(node);
+    if (!ast.tokensOnSameLine(first, last)) return false;
+    // Nested blocks and control flow have their own multiline layout. Keep
+    // their enclosing block expanded, even when its source happens to fit.
+    for (ast.tokens.items(.tag)[first .. last + 1]) |tag| switch (tag) {
+        .l_brace, .keyword_if, .keyword_loop, .keyword_match => return false,
+        else => {},
+    };
+    return true;
+}
+
 /// Preserve separators exactly, including trailing commas. Flattening all
 /// newlines can change expression continuation semantics.
 fn renderList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
     const ast = self.ast;
     const tags = ast.tokens.items(.tag);
-    // Blocks expand even when originally compact. Expand their enclosing list
-    // on the first pass as well, rather than changing layout on a second fmt.
+    // Nested blocks may expand even when originally compact. Keep enclosing
+    // lists multiline on the first pass too, preserving stable repeated formatting.
     const multiline = self.listIsMultiline(open, close);
     if (multiline) try self.ais.pushIndent(.normal);
     defer if (multiline) self.ais.popIndent();

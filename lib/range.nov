@@ -1,8 +1,6 @@
 @[public]
 let toArray: (range: ..`T) -> []`T = {
     let mut result: []`T = []
-    loop x in range {
-        result += [x]
-    }
+    loop x in range { result += [x] }
     result
 }

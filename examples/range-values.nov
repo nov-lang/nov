@@ -1,13 +1,9 @@
 let main: () = {
     let range = 0..10
-    loop i in range {
-        @print("{i} ")
-    }
+    loop i in range { @print("{i} ") }
     @println()
 
     let mut sum: uint = 0
-    loop i in range {
-        sum += i
-    }
+    loop i in range { sum += i }
     @println("Sum:", sum)
 }

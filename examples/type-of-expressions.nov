@@ -3,22 +3,16 @@
 
 let std = @import("std")
 
-let fail: () -> int = {
-    @panic("TypeOf operand executed")
-}
+let fail: () -> int = { @panic("TypeOf operand executed") }
 let identity: (value: `T) -> `T = value
 let result: () -> @TypeOf(1 + 2) = 7
-let update: (owner: &mut int, value: int) = {
-    owner.* += value
-}
+let update: (owner: &mut int, value: int) = { owner.* += value }
 
 let Record = struct {
     value: int = 0,
 
     @[stringify]
-    let format: (value: Record) -> str = {
-        @panic("TypeOf converter executed")
-    }
+    let format: (value: Record) -> str = { @panic("TypeOf converter executed") }
 }
 
 @[test]
@@ -49,11 +43,7 @@ let arrays_slices_blocks_if_and_match: () = {
         }
     ) = 6
     let branch: @TypeOf(
-        if true {
-            1
-        } else {
-            fail()
-        }
+        if true { 1 } else { fail() }
     ) = 7
     let matched: @TypeOf(
         match true {
@@ -100,12 +90,8 @@ let references_borrows_and_type_only_captures: () = {
     let mut other = 5
     let q = &other
     let callback: @TypeOf(
-        () -> int {
-            other
-        }
-    ) = () -> int {
-        6
-    }
+        () -> int { other }
+    ) = () -> int { 6 }
     q.* += 1
     @assert(q.* == 6 and callback() == 6)
     let mut reserved = 10
@@ -141,12 +127,8 @@ let closures_and_inferred_generic_calls: () = {
     ) = ["safe"]
     let generic: @TypeOf(identity(@as(u8, 1))) = 7
     let closure: @TypeOf(
-        (value: int) -> int {
-            value + 1
-        }
-    ) = (value) {
-        value + 2
-    }
+        (value: int) -> int { value + 1 }
+    ) = (value) { value + 2 }
     @assert(calls == 0 and items[0] == "safe" and generic == 7 and closure(3) == 5)
 }
 
@@ -161,9 +143,7 @@ let main: () = {
         @TypeOf(
             std.array.map(
                 [1, 2],
-                (item) {
-                    "{item}"
-                }
+                (item) { "{item}" }
             )
         )
     )

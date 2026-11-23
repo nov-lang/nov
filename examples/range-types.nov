@@ -25,9 +25,7 @@ let range_types_aliases_fields_and_callbacks: () = {
     @assert("{@TypeOf(bounds)}" == "..u8")
     @assert("{@TypeOf([bounds])}" == "[]..u8")
     let window = Window.[ bounds ]
-    let materialize = (range: ..u8) -> []u8 {
-        std.range.toArray(range)
-    }
+    let materialize = (range: ..u8) -> []u8 { std.range.toArray(range) }
     @assert(materialize(window.bounds) == @as([]u8, [0, 1, 2, 3]))
     let typed = @as(..u8, 1..3)
     @assert(std.range.toArray(typed) == @as([]u8, [1, 2]))
@@ -84,36 +82,16 @@ let evaluation_snapshots_queries_and_independent_outputs: () = {
     first[0] = 9
     @assert(first == [9] and second == [1])
     let grouped: @TypeOf(
-        {
-            0
-        }..{
-            2
-        }
-    ) = {
-        0
-    }..{
-        2
-    }
+        { 0 }..{ 2 }
+    ) = { 0 }..{ 2 }
     let values: @TypeOf(
         std.range.toArray(
-            {
-                0
-            }..{
-                2
-            }
+            { 0 }..{ 2 }
         )
     ) = std.range.toArray(grouped)
     @assert(values == @as([]uint, [0, 1]))
     let large: @TypeOf(
-        {
-            18446744073709551614
-        }..={
-            18446744073709551615
-        }
-    ) = {
-        18446744073709551614
-    }..={
-        18446744073709551615
-    }
+        { 18446744073709551614 }..={ 18446744073709551615 }
+    ) = { 18446744073709551614 }..={ 18446744073709551615 }
     @assert(@len(std.range.toArray(large)) == 2)
 }

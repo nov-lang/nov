@@ -14,37 +14,25 @@ let isValidUtf8: (bytes: []u8) -> bool = {
     let mut upper: u8 = 0xBF
     loop byte in bytes {
         if remaining != 0 {
-            if byte < lower or byte > upper {
-                return false
-            }
+            if byte < lower or byte > upper { return false }
             remaining -= 1
             lower = 0x80
             upper = 0xBF
         } else {
-            if byte <= 0x7F {
-                continue
-            }
-            if byte >= 0xC2 and byte <= 0xDF {
-                remaining = 1
-            } else if byte == 0xE0 {
+            if byte <= 0x7F { continue }
+            if byte >= 0xC2 and byte <= 0xDF { remaining = 1 } else if byte == 0xE0 {
                 remaining = 2
                 lower = 0xA0
             } else if byte == 0xED {
                 remaining = 2
                 upper = 0x9F
-            } else if byte >= 0xE1 and byte <= 0xEC or byte >= 0xEE and byte <= 0xEF {
-                remaining = 2
-            } else if byte == 0xF0 {
+            } else if byte >= 0xE1 and byte <= 0xEC or byte >= 0xEE and byte <= 0xEF { remaining = 2 } else if byte == 0xF0 {
                 remaining = 3
                 lower = 0x90
-            } else if byte >= 0xF1 and byte <= 0xF3 {
-                remaining = 3
-            } else if byte == 0xF4 {
+            } else if byte >= 0xF1 and byte <= 0xF3 { remaining = 3 } else if byte == 0xF4 {
                 remaining = 3
                 upper = 0x8F
-            } else {
-                return false
-            }
+            } else { return false }
         }
     }
     remaining == 0
@@ -52,9 +40,7 @@ let isValidUtf8: (bytes: []u8) -> bool = {
 
 @[public]
 let fromBytes: (bytes: []u8) -> std.Result(str, Utf8Error) = {
-    if isValidUtf8(bytes) == false {
-        return .err[ .invalidUtf8 ]
-    }
+    if isValidUtf8(bytes) == false { return .err[ .invalidUtf8 ] }
     .ok[@stringFromBytes(bytes)]
 }
 
@@ -77,9 +63,7 @@ let parseInt: (text: str) -> std.Result(int, ParseIntError) = {
                 negative = true
                 continue
             }
-            if scalar == '+' {
-                continue
-            }
+            if scalar == '+' { continue }
         }
         let digit: int = match scalar {
             '0' => 0
@@ -97,25 +81,15 @@ let parseInt: (text: str) -> std.Result(int, ParseIntError) = {
         hasDigits = true
         ; Negative accumulation includes int's minimum; Nov arithmetic wraps.
         let scaled = value * 10
-        if scaled / 10 != value {
-            return .err[ .overflow ]
-        }
+        if scaled / 10 != value { return .err[ .overflow ] }
         let next = scaled - digit
-        if next > scaled {
-            return .err[ .overflow ]
-        }
+        if next > scaled { return .err[ .overflow ] }
         value = next
     }
-    if hasDigits == false {
-        return .err[ .invalidInput ]
-    }
-    if negative {
-        return .ok[value]
-    }
+    if hasDigits == false { return .err[ .invalidInput ] }
+    if negative { return .ok[value] }
     let positive = -value
-    if positive < 0 {
-        return .err[ .overflow ]
-    }
+    if positive < 0 { return .err[ .overflow ] }
     .ok[positive]
 }
 
@@ -127,9 +101,7 @@ let parseUint: (text: str) -> std.Result(uint, ParseIntError) = {
     loop scalar in text {
         if first {
             first = false
-            if scalar == '+' {
-                continue
-            }
+            if scalar == '+' { continue }
         }
         let digit: uint = match scalar {
             '0' => 0
@@ -146,53 +118,37 @@ let parseUint: (text: str) -> std.Result(uint, ParseIntError) = {
         }
         hasDigits = true
         let available = ~@as(uint, 0) - digit
-        if value > available / 10 {
-            return .err[ .overflow ]
-        }
+        if value > available / 10 { return .err[ .overflow ] }
         value = value * 10 + digit
     }
-    if hasDigits == false {
-        return .err[ .invalidInput ]
-    }
+    if hasDigits == false { return .err[ .invalidInput ] }
     .ok[value]
 }
 
 @[public]
 let startsWith: (text: str, prefix: str) -> bool = {
-    if @len(prefix) > @len(text) {
-        return false
-    }
+    if @len(prefix) > @len(text) { return false }
     loop scalar, index in prefix, @as(int, 0).. {
-        if text[index] != scalar {
-            return false
-        }
+        if text[index] != scalar { return false }
     }
     true
 }
 
 @[public]
 let endsWith: (text: str, suffix: str) -> bool = {
-    if @len(suffix) > @len(text) {
-        return false
-    }
+    if @len(suffix) > @len(text) { return false }
     loop _, index in suffix, @as(int, 0).. {
         let offset = -1 - index
-        if text[offset] != suffix[offset] {
-            return false
-        }
+        if text[offset] != suffix[offset] { return false }
     }
     true
 }
 
 @[public]
 let find: (text: str, pattern: str) -> std.Option(uint) = {
-    if @len(pattern) == 0 {
-        return .some[0]
-    }
+    if @len(pattern) == 0 { return .some[0] }
     loop _, offset, index in text, @as(int, 0).., 0.. {
-        if startsWith(text[offset..], pattern) {
-            return .some[index]
-        }
+        if startsWith(text[offset..], pattern) { return .some[index] }
     }
     .none[]
 }
@@ -205,9 +161,7 @@ let join: (parts: []str, separator: str) -> str = {
     let mut result = ""
     let mut first = true
     loop part in parts {
-        if first == false {
-            result = result + separator
-        }
+        if first == false { result = result + separator }
         result = result + part
         first = false
     }
@@ -216,20 +170,14 @@ let join: (parts: []str, separator: str) -> str = {
 
 @[public]
 let split: (text: str, separator: str) -> []str = {
-    if @len(separator) == 0 {
-        return [text]
-    }
+    if @len(separator) == 0 { return [text] }
     ; String slices require native int bounds.
     let mut width: int = 0
-    loop _ in separator {
-        width += 1
-    }
+    loop _ in separator { width += 1 }
     let mut result: []str = []
     let mut start: int = 0
     loop _, index in text, @as(int, 0).. {
-        if index < start {
-            continue
-        }
+        if index < start { continue }
         if startsWith(text[index..], separator) {
             result += [text[start..index]]
             start = index + width
@@ -277,33 +225,23 @@ let trim: (text: str) -> str = {
     let mut leading = true
     loop scalar, index in text, @as(int, 0).. {
         if isWhiteSpace(scalar) {
-            if leading {
-                start = index + 1
-            }
+            if leading { start = index + 1 }
         } else {
             leading = false
             end = index + 1
         }
     }
-    if leading {
-        return text[start..]
-    }
+    if leading { return text[start..] }
     text[start..end]
 }
 
 @[public]
-let replace: (text: str, pattern: str, replacement: str) -> str = {
-    join(split(text, pattern), replacement)
-}
+let replace: (text: str, pattern: str, replacement: str) -> str = { join(split(text, pattern), replacement) }
 
 @[public]
 let repeat: (text: str, count: uint) -> str = {
-    if @len(text) == 0 {
-        return ""
-    }
+    if @len(text) == 0 { return "" }
     let mut result = ""
-    loop _ in 0..count {
-        result += text
-    }
+    loop _ in 0..count { result += text }
     result
 }

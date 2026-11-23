@@ -8,9 +8,7 @@ let MyType = struct {
 
     @[public]
     @[stringify]
-    let toString: (self: MyType) -> str = {
-        "x: {self.x}, y: {self.y}. z: {self.z}"
-    }
+    let toString: (self: MyType) -> str = { "x: {self.x}, y: {self.y}. z: {self.z}" }
 }
 
 let main: () = {

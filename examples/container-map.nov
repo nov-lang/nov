@@ -29,17 +29,13 @@ let option_variants_and_inferred_results: () = {
     )
     @assert(missing.isNone() and calls == 1)
     let defaulted = some.map(
-        (x) {
-            42
-        }
+        (x) { 42 }
     )
     let canonicalDefault: Option(int) = defaulted
     @assert(canonicalDefault.unwrapOr(0) == 42)
     let explicit = Option(int).map(
         some,
-        (x) -> i32 {
-            @as(i32, 9)
-        }
+        (x) -> i32 { @as(i32, 9) }
     )
     let canonicalExplicit: Option(i32) = explicit
     @assert(canonicalExplicit.unwrapOr(0) == 9)
@@ -89,29 +85,21 @@ let result_variants_and_shared_captures: () = {
     @assert(untouched.unwrapOr(0) == 3 and calls == 3)
     let text = Result(int, str).map(
         good,
-        (x) {
-            "ok:{x}"
-        }
+        (x) { "ok:{x}" }
     )
     @assert(text.unwrapOr("") == "ok:3")
     let defaulted = bad.mapErr(
-        (error) {
-            42
-        }
+        (error) { 42 }
     )
     let absent: Result(int, void) = .err[]
     let skipped: Result(str, void) = absent.map(
-        (value) -> str {
-            @panic("void error must skip conversion")
-        }
+        (value) -> str { @panic("void error must skip conversion") }
     )
     @assert(skipped.isErr())
     let present: Result(int, void) = .ok[3]
     @assert(
         present.map(
-            (value) {
-                value + 1
-            }
+            (value) { value + 1 }
         ).unwrapOr(0) == 4
     )
     let canonicalDefault: Result(int, int) = defaulted
@@ -189,24 +177,16 @@ let record_payloads_and_recursive_array_copies: () = {
     @assert(changed.unwrapOr(fallback).values[0][0] == 8)
     @assert(some.unwrapOr(fallback).values[0][0] == 1)
     let mapped = good.map(
-        (value) {
-            value
-        }
+        (value) { value }
     )
     let propagated = good.mapErr(
-        (error) {
-            "unused"
-        }
+        (error) { "unused" }
     )
     let mappedError = bad.mapErr(
-        (error) {
-            error
-        }
+        (error) { error }
     )
     let propagatedError = bad.map(
-        (value) {
-            "unused"
-        }
+        (value) { "unused" }
     )
     let mut copy = mapped.unwrapOr(fallback)
     copy.values[0] = [7]
@@ -239,23 +219,17 @@ let inactive_callbacks_and_chained_maps: () = {
     let bad: Result(int, str) = .err["bad"]
     @assert(
         none.map(
-            (x) -> int {
-                @panic("none callback")
-            }
+            (x) -> int { @panic("none callback") }
         ).isNone()
     )
     @assert(
         bad.map(
-            (x) -> int {
-                @panic("error callback")
-            }
+            (x) -> int { @panic("error callback") }
         ).isErr()
     )
     @assert(
         good.mapErr(
-            (error) -> int {
-                @panic("success callback")
-            }
+            (error) -> int { @panic("success callback") }
         ).unwrapOr(0) == 5
     )
     let mut calls = 0
@@ -301,11 +275,7 @@ let chained_container_operations: () = {
     let absent: Option(int) = .none[]
     let next = (value: int) -> Option(str) {
         calls += 1
-        if value > 0 {
-            .some["value:{value}"]
-        } else {
-            .none[]
-        }
+        if value > 0 { .some["value:{value}"] } else { .none[] }
     }
     @assert(present.andThen(next).unwrapOr("") == "value:2")
     @assert(absent.andThen(next).isNone() and calls == 1)
@@ -316,11 +286,7 @@ let chained_container_operations: () = {
     let bad: Result(int, str) = .err["original"]
     let step = (value: int) -> Result(str, str) {
         calls += 1
-        if value > 0 {
-            .ok["value:{value}"]
-        } else {
-            .err["nonpositive"]
-        }
+        if value > 0 { .ok["value:{value}"] } else { .err["nonpositive"] }
     }
     @assert(good.andThen(step).unwrapOr("") == "value:2")
     let original = bad.andThen(step)
@@ -350,9 +316,7 @@ let chained_container_operations: () = {
     @assert(checked.isSome())
     let voidError: Result(int, void) = .err[]
     let skipped: Result(void, void) = voidError.andThen(
-        (value) -> Result(void, void) {
-            @panic("failed result must skip next operation")
-        }
+        (value) -> Result(void, void) { @panic("failed result must skip next operation") }
     )
     @assert(skipped.isErr())
     let finished: Result(void, str) = good.andThen(
@@ -370,17 +334,13 @@ let chained_container_operations: () = {
     }
     let callback = () -> (int) -> Option(int) {
         events = events * 10 + 2
-        (value) -> Option(int) {
-            @panic("none must skip next operation")
-        }
+        (value) -> Option(int) { @panic("none must skip next operation") }
     }
     @assert(receiver().andThen(callback()).isNone() and events == 12)
 
     let source: Option(Row) = .some[Row.[ values = [[1]] ]]
     let snapshot = source.andThen(
-        (row) {
-            Option(Row).some[row]
-        }
+        (row) { Option(Row).some[row] }
     )
     let mut copy = snapshot.unwrapOr(Row.[ values = [] ])
     copy.values = [[9]]
@@ -396,31 +356,23 @@ let main: () = {
     @println(
         "Option:",
         some.map(
-            (x) {
-                x * 2
-            }
+            (x) { x * 2 }
         ).unwrapOr(0)
     )
     @println(
         "None:",
         none.map(
-            (x) {
-                x * 2
-            }
+            (x) { x * 2 }
         ).isNone()
     )
     @println(
         "Result:",
         good.map(
-            (x) {
-                "value:{x}"
-            }
+            (x) { "value:{x}" }
         ).unwrapOr("")
     )
     let error = bad.mapErr(
-        (message) {
-            "error:{message}"
-        }
+        (message) { "error:{message}" }
     )
     @println(
         match error {

@@ -10,16 +10,12 @@ let choose: (flag: bool) -> int = {
     let mut a: int = 1
     let mut b: int = 10
     let mut p = &a
-    if flag {
-        p = &b
-    }
+    if flag { p = &b }
     p.* += 2
     p.*
 }
 
-let main: () = {
-    @println("Chosen:", choose(false), choose(true))
-}
+let main: () = { @println("Chosen:", choose(false), choose(true)) }
 
 @[test]
 let branches_match_and_block: () = {
@@ -28,36 +24,18 @@ let branches_match_and_block: () = {
         let mut a: int = 1
         let mut b: int = 10
         let mut p = &a
-        if flag {
-            p = &b
-        } else {
-            p = &a
-        }
+        if flag { p = &b } else { p = &a }
         @assert(
-            p.* == if flag {
-                10
-            } else {
-                1
-            }
+            p.* == if flag { 10 } else { 1 }
         )
         match flag {
-            true => {
-                p = &a
-            }
-            false => {
-                p = &b
-            }
+            true => { p = &a }
+            false => { p = &b }
         }
         @assert(
-            p.* == if flag {
-                1
-            } else {
-                10
-            }
+            p.* == if flag { 1 } else { 10 }
         )
-        {
-            p = &b
-        }
+        { p = &b }
         ; The unconditional rebind kills all previous possible targets.
         a += 1
         p.* += 2
@@ -74,11 +52,7 @@ let branches_match_and_block: () = {
         a += 1
         @assert(p.* == 12)
         @assert(
-            a == if flag {
-                4
-            } else {
-                5
-            }
+            a == if flag { 4 } else { 5 }
         )
         ; A reference declared inside a block may select an outer owner.
         {
@@ -102,11 +76,7 @@ let short_circuit_selection: () = {
         }
         @assert(both == flag)
         @assert(
-            p.* == if flag {
-                10
-            } else {
-                1
-            }
+            p.* == if flag { 10 } else { 1 }
         )
         p = &a
         let either = flag or {
@@ -115,11 +85,7 @@ let short_circuit_selection: () = {
         }
         @assert(either == flag)
         @assert(
-            p.* == if flag {
-                1
-            } else {
-                10
-            }
+            p.* == if flag { 1 } else { 10 }
         )
     }
 }
@@ -135,23 +101,13 @@ let zero_one_many_iterations: () = {
             p.* += 1
         }
         @assert(
-            p.* == if count == 0 {
-                1
-            } else {
-                10 + count
-            }
+            p.* == if count == 0 { 1 } else { 10 + count }
         )
         p = &a
         let mut i: int = 0
-        loop i < count : i += 1 {
-            p = &b
-        }
+        loop i < count : i += 1 { p = &b }
         @assert(
-            p.* == if count == 0 {
-                1
-            } else {
-                10 + count
-            }
+            p.* == if count == 0 { 1 } else { 10 + count }
         )
     }
 }
@@ -181,21 +137,11 @@ let condition_continuation_and_exhaustion: () = {
         loop i < count : {
             p = &b
             i += 1
-        } {
-            continue
-        }
+        } { continue }
         @assert(
-            p.* == if count == 0 {
-                1
-            } else {
-                10
-            }
+            p.* == if count == 0 { 1 } else { 10 }
         )
-        loop false {
-            p = &a
-        } else {
-            p = &c
-        }
+        loop false { p = &a } else { p = &c }
         @assert(p.* == 100)
     }
 }
@@ -214,15 +160,9 @@ let break_and_continue_paths: () = {
             }
             p = &a
             continue
-        } else {
-            p = &a
-        }
+        } else { p = &a }
         @assert(
-            p.* == if flag {
-                10
-            } else {
-                1
-            }
+            p.* == if flag { 10 } else { 1 }
         )
     }
 }
@@ -233,23 +173,15 @@ let readonly_targets: () = {
     let b: u8 = 7
     loop flag in [false, true] {
         let mut view: &u8 = &a
-        if flag {
-            view = &b
-        }
+        if flag { view = &b }
         @assert(
-            view.* == if flag {
-                7
-            } else {
-                3
-            }
+            view.* == if flag { 7 } else { 3 }
         )
         @assert("{@TypeOf(view)}" == "&u8")
     }
     let mut writable: u8 = 9
     let mut downgraded: &u8 = &writable
-    {
-        downgraded = &a
-    }
+    { downgraded = &a }
     writable += 1
     @assert(downgraded.* == 3 and writable == 10)
 }
@@ -273,17 +205,9 @@ let array_elements_different_owners: () = {
             8
         }
         p.* += 1
-        if flag {
-            p = &a[1]
-        } else {
-            p = &b[-1]
-        }
+        if flag { p = &a[1] } else { p = &b[-1] }
         @assert(
-            p.* == if flag {
-                2
-            } else {
-                30
-            }
+            p.* == if flag { 2 } else { 30 }
         )
         p = &a[0]
         @assert(p.* == 2)

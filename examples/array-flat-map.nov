@@ -3,9 +3,7 @@ let std = @import("std")
 let main: () = {
     let expanded = std.array.flatMap(
         [1, 2, 3],
-        (x) {
-            [x, x]
-        }
+        (x) { [x, x] }
     )
     @println("Expanded:", expanded)
 }
@@ -19,11 +17,7 @@ let order_empty_results_and_callback_count: () = {
         (x) {
             calls += 1
             seen = seen * 10 + x
-            if x == 2 {
-                []
-            } else {
-                [x, x]
-            }
+            if x == 2 { [] } else { [x, x] }
         }
     )
     @assert(calls == 3 and seen == 123)
@@ -40,16 +34,12 @@ let order_empty_results_and_callback_count: () = {
 
 @[test]
 let flatten_one_layer_and_recursive_independence: () = {
-    let identity = (value: `T) -> `T {
-        value
-    }
+    let identity = (value: `T) -> `T { value }
     let mut source = [[1], [2, 3]]
     let flattened = std.array.flatMap(source, identity)
     let mut duplicated = std.array.flatMap(
         source,
-        (row) {
-            [row, row]
-        }
+        (row) { [row, row] }
     )
     source[0] = [9]
     @assert(flattened[0] == 1 and flattened[-1] == 3)
@@ -62,23 +52,17 @@ let flatten_one_layer_and_recursive_independence: () = {
 let storable_outputs_and_shared_closures: () = {
     let words = std.array.flatMap(
         [1, 2],
-        (x) {
-            ["item:{x}"]
-        }
+        (x) { ["item:{x}"] }
     )
     @assert(words[0] == "item:1" and words[1] == "item:2")
     let outcomes: []std.Option([]int) = std.array.flatMap(
         [1],
-        (x) -> []std.Option([]int) {
-            [std.Option([]int).some[[x]], std.Option([]int).none[]]
-        }
+        (x) -> []std.Option([]int) { [std.Option([]int).some[[x]], std.Option([]int).none[]] }
     )
     @assert(outcomes[0].unwrapOr([])[0] == 1 and outcomes[1].isNone())
     let ranges = std.array.flatMap(
         [1, 2],
-        (x) {
-            [x..x + 2]
-        }
+        (x) { [x..x + 2] }
     )
     @assert(@len(ranges[0]) == 2 and @len(ranges[1]) == 2)
     let mut calls = 0
@@ -88,9 +72,7 @@ let storable_outputs_and_shared_closures: () = {
     }
     let callbacks = std.array.flatMap(
         [increment],
-        (f) {
-            [f, f]
-        }
+        (f) { [f, f] }
     )
     @assert(callbacks[0]() == 1 and callbacks[1]() == 2)
 }
@@ -108,9 +90,7 @@ let snapshots_inference_and_queries: () = {
     @assert(result[0] == 1 and result[1] == 2 and source[0] == 9)
     let empty: []str = std.array.flatMap(
         [1, 2],
-        (x) {
-            []
-        }
+        (x) { [] }
     )
     @assert(@len(empty) == 0)
     let mut calls = 0

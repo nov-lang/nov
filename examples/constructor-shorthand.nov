@@ -84,9 +84,7 @@ let source_snapshots: () = {
 let closure_captures: () = {
     let width: int = 8
     let mut height: int = 3
-    let make = () -> Rectangle {
-        Rectangle.[ width, height ]
-    }
+    let make = () -> Rectangle { Rectangle.[ width, height ] }
     let saved = make()
     height = 9
     let current = make()

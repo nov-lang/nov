@@ -96,9 +96,7 @@ let empty_identities_and_each_order: () = {
 
 @[test]
 let find_payload_types_and_recursive_copies: () = {
-    let yes = (value: `T) -> bool {
-        true
-    }
+    let yes = (value: `T) -> bool { true }
     @assert(std.array.find([false, true], yes).unwrapOr(true) == false)
     @assert(std.array.find(@as([]i32, [7]), yes).unwrapOr(0) == 7)
     @assert(std.array.find(@as([]f64, [1.5]), yes).unwrapOr(0.0) == 1.5)
@@ -133,9 +131,7 @@ let function_elements_and_other_index_types: () = {
     let functions: []() -> int = [next, next, next]
     let index = std.array.findIndex(
         functions,
-        (value: () -> int) -> bool {
-            value() == 2
-        }
+        (value: () -> int) -> bool { value() == 2 }
     )
     @assert(index.unwrapOr(99) == 1 and count == 2)
     std.array.each(
@@ -145,9 +141,7 @@ let function_elements_and_other_index_types: () = {
         }
     )
     @assert(count == 5 and next() == 6)
-    let yes = (value: `T) -> bool {
-        true
-    }
+    let yes = (value: `T) -> bool { true }
     @assert(std.array.findIndex(@as([][]int, [[1], [2]]), yes).unwrapOr(99) == 0)
     let payloads: []Payload = [.none[], .value[3]]
     @assert(std.array.findIndex(payloads, yes).unwrapOr(99) == 0)
@@ -206,9 +200,7 @@ let empty_arguments_are_still_eager: () = {
     }
     let predicate = () -> (int) -> bool {
         events = events * 10 + 2
-        (value: int) -> bool {
-            @panic("empty callback")
-        }
+        (value: int) -> bool { @panic("empty callback") }
     }
     @assert(std.array.any(items(), predicate()) == false and events == 12)
     events = 0
@@ -222,9 +214,7 @@ let empty_arguments_are_still_eager: () = {
         items(),
         {
             events = events * 10 + 2
-            (value: int) -> void {
-                @panic("empty callback")
-            }
+            (value: int) -> void { @panic("empty callback") }
         }
     )
     @assert(events == 12)
@@ -232,9 +222,7 @@ let empty_arguments_are_still_eager: () = {
 
 let main: () = {
     let numbers: []int = [3, 1, 4, 2]
-    let large = (value: int) {
-        value > 2
-    }
+    let large = (value: int) { value > 2 }
     @println("Any:", std.array.any(numbers, large))
     @println("All:", std.array.all(numbers, large))
     @println("First:", std.array.find(numbers, large))
@@ -242,9 +230,7 @@ let main: () = {
     @print("Each:")
     std.array.each(
         numbers,
-        (value) {
-            @print(" {value}")
-        }
+        (value) { @print(" {value}") }
     )
     @println("")
 }

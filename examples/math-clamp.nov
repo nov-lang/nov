@@ -1,9 +1,7 @@
 let std = @import("std")
 let clamp = std.math.clamp
 
-let main: () = {
-    @println("Clamped:", clamp(12, 0, 10))
-}
+let main: () = { @println("Clamped:", clamp(12, 0, 10)) }
 
 @[test]
 let exact_numeric_types_and_inclusive_bounds: () = {
@@ -136,9 +134,7 @@ let eager_arguments_and_bounds_first_comparison_order: () = {
     let stop = () -> int {
         clamp(
             make(2),
-            {
-                return 8
-            },
+            { return 8 },
             make(3)
         )
     }

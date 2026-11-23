@@ -4,12 +4,8 @@
 ; Open ranges follow the finite sources; strings count Unicode scalars.
 
 let main: () = {
-    loop item, index in [10, 20, 30], 0.. {
-        @println(index, item)
-    }
-    loop left, right in "éa", "a😀" {
-        @println(left, right)
-    }
+    loop item, index in [10, 20, 30], 0.. { @println(index, item) }
+    loop left, right in "éa", "a😀" { @println(left, right) }
 }
 
 @[test]
@@ -25,9 +21,7 @@ let mixed_and_unicode: () = {
     }
     @assert(count == 4)
     let same = [true, false]
-    loop a, b in same, same {
-        @assert(a == b)
-    }
+    loop a, b in same, same { @assert(a == b) }
 }
 
 @[test]
@@ -50,11 +44,7 @@ let source_order: () = {
         @assert(order == 1234)
         @assert(a == c)
         @assert(
-            b == if index == 0 {
-                'é'
-            } else {
-                '😀'
-            }
+            b == if index == 0 { 'é' } else { '😀' }
         )
         count += 1
     }
@@ -66,18 +56,10 @@ let source_order: () = {
         text
     }, 0.. {
         @assert(
-            a == if index == 0 {
-                'é'
-            } else {
-                'a'
-            }
+            a == if index == 0 { 'é' } else { 'a' }
         )
         @assert(
-            b == if index == 0 {
-                'a'
-            } else {
-                '😀'
-            }
+            b == if index == 0 { 'a' } else { '😀' }
         )
     }
 }
@@ -92,11 +74,7 @@ let range_cardinalities: () = {
     }
     @assert(count == 3)
     let empty: []int = []
-    loop a, b, c, d in 8..3, 8..=3, empty, "" {
-        @panic("empty body ran")
-    } else {
-        count += 1
-    }
+    loop a, b, c, d in 8..3, 8..=3, empty, "" { @panic("empty body ran") } else { count += 1 }
     @assert(count == 4)
     loop a, b in @as(u64, 18446744073709551615)..=18446744073709551615, @as(i64, 9223372036854775807)..=9223372036854775807 {
         @assert(a == 18446744073709551615)
@@ -109,9 +87,7 @@ let range_cardinalities: () = {
         @assert(a == 0)
         @assert(b == minimum)
         break
-    } else {
-        @panic("full range appeared empty")
-    }
+    } else { @panic("full range appeared empty") }
 }
 
 @[test]
@@ -137,9 +113,7 @@ let open_indices: () = {
         break
     }
     let empty: []int = []
-    loop index, value in @as(u8, 255).., empty {
-        @panic("empty body ran")
-    }
+    loop index, value in @as(u8, 255).., empty { @panic("empty body ran") }
 }
 
 @[test]
@@ -150,13 +124,9 @@ let reference_pairs: () = {
     loop &a, &b, index in left, right, @as(int, 0).. {
         a.* += b.*
         b.* = index
-        if index == 0 {
-            continue
-        }
+        if index == 0 { continue }
         break
-    } else {
-        @panic("break must skip else")
-    }
+    } else { @panic("break must skip else") }
     @assert(left[0] == 5)
     @assert(left[1] == 7)
     @assert(left[2] == 3)
@@ -166,18 +136,14 @@ let reference_pairs: () = {
     left += [9]
     right += [8]
     let readonly: []int = [5, 7, 3, 9]
-    loop &a, &b in left, readonly {
-        @assert(a.* == b.*)
-    }
+    loop &a, &b in left, readonly { @assert(a.* == b.*) }
 }
 
 @[test]
 let control_and_captures: () = {
     let mut exhausted: int = 0
     let found = loop value, index in [2, 4, 6], @as(int, 0).. {
-        let read = () -> int {
-            value + index
-        }
+        let read = () -> int { value + index }
         if index == 0 {
             @assert(read() == 2)
             continue
@@ -189,17 +155,11 @@ let control_and_captures: () = {
     }
     @assert(found == 5)
     let empty: []int = []
-    let fallback = loop value, index in empty, 0.. {
-        break value
-    } else {
+    let fallback = loop value, index in empty, 0.. { break value } else {
         exhausted += 1
         9
     }
     @assert(fallback == 9)
-    loop value, index in [2, 4], 0.. {
-        continue
-    } else {
-        exhausted += 1
-    }
+    loop value, index in [2, 4], 0.. { continue } else { exhausted += 1 }
     @assert(exhausted == 2)
 }

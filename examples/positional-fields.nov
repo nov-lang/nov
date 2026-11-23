@@ -23,9 +23,7 @@ let projections: () = {
     @assert(p.0.1 == 7 and p.*.0.1 == 7)
     let pairs = std.array.map(
         [1, 2],
-        (value) {
-            .[ value, "item:{value}" ]
-        }
+        (value) { .[ value, "item:{value}" ] }
     )
     let projected = std.array.map(pairs, first)
     @assert(projected[0] == 1 and projected[1] == 2)
@@ -69,9 +67,7 @@ let call_order: () = {
     let copy = r
     let result = r.0(
         {
-            r.0 = (suffix: str) -> str {
-                "replacement" + suffix
-            }
+            r.0 = (suffix: str) -> str { "replacement" + suffix }
             r.1 = 9
             "?" + "!"
         }
@@ -90,13 +86,9 @@ let range_reuse: () = {
         r.0 = 8..10
     }
     @assert(sum == 3 and r.1 == 7)
-    loop i in saved.0 {
-        sum += i
-    }
+    loop i in saved.0 { sum += i }
     @assert(sum == 6)
-    loop i in r.0 {
-        sum += i
-    }
+    loop i in r.0 { sum += i }
     @assert(sum == 23)
 }
 
@@ -139,26 +131,16 @@ let main: () = {
 }
 
 @[test]
-let projection_and_generic_map: () = {
-    projections()
-}
+let projection_and_generic_map: () = { projections() }
 
 @[test]
-let independent_nested_snapshots: () = {
-    snapshots()
-}
+let independent_nested_snapshots: () = { snapshots() }
 
 @[test]
-let callable_snapshot_and_shared_environment: () = {
-    call_order()
-}
+let callable_snapshot_and_shared_environment: () = { call_order() }
 
 @[test]
-let reusable_range_field: () = {
-    range_reuse()
-}
+let reusable_range_field: () = { range_reuse() }
 
 @[test]
-let numeric_mutation_and_unevaluated_type: () = {
-    mutation_and_type_queries()
-}
+let numeric_mutation_and_unevaluated_type: () = { mutation_and_type_queries() }

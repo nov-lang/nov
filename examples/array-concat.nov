@@ -48,13 +48,9 @@ let storable_element_types: () = {
     let entries = [Entry.[ scores = [1] ]] + [Entry.[ scores = [2] ]]
     let messages: []Message = [.entry[entries[0]]] + [.none[]]
     let functions: []() -> int = [
-        () -> int {
-            1
-        }
+        () -> int { 1 }
     ] + [
-        () -> int {
-            2
-        }
+        () -> int { 2 }
     ]
     let ranges = [0..2] + [2..4]
     @assert(flags[0] and flags[1] == false)
@@ -102,9 +98,7 @@ let operands_snapshot_before_later_effects: () = {
 @[test]
 let generics_callbacks_and_unevaluated_queries: () = {
     let values: []u8 = concat([], [7])
-    let callback = (a: []int, b: []int) {
-        a + b
-    }
+    let callback = (a: []int, b: []int) { a + b }
     let result = callback([1], [2])
     let mut calls = 0
     let effect = () -> []u8 {

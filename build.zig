@@ -461,17 +461,13 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("loop-values.nov", @embedFile("examples/loop-values.nov"));
     _ = fixtures.add("inclusive-range.nov",
         \\let main: () = {
-        \\    loop i in 0..=2 {
-        \\        @println(i)
-        \\    }
+        \\    loop i in 0..=2 { @println(i) }
         \\    let max: u64 = 18446744073709551615
         \\    loop i in max..=max {
         \\        @println(i)
         \\        continue
         \\    }
-        \\    loop _ in 2..=1 {
-        \\        @println(false)
-        \\    }
+        \\    loop _ in 2..=1 { @println(false) }
         \\}
         \\
     );
@@ -3426,9 +3422,7 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\    let cb: (uint) -> uint = identity
         \\    @assert(cb(42) == 42)
         \\    let local: (value: `T) -> `T = value
-        \\    let closure = (value: `U) -> `U {
-        \\        value
-        \\    }
+        \\    let closure = (value: `U) -> `U { value }
         \\    let typed: (bool) -> bool = local
         \\    let captured: (str) -> str = closure
         \\    @assert(local(true) and closure(false) == false and typed(true))
@@ -6093,13 +6087,9 @@ fn addPositionalFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\    let local: @TypeOf(.[ 1, "a" ]) = pair
         \\    @assert(local.0 == 8 and local.1 == "imported")
         \\}
-        \\let main: () = {
-        \\    exercise()
-        \\}
+        \\let main: () = { exercise() }
         \\@[test]
-        \\let imported_projection: () = {
-        \\    exercise()
-        \\}
+        \\let imported_projection: () = { exercise() }
         \\
     );
     for ([_][]const u8{ "positional-fields.nov", "imported.nov" }) |source| {
@@ -6420,17 +6410,9 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\let viaAlias: (value: alternate.Option(int)) -> O = value
         \\let make: (present: bool) -> O = {
         \\    @print(
-        \\        if present {
-        \\            "S"
-        \\        } else {
-        \\            "N"
-        \\        }
+        \\        if present { "S" } else { "N" }
         \\    )
-        \\    if present {
-        \\        .some[1]
-        \\    } else {
-        \\        .none[]
-        \\    }
+        \\    if present { .some[1] } else { .none[] }
         \\}
         \\let eager: () -> int = {
         \\    @print("E")
@@ -6484,19 +6466,11 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\let R = standard.Result(Record, Record)
         \\let makeOption: (present: bool) -> O = {
         \\    @print("O")
-        \\    if present {
-        \\        .some[1]
-        \\    } else {
-        \\        .none[]
-        \\    }
+        \\    if present { .some[1] } else { .none[] }
         \\}
         \\let makeResult: (success: bool) -> R = {
         \\    @print("R")
-        \\    if success {
-        \\        .ok[Record.[ text = "o" + "k" ]]
-        \\    } else {
-        \\        .err[Record.[ text = "e" + "rr" ]]
-        \\    }
+        \\    if success { .ok[Record.[ text = "o" + "k" ]] } else { .err[Record.[ text = "e" + "rr" ]] }
         \\}
         \\let main: () = {
         \\    let some = O.some[1]
@@ -7316,9 +7290,7 @@ fn addReferenceParameterCliTests(b: *std.Build, exe: *std.Build.Step.Compile, te
     }
     const fixtures = b.addWriteFiles();
     const formatted = fixtures.add("reference-parameter-binding-call.nov",
-        \\let increment: (p: &mut int) = {
-        \\    p.* += 1
-        \\}
+        \\let increment: (p: &mut int) = { p.* += 1 }
         \\let main: () = {
         \\    let mut value: int = 1
         \\    let p = &value
@@ -7919,9 +7891,7 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\let result = @import("lib/result.nov")
         \\let api = @import("api.nov")
         \\let verify: () = {
-        \\    let callback: api.Callback = (n) {
-        \\        n + 1
-        \\    }
+        \\    let callback: api.Callback = (n) { n + 1 }
         \\    let original: api.FunctionOption = .some[callback]
         \\    let canonical: standard.Option((int) -> int) = original
         \\    let direct: option.Option(api.Callback) = canonical
@@ -7936,9 +7906,7 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\    let rangeCanonical: standard.Option(@TypeOf(0..1)) = interval
         \\    let range = rangeCanonical.unwrapOr(0..0)
         \\    let mut count = 0
-        \\    loop n in range {
-        \\        count += 1
-        \\    }
+        \\    loop n in range { count += 1 }
         \\    @assert(count == 3)
         \\}
         \\@[test]
@@ -8132,13 +8100,9 @@ fn addRangeValueCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         \\        range = 8..=9
         \\    }
         \\    @println()
-        \\    loop i in copy {
-        \\        @print("{i} ")
-        \\    }
+        \\    loop i in copy { @print("{i} ") }
         \\    @println()
-        \\    loop i in range {
-        \\        @print("{i} ")
-        \\    }
+        \\    loop i in range { @print("{i} ") }
         \\    @println()
         \\}
         \\

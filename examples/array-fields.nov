@@ -91,14 +91,8 @@ let payload_and_control_flow: () = {
         .none => tree()
     }
     @assert(again.leaf.values[0] == 1 and again.records[0].values[0] == 3)
-    let mut branch = if true {
-        original
-    } else {
-        tree()
-    }
-    let mut looped = loop {
-        break original
-    }
+    let mut branch = if true { original } else { tree() }
+    let mut looped = loop { break original }
     branch.leaf.values[0] = 7
     looped.leaf.values[0] = 6
     @assert(original.leaf.values[0] == 1)
@@ -109,15 +103,9 @@ let payload_and_control_flow: () = {
 let closure_copies: () = {
     let mut current = tree()
     let frozen = current
-    let snapshot = () -> Tree {
-        frozen
-    }
-    let read = () -> Tree {
-        current
-    }
-    let change = () {
-        current.leaf.values[0] += 1
-    }
+    let snapshot = () -> Tree { frozen }
+    let read = () -> Tree { current }
+    let change = () { current.leaf.values[0] += 1 }
     let same = change
     change()
     same()

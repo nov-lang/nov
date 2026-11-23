@@ -4,18 +4,14 @@ let Option = std.Option
 @[public]
 let map: (items: []`T, convert: (`T) -> `U) -> []`U = {
     let mut result: []`U = []
-    loop item in items {
-        result += [convert(item)]
-    }
+    loop item in items { result += [convert(item)] }
     result
 }
 
 @[public]
 let flatMap: (items: []`T, convert: (`T) -> []`U) -> []`U = {
     let mut result: []`U = []
-    loop item in items {
-        result += convert(item)
-    }
+    loop item in items { result += convert(item) }
     result
 }
 
@@ -34,9 +30,7 @@ let reverse: (items: []`T) -> []`T = {
 let filter: (items: []`T, predicate: (`T) -> bool) -> []`T = {
     let mut result: []`T = []
     loop item in items {
-        if predicate(item) {
-            result += [item]
-        }
+        if predicate(item) { result += [item] }
     }
     result
 }
@@ -49,9 +43,7 @@ let sort: (items: []`T, lessThan: (`T, `T) -> bool) -> []`T = {
     let mut index: int = 0
     loop item in items : index += 1 {
         let mut position = index
-        loop position > 0 and lessThan(item, result[position - 1]) : position -= 1 {
-            result[position] = result[position - 1]
-        }
+        loop position > 0 and lessThan(item, result[position - 1]) : position -= 1 { result[position] = result[position - 1] }
         result[position] = item
     }
     result
@@ -60,18 +52,14 @@ let sort: (items: []`T, lessThan: (`T, `T) -> bool) -> []`T = {
 @[public]
 let fold: (items: []`T, initial: `U, combine: (`U, `T) -> `U) -> `U = {
     let mut result: `U = initial
-    loop item in items {
-        result = combine(result, item)
-    }
+    loop item in items { result = combine(result, item) }
     result
 }
 
 @[public]
 let any: (items: []`T, predicate: (`T) -> bool) -> bool = {
     loop item in items {
-        if predicate(item) {
-            return true
-        }
+        if predicate(item) { return true }
     }
     false
 }
@@ -79,9 +67,7 @@ let any: (items: []`T, predicate: (`T) -> bool) -> bool = {
 @[public]
 let all: (items: []`T, predicate: (`T) -> bool) -> bool = {
     loop item in items {
-        if predicate(item) == false {
-            return false
-        }
+        if predicate(item) == false { return false }
     }
     true
 }
@@ -89,9 +75,7 @@ let all: (items: []`T, predicate: (`T) -> bool) -> bool = {
 @[public]
 let find: (items: []`T, predicate: (`T) -> bool) -> Option(`T) = {
     loop item in items {
-        if predicate(item) {
-            return .some[item]
-        }
+        if predicate(item) { return .some[item] }
     }
     .none[]
 }
@@ -101,35 +85,23 @@ let findLast: (items: []`T, predicate: (`T) -> bool) -> Option(`T) = {
     let mut index: int = -1
     loop _ in items {
         let item = items[index]
-        if predicate(item) {
-            return .some[item]
-        }
+        if predicate(item) { return .some[item] }
         index -= 1
     }
     .none[]
 }
 
 @[public]
-let min: (items: []`T) -> Option(`T) = if @len(items) == 0 {
-    .none[]
-} else {
-    .some[@min(items)]
-}
+let min: (items: []`T) -> Option(`T) = if @len(items) == 0 { .none[] } else { .some[@min(items)] }
 
 @[public]
-let max: (items: []`T) -> Option(`T) = if @len(items) == 0 {
-    .none[]
-} else {
-    .some[@max(items)]
-}
+let max: (items: []`T) -> Option(`T) = if @len(items) == 0 { .none[] } else { .some[@max(items)] }
 
 @[public]
 let take: (items: []`T, count: uint) -> []`T = {
     let mut result: []`T = []
     loop item, index in items, 0.. {
-        if index >= count {
-            break
-        }
+        if index >= count { break }
         result += [item]
     }
     result
@@ -139,9 +111,7 @@ let take: (items: []`T, count: uint) -> []`T = {
 let drop: (items: []`T, count: uint) -> []`T = {
     let mut result: []`T = []
     loop item, index in items, 0.. {
-        if index >= count {
-            result += [item]
-        }
+        if index >= count { result += [item] }
     }
     result
 }
@@ -149,16 +119,12 @@ let drop: (items: []`T, count: uint) -> []`T = {
 @[public]
 let findIndex: (items: []`T, predicate: (`T) -> bool) -> Option(uint) = {
     loop item, index in items, 0.. {
-        if predicate(item) {
-            return .some[index]
-        }
+        if predicate(item) { return .some[index] }
     }
     .none[]
 }
 
 @[public]
 let each: (items: []`T, action: (`T)) = {
-    loop item in items {
-        action(item)
-    }
+    loop item in items { action(item) }
 }

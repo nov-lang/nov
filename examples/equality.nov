@@ -65,9 +65,7 @@ let overrides_apply_recursively_and_inequality_negates: () = {
     let c = User.[ id = 8, name = "Ada" ]
     @assert(a == b and a != c)
     @assert(
-        {
-            a != b
-        } == false
+        { a != b } == false
     )
     @assert([a] == [b] and [[a]] == [[b]])
     @assert(b in [c, a])

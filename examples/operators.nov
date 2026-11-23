@@ -46,16 +46,10 @@ let arithmetic_negation_and_bitwise: () = {
     @assert(a * b == Number.[ value = 60 ] and a / b == Number.[ value = 2 ])
     @assert(a % b == Number.[ value = 2 ] and -b == Number.[ value = -5 ])
     @assert(
-        {
-            a & b
-        } == Number.[ value = 4 ] and {
-            a | b
-        } == Number.[ value = 13 ]
+        { a & b } == Number.[ value = 4 ] and { a | b } == Number.[ value = 13 ]
     )
     @assert(
-        {
-            a ^ b
-        } == Number.[ value = 9 ]
+        { a ^ b } == Number.[ value = 9 ]
     )
     @assert(a.value == 12 and b.value == 5)
 }
@@ -66,24 +60,14 @@ let derived_ordering_and_sort: () = {
     let b = Number.[ value = 2 ]
     @assert(a < b and b > a and a <= b and b >= a)
     @assert(
-        a <= a and a >= a and {
-            a < a
-        } == false
+        a <= a and a >= a and { a < a } == false
     )
     @assert(
-        {
-            a > b
-        } == false and {
-            b <= a
-        } == false and {
-            a >= b
-        } == false
+        { a > b } == false and { b <= a } == false and { a >= b } == false
     )
     let sorted = std.array.sort(
         [b, a],
-        (left, right) {
-            left < right
-        }
+        (left, right) { left < right }
     )
     @assert(sorted == [a, b])
 }
@@ -162,9 +146,7 @@ let generic_hooks_inferred_callbacks_and_queries: () = {
     let numbers = [Number.[ value = 1 ], Number.[ value = 2 ]]
     let doubled = std.array.map(
         numbers,
-        (x) {
-            x + x
-        }
+        (x) { x + x }
     )
     @assert(doubled[0].value == 2 and doubled[1].value == 4)
     let mut calls = 0
@@ -230,9 +212,7 @@ let operand_evaluation_precedes_reversed_ordering: () = {
     @assert(seen == [2, 1])
     seen = []
     @assert(
-        {
-            make(2) <= make(1)
-        } == false
+        { make(2) <= make(1) } == false
     )
     @assert(seen == [2, 1])
 }

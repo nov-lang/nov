@@ -30,9 +30,7 @@ let Custom = union {
         .function[callback] => "callback:{callback(4)}"
         .range[range] => {
             let mut count = 0
-            loop n in range {
-                count += 1
-            }
+            loop n in range { count += 1 }
             "range:{count}"
         }
         .none => "empty"
@@ -70,9 +68,7 @@ let callResult: (value: Result(Callback, str)) -> Result(int, str) = {
 let sumOption: (value: Option(IntRange)) -> Option(int) = {
     let range = value.!
     let mut sum = 0
-    loop n in range {
-        sum += n
-    }
+    loop n in range { sum += n }
     .some[sum]
 }
 
@@ -121,9 +117,7 @@ let escaping_shared_cells_and_overwritten_owner: () = {
     let copy = owner
     owner = .none[]
     let mut pressure: [][]int = []
-    loop n in @as(int, 0)..256 {
-        pressure += [[n, n + 1]]
-    }
+    loop n in @as(int, 0)..256 { pressure += [[n, n + 1]] }
     @assert(owner.isNone() and @len(pressure) == 256)
     let callback = match copy {
         .some[function] => function
@@ -144,15 +138,11 @@ let creation_snapshots_and_later_copies: () = {
     let mut values: []int = [2]
     let saved = values
     let first: Option(Callback) = .some[
-        (n: int) -> int {
-            saved[0] + n
-        }]
+        (n: int) -> int { saved[0] + n }]
     values[0] = 9
     let newer = values
     let second: Option(Callback) = .some[
-        (n: int) -> int {
-            newer[0] + n
-        }]
+        (n: int) -> int { newer[0] + n }]
     let later = first
     values[0] = 20
     @assert(callOption(first).unwrapOr(0) == 5)
@@ -225,24 +215,18 @@ let range_copies_exact_bounds_and_inclusive_max: () = {
 let find_and_map_function_and_range_results: () = {
     let found: Option(Callback) = std.array.find(
         [increment],
-        (callback: Callback) -> bool {
-            callback(2) == 3
-        }
+        (callback: Callback) -> bool { callback(2) == 3 }
     )
     @assert(callOption(found).unwrapOr(0) == 4)
     let missing: Option(Callback) = std.array.find(
         @as([]Callback, []),
-        (callback: Callback) -> bool {
-            true
-        }
+        (callback: Callback) -> bool { true }
     )
     @assert(missing.isNone())
     let ranges: []IntRange = [@as(int, 1)..4, @as(int, 5)..=6]
     let selected: Option(IntRange) = std.array.find(
         ranges,
-        (range: IntRange) -> bool {
-            true
-        }
+        (range: IntRange) -> bool { true }
     )
     @assert(sumOption(selected).unwrapOr(0) == 6)
     let plain: []PlainFnUnion = [.none[], .function[increment]]
@@ -259,33 +243,25 @@ let find_and_map_function_and_range_results: () = {
     let source: Option(int) = .some[7]
     let mapped: Option(Callback) = source.map(
         (base) {
-            (n: int) -> int {
-                base + n
-            }
+            (n: int) -> int { base + n }
         }
     )
     @assert(callOption(mapped).unwrapOr(0) == 10)
     let mappedRange: Option(IntRange) = source.map(
-        (base) {
-            base..=base
-        }
+        (base) { base..=base }
     )
     @assert(sumOption(mappedRange).unwrapOr(0) == 7)
     let result: Result(int, str) = .ok[8]
     let resultFunction = result.map(
         (base) {
-            (n: int) -> int {
-                base + n
-            }
+            (n: int) -> int { base + n }
         }
     )
     @assert(callResult(resultFunction).unwrapOr(0) == 12)
     let error: Result(int, str) = .err["saved"]
     let errorFunction = error.mapErr(
         (message) {
-            () -> str {
-                message
-            }
+            () -> str { message }
         }
     )
     @assert(
@@ -296,9 +272,7 @@ let find_and_map_function_and_range_results: () = {
     )
     let none: Option(int) = .none[]
     let skipped: Option(Callback) = none.map(
-        (base) -> Callback {
-            @panic("inactive map")
-        }
+        (base) -> Callback { @panic("inactive map") }
     )
     @assert(skipped.isNone())
 }

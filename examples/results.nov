@@ -2,11 +2,7 @@ let std = @import("std")
 let Result = std.Result
 
 let checkedDouble: (value: uint) -> Result(uint, str) = {
-    if value > 100 {
-        .err["value exceeds 100"]
-    } else {
-        .ok[value * 2]
-    }
+    if value > 100 { .err["value exceeds 100"] } else { .ok[value * 2] }
 }
 
 let describe: (value: uint) -> Result(str, str) = {

@@ -138,9 +138,7 @@ let arguments_are_eager_and_comparisons_run_afterwards: () = {
     let stop = () -> int {
         @max(
             make(1),
-            {
-                return 7
-            },
+            { return 7 },
             make(2)
         )
     }
@@ -150,9 +148,7 @@ let arguments_are_eager_and_comparisons_run_afterwards: () = {
         @min(
             [
                 make(3),
-                {
-                    return 8
-                },
+                { return 8 },
                 make(4)
             ]
         )

@@ -6,16 +6,10 @@ let main: () = {
     let sub: (x: int, y: int) -> int = x - y
     let reversed = std.fn.flip(sub)
     @println("Flipped:", reversed(3, 10))
-    let double = (value: int) -> int {
-        value * 2
-    }
-    let increment = (value: int) -> int {
-        value + 1
-    }
+    let double = (value: int) -> int { value * 2 }
+    let increment = (value: int) -> int { value + 1 }
     @println("Composed:", std.fn.compose(double, increment)(3))
-    let positive = (value: int) -> bool {
-        value > 0
-    }
+    let positive = (value: int) -> bool { value > 0 }
     @println("Negated:", std.fn.neg(positive)(0))
     std.fn.noop()
 }
@@ -84,9 +78,7 @@ let noop_and_unevaluated_queries: () = {
         calls
     }
     let query: @TypeOf(std.fn.identity(make())) = 0
-    let constant: @TypeOf(std.fn.const(make())) = () -> int {
-        7
-    }
+    let constant: @TypeOf(std.fn.const(make())) = () -> int { 7 }
     @assert(query == 0 and constant() == 7 and calls == 0)
     @assert(std.fn.identity(make()) == 1 and calls == 1)
 }
@@ -107,12 +99,8 @@ let compose_distinct_types_order_and_shared_state: () = {
     @assert(@len(events) == 0)
     @assert(composed(7) == 7 and events == [1, 2])
     @assert(copied(12) == 8 and events == [1, 2, 1, 2])
-    let double = (value: int) -> int {
-        value * 2
-    }
-    let increment = (value: int) -> int {
-        value + 1
-    }
+    let double = (value: int) -> int { value * 2 }
+    let increment = (value: int) -> int { value + 1 }
     @assert(std.fn.compose(double, increment)(3) == 8)
     @assert(std.array.map([1, 2, 3], std.fn.compose(double, increment)) == [4, 6, 8])
 }
@@ -121,12 +109,8 @@ let compose_distinct_types_order_and_shared_state: () = {
 let compose_managed_results_and_unevaluated_queries: () = {
     let mut source = [1, 2]
     let snapshot = source
-    let get = (ignored: uint) -> []int {
-        snapshot
-    }
-    let row = (values: []int) -> Row {
-        Row.[ values ]
-    }
+    let get = (ignored: uint) -> []int { snapshot }
+    let row = (values: []int) -> Row { Row.[ values ] }
     let composed = std.fn.compose(row, get)
     source[0] = 9
     let mut first = composed(0)
@@ -139,9 +123,7 @@ let compose_managed_results_and_unevaluated_queries: () = {
     }
     let query: @TypeOf(std.fn.compose(row, make())) = composed
     @assert(calls == 0 and query(0).values == [1, 2])
-    let isEmpty = (values: []int) -> bool {
-        @len(values) == 0
-    }
+    let isEmpty = (values: []int) -> bool { @len(values) == 0 }
     let negQuery: @TypeOf(std.fn.neg(isEmpty)) = std.fn.neg(isEmpty)
     @assert(negQuery([1]))
 }
@@ -161,8 +143,6 @@ let neg_inverts_once_and_preserves_shared_captures: () = {
     @assert(nonpositive(1) == false and calls == 3)
     @assert(std.fn.neg(nonpositive)(2) and calls == 4)
     @assert(std.array.filter([-1, 0, 1], nonpositive) == [-1, 0] and calls == 7)
-    let empty = (text: str) -> bool {
-        @len(text) == 0
-    }
+    let empty = (text: str) -> bool { @len(text) == 0 }
     @assert(std.fn.neg(empty)("é") and std.fn.neg(empty)("") == false)
 }

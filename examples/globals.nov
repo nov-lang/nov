@@ -30,9 +30,7 @@ let mut message: Message = .values[[6, 7]]
 let mut interval = 1..=3
 let double: (value: int) -> int = value * 2
 let mut callback: (int) -> int = double
-let mut live: () -> int = () -> int {
-    count
-}
+let mut live: () -> int = () -> int { count }
 
 ; User runtime initialization belongs in main (or a function called from main).
 let configure: () -> int = 20
@@ -41,9 +39,7 @@ let main: () = {
     @println("Initial:", count, enabled, marker, scale, color)
     count = configure()
     let snapshot = count
-    let read = () -> int {
-        count
-    }
+    let read = () -> int { count }
     count += 2
     @println("Live:", live(), read(), "Snapshot:", snapshot)
 
@@ -61,13 +57,9 @@ let main: () = {
     @println("Imported:", shared.count, same.count, shared.counter.value, shared.counter.samples, shared.readSecret())
 
     let mut total: uint = 0
-    loop n in interval {
-        total += n
-    }
+    loop n in interval { total += n }
     @println("Range:", total, "Callback:", callback(5))
-    callback = (value: int) -> int {
-        value + count
-    }
+    callback = (value: int) -> int { value + count }
     count = 30
     @println("Replaced callback:", callback(5))
 }
@@ -75,9 +67,7 @@ let main: () = {
 @[test]
 let live_global_reads: () = {
     count = 1
-    let read = () -> int {
-        count
-    }
+    let read = () -> int { count }
     let saved = count
     count = 9
     @assert(read() == 9 and live() == 9 and saved == 1)
@@ -102,9 +92,7 @@ let aggregate_copies_and_replacement: () = {
     @assert("{old}" == "Message.values[[8, 9]]" and "{message}" == "Message.none")
     interval = 2..=4
     let mut total: uint = 0
-    loop n in interval {
-        total += n
-    }
+    loop n in interval { total += n }
     @assert(total == 9)
 }
 

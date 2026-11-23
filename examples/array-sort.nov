@@ -29,9 +29,7 @@ let payload_key: (value: Payload) -> int = match value {
 
 let assert_numbers: (actual: []int, expected: []int) = {
     @assert(@len(actual) == @len(expected))
-    loop value, wanted in actual, expected {
-        @assert(value == wanted)
-    }
+    loop value, wanted in actual, expected { @assert(value == wanted) }
 }
 
 @[test]
@@ -68,9 +66,7 @@ let stable_struct_keys_and_all_equal: () = {
     @assert(sorted[2].name == "a" and sorted[3].name == "c")
     let unchanged = std.array.sort(
         rows,
-        (a: Row, b: Row) -> bool {
-            false
-        }
+        (a: Row, b: Row) -> bool { false }
     )
     @assert(unchanged[0].name == "a" and unchanged[1].name == "b")
     @assert(unchanged[2].name == "c" and unchanged[3].name == "d")
@@ -81,30 +77,22 @@ let stable_struct_keys_and_all_equal: () = {
 let strings_runes_and_finite_floats: () = {
     let words = std.array.sort(
         ["pear", "a", "fig", "bb"],
-        (a: str, b: str) -> bool {
-            @len(a) < @len(b)
-        }
+        (a: str, b: str) -> bool { @len(a) < @len(b) }
     )
     @assert(words[0] == "a" and words[1] == "bb" and words[2] == "fig" and words[3] == "pear")
     let runes = std.array.sort(
         ['😀', 'λ', 'a'],
-        (a: rune, b: rune) -> bool {
-            a == 'a' and b != 'a' or a == 'λ' and b == '😀'
-        }
+        (a: rune, b: rune) -> bool { a == 'a' and b != 'a' or a == 'λ' and b == '😀' }
     )
     @assert(runes[0] == 'a' and runes[1] == 'λ' and runes[2] == '😀')
     let small = std.array.sort(
         @as([]f32, [2.5, -1.5, 0.0]),
-        (a: f32, b: f32) -> bool {
-            a < b
-        }
+        (a: f32, b: f32) -> bool { a < b }
     )
     @assert(small[0] == -1.5 and small[1] == 0.0 and small[2] == 2.5)
     let wide = std.array.sort(
         @as([]f64, [-1.5, 2.5, 0.0]),
-        (a: f64, b: f64) -> bool {
-            a > b
-        }
+        (a: f64, b: f64) -> bool { a > b }
     )
     @assert(wide[0] == 2.5 and wide[1] == 0.0 and wide[2] == -1.5)
 }
@@ -113,37 +101,27 @@ let strings_runes_and_finite_floats: () = {
 let bool_integer_enum_union_and_range_elements: () = {
     let flags = std.array.sort(
         [true, false, true],
-        (a: bool, b: bool) -> bool {
-            a == false and b
-        }
+        (a: bool, b: bool) -> bool { a == false and b }
     )
     @assert(flags[0] == false and flags[1] and flags[2])
     let signed = std.array.sort(
         @as([]i8, [3, -2, 1]),
-        (a: i8, b: i8) -> bool {
-            a < b
-        }
+        (a: i8, b: i8) -> bool { a < b }
     )
     @assert(signed[0] == -2 and signed[1] == 1 and signed[2] == 3)
     let unsigned = std.array.sort(
         @as([]uint, [3, 1, 2]),
-        (a: uint, b: uint) -> bool {
-            a < b
-        }
+        (a: uint, b: uint) -> bool { a < b }
     )
     @assert(unsigned[0] == 1 and unsigned[1] == 2 and unsigned[2] == 3)
     let colors = std.array.sort(
         @as([]Color, [.blue, .red, .blue]),
-        (a: Color, b: Color) -> bool {
-            a == .red and b == .blue
-        }
+        (a: Color, b: Color) -> bool { a == .red and b == .blue }
     )
     @assert(colors[0] == .red and colors[1] == .blue and colors[2] == .blue)
     let payloads = std.array.sort(
         @as([]Payload, [.row[Row.[ key = 2, name = "two", values = [[2]] ]], .none[], .row[Row.[ key = 1, name = "one", values = [[1]] ]]]),
-        (a: Payload, b: Payload) -> bool {
-            payload_key(a) < payload_key(b)
-        }
+        (a: Payload, b: Payload) -> bool { payload_key(a) < payload_key(b) }
     )
     @assert(payload_key(payloads[0]) == 0 and payload_key(payloads[1]) == 1 and payload_key(payloads[2]) == 2)
     let ranges = std.array.sort(
@@ -151,19 +129,13 @@ let bool_integer_enum_union_and_range_elements: () = {
         (a: `T, b: `T) -> bool {
             let mut left: int = 0
             let mut right: int = 0
-            loop value in a {
-                left += value
-            }
-            loop value in b {
-                right += value
-            }
+            loop value in a { left += value }
+            loop value in b { right += value }
             left < right
         }
     )
     let mut total: int = 0
-    loop value in ranges[0] {
-        total += value
-    }
+    loop value in ranges[0] { total += value }
     @assert(total == 3)
 }
 
@@ -172,9 +144,7 @@ let nested_arrays_and_records_copy_independently: () = {
     let mut source: [][]int = [[3, 4], [1]]
     let mut sorted = std.array.sort(
         source,
-        (a: []int, b: []int) -> bool {
-            @len(a) < @len(b)
-        }
+        (a: []int, b: []int) -> bool { @len(a) < @len(b) }
     )
     let inner = &sorted[0]
     inner.*[0] = 9
@@ -207,9 +177,7 @@ let function_elements_share_closure_captures: () = {
     let source: []() -> int = [high, low]
     let sorted = std.array.sort(
         source,
-        (a: () -> int, b: () -> int) -> bool {
-            a() < b()
-        }
+        (a: () -> int, b: () -> int) -> bool { a() < b() }
     )
     @assert(count == 2)
     @assert(sorted[0]() == 1 and sorted[1]() == 2 and count == 4)
@@ -226,11 +194,7 @@ let comparator_capture_and_comparison_order: () = {
         (a: int, b: int) -> bool {
             seen += [a, b]
             calls += 1
-            if reverse {
-                a > b
-            } else {
-                a < b
-            }
+            if reverse { a > b } else { a < b }
         }
     )
     assert_numbers(sorted, [1, 2, 3])

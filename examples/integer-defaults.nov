@@ -33,18 +33,12 @@ let defaults_and_control_flow: () = {
     let exact: int = value
     let nested = [[1], [2, 3]]
     let exact_nested: [][]int = nested
-    let selected = if true {
-        1
-    } else {
-        2
-    }
+    let selected = if true { 1 } else { 2 }
     let matched = match 1 {
         0 => 2
         _ => 3
     }
-    let repeated = loop {
-        break 4
-    }
+    let repeated = loop { break 4 }
     @assert(exact == 1 and exact_nested[1][1] == 3)
     @assert(selected == 1 and matched == 3 and repeated == 4)
     @assert("{1}" == "1")
@@ -56,11 +50,7 @@ let constraints_precede_defaulting: () = {
     let narrow: u8 = 7
     let numbers = [1, narrow]
     let exact_numbers: []u8 = numbers
-    let branch = if true {
-        1
-    } else {
-        narrow
-    }
+    let branch = if true { 1 } else { narrow }
     let exact_branch: u8 = branch
     let generic = same(1, narrow)
     let exact_generic: u8 = generic

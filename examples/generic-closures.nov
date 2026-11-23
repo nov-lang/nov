@@ -17,14 +17,10 @@ let makeCounter: (initial: int) -> (bool) -> int = {
 }
 
 let nested: (input: `A) -> `A = {
-    let forward = (value: `B) -> `B {
-        value
-    }
+    let forward = (value: `B) -> `B { value }
     let local: (value: `C) -> `A = {
         let outer = (ignored: `D) -> `A {
-            let ordinary = () -> `A {
-                input
-            }
+            let ordinary = () -> `A { input }
             ordinary()
         }
         @assert(forward(value) == value)
@@ -34,9 +30,7 @@ let nested: (input: `A) -> `A = {
 }
 
 let verifyDirect: () = {
-    let identity = (value: `T) -> `T {
-        value
-    }
+    let identity = (value: `T) -> `T { value }
     let local: (value: `U) -> `U = value
     @assert(identity(true) and local(false) == false)
     @assert(identity("text") == "text")
@@ -45,16 +39,12 @@ let verifyDirect: () = {
     @assert(number == 42 and callback("typed") == "typed")
     @assert(@as((bool) -> bool, identity)(true))
     @assert(
-        (value: `V) -> `V {
-            value
-        }(@as(int, 7)) == 7
+        (value: `V) -> `V { value }(@as(int, 7)) == 7
     )
 }
 
 let verifyCallbacks: () = {
-    let identity = (value: `T) -> `T {
-        value
-    }
+    let identity = (value: `T) -> `T { value }
     let local: (value: `U) -> `U = value
     @assert(apply(identity, "inferred") == "inferred")
     let number: uint = apply(local, 42)
@@ -62,9 +52,7 @@ let verifyCallbacks: () = {
     @assert(number == 42 and reversed == 43)
     @assert(
         apply(
-            (value: `V) -> `V {
-                value
-            },
+            (value: `V) -> `V { value },
             true
         )
     )
@@ -107,9 +95,7 @@ let verifySnapshots: () = {
 }
 
 let verifyInstances: () = {
-    let mut first: (bool) -> int = (ignored: bool) -> int {
-        0
-    }
+    let mut first: (bool) -> int = (ignored: bool) -> int { 0 }
     let mut last: (bool) -> int = first
     loop index in @as(int, 0)..2 {
         let mut count = index * 10
@@ -120,11 +106,7 @@ let verifyInstances: () = {
         }
         @assert(next("warmup") == index * 10 + 1 + index)
         let specialized: (bool) -> int = next
-        if index == 0 {
-            first = specialized
-        } else {
-            last = specialized
-        }
+        if index == 0 { first = specialized } else { last = specialized }
     }
     @assert(first(true) == 2 and first(false) == 3)
     @assert(last(true) == 13 and last(false) == 14)

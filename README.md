@@ -559,6 +559,9 @@ General iterators and labels remain unsupported and diagnosed.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
+Simple, comment-free single-expression blocks format inline as `{ x > y }`,
+including function and closure bodies. Blocks with declarations, multiple
+statements, comments or multiline contents keep their expanded layout.
 Both commands accept multiple files and directories:
 
 ```sh

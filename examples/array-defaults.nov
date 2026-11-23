@@ -65,9 +65,7 @@ let make: () -> Settings = Settings.[]
 @[test]
 let globals_returns_and_closures: () = {
     let mut value = make()
-    let capture = () -> Settings {
-        value
-    }
+    let capture = () -> Settings { value }
     value.rows[0] = [7]
     let captured = capture()
     @assert(captured.rows[0][0] == 7)

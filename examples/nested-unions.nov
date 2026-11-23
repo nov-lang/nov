@@ -153,12 +153,8 @@ let recursive_array_storage_is_independent: () = {
 let closure_snapshots_and_shared_cells: () = {
     let mut current: Outer = .inner[.some[[["first"]]]]
     let saved = current
-    let snapshot = () -> Outer {
-        saved
-    }
-    let read = () -> Outer {
-        current
-    }
+    let snapshot = () -> Outer { saved }
+    let read = () -> Outer { current }
     let update = () {
         let mut rows = words(current)
         rows[0] = [rows[0][0] + "!"]
@@ -194,17 +190,13 @@ let mapping_and_search_produce_nested_unions: () = {
     )
     let present: Option(int) = .some[4]
     let nested: Option(Result(int, str)) = present.map(
-        (value) {
-            Result(int, str).ok[value]
-        }
+        (value) { Result(int, str).ok[value] }
     )
     @assert(nested.unwrapOr(.err["missing"]).unwrapOr(0) == 4)
     let items: []Outer = [.none[], .inner[.some[[["found"]]]]]
     let found: Option(Outer) = std.array.find(
         items,
-        (value) {
-            @len(words(value)) != 0
-        }
+        (value) { @len(words(value)) != 0 }
     )
     @assert(words(found.unwrapOr(.none[]))[0][0] == "found")
 }
@@ -223,9 +215,7 @@ let nested_stringify_and_inactive_payloads: () = {
     @assert("{innerAbsent}" == "Outer.inner[Inner.none]")
     @assert("{inactive}" == "Envelope.none")
     let missing: Option(Result([][]str, [][]str)) = .none[]
-    let snapshot = () -> Option(Result([][]str, [][]str)) {
-        missing
-    }
+    let snapshot = () -> Option(Result([][]str, [][]str)) { missing }
     @assert(snapshot().isNone())
 }
 

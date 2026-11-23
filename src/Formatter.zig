@@ -408,11 +408,11 @@ fn testInvalidPositionalFormatAllocationFailures(allocator: std.mem.Allocator, s
 }
 
 test "inferred closures format bare parameters callbacks results and comments" {
-    try expectFormatted("let f=(x){x*2}", "let f = (x) {\n    x * 2\n}\n");
-    try expectFormatted("let ys=xs.map((x){x*2})", "let ys = xs.map(\n    (x) {\n        x * 2\n    }\n)\n");
-    try expectFormatted("let f=(x,y:int)->int{x+y}", "let f = (x, y: int) -> int {\n    x + y\n}\n");
-    try expectFormatted("let f=(x:&int){x}\nlet g=(){@print(1)\n}", "let f = (x: &int) {\n    x\n}\nlet g = () {\n    @print(1)\n}\n");
-    try expectFormatted("let f=(x){return (y){x+y}}", "let f = (x) {\n    return (y) {\n        x + y\n    }\n}\n");
+    try expectFormatted("let f=(x){x*2}", "let f = (x) { x * 2 }\n");
+    try expectFormatted("let ys=xs.map((x){x*2})", "let ys = xs.map(\n    (x) { x * 2 }\n)\n");
+    try expectFormatted("let f=(x,y:int)->int{x+y}", "let f = (x, y: int) -> int { x + y }\n");
+    try expectFormatted("let f=(x:&int){x}\nlet g=(){@print(1)\n}", "let f = (x: &int) { x }\nlet g = () { @print(1) }\n");
+    try expectFormatted("let f=(x){return (y){x+y}}", "let f = (x) {\n    return (y) { x + y }\n}\n");
     try expectFormatted("let T=(int)->int\nlet f:(x:int)={}", "let T = (int) -> int\nlet f: (x: int) = {}\n");
     for ([_][:0]const u8{
         "let f=(\n; first\nx,\n; typed\ny:&int,\n){\n; body\nreturn (z){x+z}\n}",
@@ -729,8 +729,8 @@ test "ascription preserves type syntax comments nested calls interpolation and a
 }
 
 test "iteration continuations format before bodies with stable tokens structure and allocation cleanup" {
-    try expectFormatted("let f=loop item in items:index+=1{continue}else{false}", "let f = loop item in items : index += 1 {\n    continue\n} else {\n    false\n}\n");
-    try expectFormatted("let f=loop item in items:{tick()}{break item}", "let f = loop item in items : {\n    tick()\n} {\n    break item\n}\n");
+    try expectFormatted("let f=loop item in items:index+=1{continue}else{false}", "let f = loop item in items : index += 1 { continue } else { false }\n");
+    try expectFormatted("let f=loop item in items:{tick()}{break item}", "let f = loop item in items : { tick() } { break item }\n");
     for ([_][:0]const u8{
         "let f=loop item in [1,2] : index += 1 {continue} else {}",
         "let f=loop rune in \"é😀\" : index += 1 {break rune} else {'?'}",
@@ -756,7 +756,7 @@ test "iteration continuations format before bodies with stable tokens structure 
 }
 
 test "zip iteration formatting preserves comments interpolation and allocation cleanup" {
-    try expectFormatted("let f=loop item,index in items,0.. {item} else {false}", "let f = loop item, index in items, 0.. {\n    item\n} else {\n    false\n}\n");
+    try expectFormatted("let f=loop item,index in items,0.. {item} else {false}", "let f = loop item, index in items, 0.. { item } else { false }\n");
     for ([_][:0]const u8{
         "let f=loop &item,&other,index in items,others,0.. {continue} else {}",
         "let f=loop x,y in [1,2],\"ab\" {}",
@@ -898,10 +898,63 @@ test "function signatures calls and delimiters are idempotent" {
 }
 
 test "blocks controls assignments and precedence are idempotent" {
-    try expectFormatted("let f:(n:int)->int={let mut x:int=1\nx += n * 2\nif x > 0 {return x} else if x == 0 {return -1} else {return 0}}\n", "let f: (n: int) -> int = {\n    let mut x: int = 1\n    x += n * 2\n    if x > 0 {\n        return x\n    } else if x == 0 {\n        return -1\n    } else {\n        return 0\n    }\n}\n");
-    try expectFormatted("let main:()->void={loop {true} {if false {break} else {continue}}\nreturn}\n", "let main: () -> void = {\n    loop {\n        true\n    } {\n        if false {\n            break\n        } else {\n            continue\n        }\n    }\n    return\n}\n");
-    try expectFormatted("let x={1 + 2} * 3 - 4 / {5 - 6}\n", "let x = {\n    1 + 2\n} * 3 - 4 / {\n    5 - 6\n}\n");
-    try expectFormatted("let f:()->bool=false and {return true} or !false\n", "let f: () -> bool = false and {\n    return true\n} or !false\n");
+    try expectFormatted("let f:(n:int)->int={let mut x:int=1\nx += n * 2\nif x > 0 {return x} else if x == 0 {return -1} else {return 0}}\n", "let f: (n: int) -> int = {\n    let mut x: int = 1\n    x += n * 2\n    if x > 0 { return x } else if x == 0 { return -1 } else { return 0 }\n}\n");
+    try expectFormatted("let main:()->void={loop {true} {if false {break} else {continue}}\nreturn}\n", "let main: () -> void = {\n    loop { true } {\n        if false { break } else { continue }\n    }\n    return\n}\n");
+    try expectFormatted("let x={1 + 2} * 3 - 4 / {5 - 6}\n", "let x = { 1 + 2 } * 3 - 4 / { 5 - 6 }\n");
+    try expectFormatted("let f:()->bool=false and {return true} or !false\n", "let f: () -> bool = false and { return true } or !false\n");
+}
+
+test "single expression blocks compact scalar comparisons and multiline wrappers" {
+    try expectFormatted("let value={x>y}", "let value = { x > y }\n");
+    try expectFormatted("let value={true}\nlet count={42}", "let value = { true }\nlet count = { 42 }\n");
+    try expectFormatted("let value={\n x>y\n}\n", "let value = { x > y }\n");
+    try expectFormatted("let f:(x:int,y:int)->bool={\n x>y\n}\n", "let f: (x: int, y: int) -> bool = { x > y }\n");
+    try expectFormatted("let f=(x){\n x>0\n}\n", "let f = (x) { x > 0 }\n");
+}
+
+test "single statement blocks compact executable forms under allocation failures" {
+    const cases = .{
+        .{ "let f:()->int={return 1}", "let f: () -> int = { return 1 }\n" },
+        .{ "let f:()={return}", "let f: () = { return }\n" },
+        .{ "let value=loop {break 1}", "let value = loop { break 1 }\n" },
+        .{ "let f:()=loop {break}", "let f: () = loop { break }\n" },
+        .{ "let f:()=loop {continue}", "let f: () = loop { continue }\n" },
+        .{ "let f:()={x=1}", "let f: () = { x = 1 }\n" },
+        .{ "let f:()={a[0]+=1}", "let f: () = { a[0] += 1 }\n" },
+        .{ "let f:()={call(1,2)}", "let f: () = { call(1, 2) }\n" },
+        .{ "let value={[1,2]}", "let value = { [1, 2] }\n" },
+        .{ "let value={items[-1]}", "let value = { items[-1] }\n" },
+    };
+    inline for (cases) |case| {
+        try expectFormatted(case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
+    }
+}
+
+test "single statement blocks retain comments declarations and multiline expressions" {
+    try expectFormatted("let value={; entry\nx>y}", "let value = { ; entry\n    x > y\n}\n");
+    try expectFormatted("let value={x>y ; tail\n}", "let value = {\n    x > y ; tail\n}\n");
+    try expectFormatted("let value={x + ; addition\ny}", "let value = {\n    x + ; addition\n        y\n}\n");
+    try expectFormatted("let value={x\ny}", "let value = {\n    x\n    y\n}\n");
+    try expectFormatted("let value={let x=1\n}", "let value = {\n    let x = 1\n}\n");
+    try expectFormatted("let value={x +\n y}", "let value = {\n    x +\n        y\n}\n");
+    try expectFormatted("let value={call(\n1,\n2\n)}", "let value = {\n    call(\n        1,\n        2\n    )\n}\n");
+    try expectFormatted("let value={}\nlet other={\n}", "let value = {}\nlet other = {}\n");
+}
+
+test "single statement blocks retain nested blocks and control flow" {
+    try expectFormatted("let value={{1}}", "let value = {\n    { 1 }\n}\n");
+    try expectFormatted("let value={if ready {1} else {2}}", "let value = {\n    if ready { 1 } else { 2 }\n}\n");
+    try expectFormatted("let value={loop {break 1}}", "let value = {\n    loop { break 1 }\n}\n");
+    try expectFormatted("let value={match x {0=>1\n_=>2}}", "let value = {\n    match x {\n        0 => 1\n        _ => 2\n    }\n}\n");
+}
+
+test "compact blocks nested in lists stabilize on the first pass" {
+    try expectFormatted("let value=call({x>y})", "let value = call(\n    { x > y }\n)\n");
+    try expectFormatted("let value=[{x>y},{false}]", "let value = [\n    { x > y },\n    { false }\n]\n");
+    try expectFormatted("let value=call([{1}])", "let value = call(\n    [\n        { 1 }\n    ]\n)\n");
+    try expectFormatted("let value=[call({1})]", "let value = [\n    call(\n        { 1 }\n    )\n]\n");
+    try expectFormatted("let value=items[{1}]", "let value = items[\n    { 1 }]\n");
 }
 
 test "nested list expansion and empty block comments stabilize on the first pass" {
@@ -1009,7 +1062,7 @@ test "scalar arrays render types literals indexing length and direct stores" {
 
 test "array comments continuations and expanding lists stabilize on the first pass" {
     try expectFormatted("let x:[]int=[\n; empty\n]\n", "let x: []int = [\n    ; empty\n]\n");
-    try expectFormatted("let x=[{1}]\n", "let x = [\n    {\n        1\n    }\n]\n");
+    try expectFormatted("let x=[{1}]\n", "let x = [\n    { 1 }\n]\n");
     for ([_][:0]const u8{
         "let f:(a:[]int)->int=a[\n -1]\n",
         "let f:(a:[]int)->uint=@len(a[; index\n -1])\n",
@@ -1143,7 +1196,7 @@ test "interpolation formatting preserves literal chunks escapes and placeholders
 }
 
 test "conditional loop exhaustion formatting preserves tokens comments and structure" {
-    try expectFormatted("let x=loop false{}else{true}", "let x = loop false {} else {\n    true\n}\n");
+    try expectFormatted("let x=loop false{}else{true}", "let x = loop false {} else { true }\n");
     for ([_][:0]const u8{
         "let x=loop c : step() {break 1} else {2}",
         "let x=loop {true} : {tick()} {break [1,2,]} else {[]}",
@@ -1161,8 +1214,8 @@ test "conditional loop exhaustion formatting preserves tokens comments and struc
 }
 
 test "loop continuations and value breaks are idempotent" {
-    try expectFormatted("let value=loop i<10:i+=1{break 1+2*3}", "let value = loop i < 10 : i += 1 {\n    break 1 + 2 * 3\n}\n");
-    try expectFormatted("let value=loop:tick(){break 42}", "let value = loop : tick() {\n    break 42\n}\n");
+    try expectFormatted("let value=loop i<10:i+=1{break 1+2*3}", "let value = loop i < 10 : i += 1 { break 1 + 2 * 3 }\n");
+    try expectFormatted("let value=loop:tick(){break 42}", "let value = loop : tick() { break 42 }\n");
     for ([_][:0]const u8{
         "let value=loop {break 1 + 2 * 3}",
         "let value=loop : tick(1,2,) {break loop : next() {break 7}}",
@@ -1187,12 +1240,12 @@ test "loop continuations and value breaks are idempotent" {
 test "reference arguments format direct borrows indexed owners and pipes" {
     try expectFormatted(
         "let f:(p:&mut int)={p.*+=1}\nlet main:()={let mut n=1\nf(&n)\nlet mut a=[1]\nf(&a[-1])\nlet done:void=&n |> f\n}",
-        "let f: (p: &mut int) = {\n    p.* += 1\n}\nlet main: () = {\n    let mut n = 1\n    f(&n)\n    let mut a = [1]\n    f(&a[-1])\n    let done: void = &n |> f\n}\n",
+        "let f: (p: &mut int) = { p.* += 1 }\nlet main: () = {\n    let mut n = 1\n    f(&n)\n    let mut a = [1]\n    f(&a[-1])\n    let done: void = &n |> f\n}\n",
     );
 }
 
 test "iteration formatting preserves copied and borrowed captures comments and nesting" {
-    try expectFormatted("let f:()=loop &item in items {item+=1}", "let f: () = loop &item in items {\n    item += 1\n}\n");
+    try expectFormatted("let f:()=loop &item in items {item+=1}", "let f: () = loop &item in items { item += 1 }\n");
     for ([_][:0]const u8{
         "let f:()=loop item in [true,false,] {continue} else {}",
         "let f:()=loop rune in \"é\\0😀\" {break rune} else {'?'}",
@@ -1246,8 +1299,8 @@ test "range formatting survives every allocation failure" {
 }
 
 test "bare block continuations format without accepting genuine labels" {
-    try expectFormatted("let value=loop ready:{tick()}{break 1}", "let value = loop ready : {\n    tick()\n} {\n    break 1\n}\n");
-    try expectFormatted("let value=loop:{}{break 1}", "let value = loop : {} {\n    break 1\n}\n");
+    try expectFormatted("let value=loop ready:{tick()}{break 1}", "let value = loop ready : { tick() } { break 1 }\n");
+    try expectFormatted("let value=loop:{}{break 1}", "let value = loop : {} { break 1 }\n");
     for ([_][:0]const u8{
         "let value=loop i < limit : {i += 1} {break 1}",
         "let value=loop true : {} {break 1}",

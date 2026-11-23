@@ -8,9 +8,7 @@ let std = @import("std")
 let expect: (text: str, separator: str, wanted: []str) = {
     let fields = std.string.split(text, separator)
     @assert(@len(fields) == @len(wanted))
-    loop field, expected in fields, wanted {
-        @assert(field == expected)
-    }
+    loop field, expected in fields, wanted { @assert(field == expected) }
 }
 
 @[test]
@@ -123,9 +121,7 @@ let callee_and_arguments_once_left_to_right: () = {
 let main: () = {
     let fields = std.string.split(",red,,blue,", ",")
     @println("Fields:", @len(fields))
-    loop field in fields {
-        @println("[{field}]")
-    }
+    loop field in fields { @println("[{field}]") }
     let unicode = std.string.split("é😀x\0e\u{301}", "😀x")
     @println("Scalar lengths:", @len(unicode[0]), @len(unicode[1]))
 }

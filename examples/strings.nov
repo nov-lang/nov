@@ -10,11 +10,7 @@ let main: () -> void = {
     text += "!"
     @println(shared, @len(shared))
     @println(text)
-    let selected = if true {
-        shared
-    } else {
-        "unused"
-    }
+    let selected = if true { shared } else { "unused" }
     @println(decorate(selected))
     ; Escaped braces are literal, unlike identifier placeholders.
     @println("\{UTF-8\}", @len("😀"))

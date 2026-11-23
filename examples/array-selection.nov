@@ -45,9 +45,7 @@ let reverse_visit_order_and_shortcircuit: () = {
     )
     @assert(seen == 2413 and calls == 4)
     @assert(items[0] == 3 and items[3] == 2)
-    let yes = (value: int) -> bool {
-        true
-    }
+    let yes = (value: int) -> bool { true }
     @assert(std.array.findLast(items, yes).unwrapOr(0) == 2)
     @assert(std.array.findLast(@as([]int, [7]), yes).unwrapOr(0) == 7)
 }
@@ -93,9 +91,7 @@ let take_drop_boundaries_and_order: () = {
 }
 
 let check_family: (items: []`T) = {
-    let yes = (value: `U) -> bool {
-        true
-    }
+    let yes = (value: `U) -> bool { true }
     @assert(std.array.findLast(items, yes).isSome())
     @assert(@len(std.array.take(items, 1)) == 1)
     @assert(@len(std.array.drop(items, 1)) == @len(items) - 1)
@@ -119,9 +115,7 @@ let generic_storable_families: () = {
     check_family([Row.[ values = [[1]] ], Row.[ values = [[2]] ]])
     check_family(@as([]Payload, [.none[], .row[Row.[ values = [[3]] ]]]))
     check_family([1..3, 4..6])
-    let yes = (value: `T) -> bool {
-        true
-    }
+    let yes = (value: `T) -> bool { true }
     @assert(std.array.findLast(["first", "last"], yes).unwrapOr("") == "last")
     @assert(std.array.take(@as([]Color, [.blue, .red]), 1)[0] == .blue)
     @assert(std.array.drop(['λ', '😀'], 1)[0] == '😀')
@@ -134,9 +128,7 @@ let recursive_copies_in_both_directions: () = {
     let mut dropped = std.array.drop(source, 0)
     let found = std.array.findLast(
         source,
-        (value: Row) -> bool {
-            true
-        }
+        (value: Row) -> bool { true }
     )
     let mut row = taken[0]
     let mut inner = row.values[0]
@@ -192,9 +184,7 @@ let closures_share_capture_environments: () = {
     let dropped = std.array.drop(functions, 1)
     let found = std.array.findLast(
         functions,
-        (value: () -> int) -> bool {
-            true
-        }
+        (value: () -> int) -> bool { true }
     ).unwrapOr(next)
     @assert(count == 0)
     @assert(taken[0]() == 1 and dropped[0]() == 2 and found() == 3)
@@ -239,9 +229,7 @@ let main: () = {
         "Last above two:",
         std.array.findLast(
             numbers,
-            (value: int) -> bool {
-                value > 2
-            }
+            (value: int) -> bool { value > 2 }
         ).unwrapOr(0)
     )
     @println("Take two:", std.array.take(numbers, 2))

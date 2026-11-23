@@ -37,9 +37,7 @@ let later_uses_keep_independent_values: () = {
 @[test]
 let captured_owners_are_not_consumed: () = {
     let mut source = [1]
-    let read = () -> int {
-        source[0]
-    }
+    let read = () -> int { source[0] }
     let mut snapshot = source
     snapshot[0] = 9
     @assert(read() == 1 and snapshot[0] == 9)

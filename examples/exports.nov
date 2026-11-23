@@ -10,11 +10,7 @@
 let add_i32: (left: i32, right: i32) -> i32 = left + right
 
 @[export("api_select_u64")]
-let select: (condition: bool, yes: u64, no: u64) -> u64 = if condition {
-    yes
-} else {
-    no
-}
+let select: (condition: bool, yes: u64, no: u64) -> u64 = if condition { yes } else { no }
 
 @[export]
 let invert: (value: bool) -> bool = !value
@@ -25,9 +21,7 @@ let Rectangle = struct {
 
     let area: (self: Rectangle) -> u32 = self.width * self.height
 
-    let perimeter: (self: Rectangle) -> u32 = {
-        self.width + self.height
-    } * 2
+    let perimeter: (self: Rectangle) -> u32 = { self.width + self.height } * 2
 }
 
 @[export]

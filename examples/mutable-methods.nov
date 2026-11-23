@@ -6,9 +6,7 @@ let Counter = struct {
     value: int,
 
     @[public]
-    let add: (self: &mut Counter, amount: int) = {
-        self.value += amount
-    }
+    let add: (self: &mut Counter, amount: int) = { self.value += amount }
     @[public]
     let get: (self: Counter) -> int = self.value
     @[public]
@@ -21,16 +19,12 @@ let Box: (Element: type) -> type = struct {
     value: Element,
 
     @[public]
-    let set: (self: &mut Self, value: Element) = {
-        self.value = value
-    }
+    let set: (self: &mut Self, value: Element) = { self.value = value }
     @[public]
     let echo: (self: &mut Self, input: `T) -> `T = input
 }
 
-let forward: (counter: &mut Counter, amount: int) = {
-    counter.add(amount)
-}
+let forward: (counter: &mut Counter, amount: int) = { counter.add(amount) }
 let Callable = struct {
     call: (int) -> int,
 }
@@ -167,9 +161,7 @@ let reference_fields_read_write_and_call: () = {
     let mut callable = Callable.[ call = twice ]
     let function = &callable
     @assert(function.call(3) == 6)
-    let next = (n: int) -> int {
-        n + 1
-    }
+    let next = (n: int) -> int { n + 1 }
     let result = function.call(
         {
             function.call = next
