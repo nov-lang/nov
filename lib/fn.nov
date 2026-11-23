@@ -8,10 +8,61 @@ let const: (x: `T) -> () -> `T = () { x }
 let noop: () = {}
 
 @[public]
+let apply: (x: `T, f: (`T) -> `U) -> `U = f(x)
+
+@[public]
 let compose: (f: (`B) -> `C, g: (`A) -> `B) -> (`A) -> `C = (a) { f(g(a)) }
 
 @[public]
 let flip: (f: (`A, `B) -> `C) -> (`B, `A) -> `C = (b, a) { f(a, b) }
 
 @[public]
-let neg: (f: (`T) -> bool) -> (`T) -> bool = (x) { !f(x) }
+let negate: (f: (`T) -> bool) -> (`T) -> bool = (x) { !f(x) }
+
+@[public]
+let add: (a: `A, b: `B) -> `C = a + b
+
+@[public]
+let sub: (a: `A, b: `B) -> `C = a - b
+
+@[public]
+let mul: (a: `A, b: `B) -> `C = a * b
+
+@[public]
+let div: (a: `A, b: `B) -> `C = a / b
+
+@[public]
+let rem: (a: `A, b: `B) -> `C = a % b
+
+@[public]
+let bitAnd: (a: `A, b: `B) -> `C = a & b
+
+@[public]
+let bitOr: (a: `A, b: `B) -> `C = a | b
+
+@[public]
+let bitXor: (a: `A, b: `B) -> `C = a ^ b
+
+@[public]
+let neg: (x: `T) -> `U = -x
+
+@[public]
+let bitNot: (x: `T) -> `U = ~x
+
+@[public]
+let equal: (a: `A, b: `B) -> bool = a == b
+
+@[public]
+let notEqual: (a: `A, b: `B) -> bool = a != b
+
+@[public]
+let lessThan: (a: `A, b: `B) -> bool = a < b
+
+@[public]
+let lessOrEqual: (a: `A, b: `B) -> bool = a <= b
+
+@[public]
+let greaterThan: (a: `A, b: `B) -> bool = a > b
+
+@[public]
+let greaterOrEqual: (a: `A, b: `B) -> bool = a >= b

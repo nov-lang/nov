@@ -60,6 +60,24 @@ results. See `tests/array-fields.nov`.
 
 ## Current delivered status
 
+`std.fn.apply(value: T, transform: (T) -> U) -> U` and direct operator
+callbacks are delivered as ordinary public Nov helpers: `add`, `sub`, `mul`,
+`div`, `rem`, `bitAnd`, `bitOr`, `bitXor` have `(A, B) -> C` signatures;
+`neg` and `bitNot` have `(T) -> U` signatures. `equal`, `notEqual`,
+`lessThan`, `lessOrEqual`, `greaterThan`, `greaterOrEqual` take `(A, B)` and
+return `bool`. Backtick generic variables are independent, preserving exact
+builtin types and accessible public mixed nominal hooks/results, without
+conversions. Numeric wrapping/division/IEEE rules, structural equality and
+array/string addition remain the underlying operators' rules. Predicate negation
+is now named `negate(predicate)`; arithmetic negation uses `neg(value)`. No shifts, new operators, builtins or bit-not hook are added.
+Arguments evaluate eagerly once left-to-right; apply invokes its callback once,
+including void/error results. Recursive result copies remain independent,
+closure copies share cells, and `@TypeOf` runs no effects or hooks.
+See `lib/README.md`, `tests/fn.nov` (thirteen tests) and the curated
+`examples/functions.nov` (stdlib apply, arithmetic and add fold callback).
+This does not change slice semantics or settle the unresolved array-view design.
+
+
 Array slicing is implemented for all ordinary storable element types, returning
 the base's exact `[]T` type with fresh, recursively independent array backing,
 not a borrow/view. Nested arrays, record fields and active union payloads follow

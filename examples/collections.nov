@@ -22,11 +22,7 @@ let main: () = {
         ranked,
         (score) { score >= 70 }
     )
-    let total = std.array.fold(
-        ranked,
-        0,
-        (sum, score) { sum + score }
-    )
+    let total = std.array.fold(ranked, 0, std.fn.add)
     @println("Passing: {passing} of {@len(ranked)}")
     @println("Total points: {total}")
     match std.array.findLastIndex(

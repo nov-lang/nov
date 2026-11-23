@@ -97,7 +97,7 @@ fn addExampleTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.
         .{ .source = "examples/references.nov", .output = "Morning after advance: 5\nSnapshot: 2\nActive morning: 7\nActive afternoon: 24\nReadonly count: 24\nReadonly field: 24\nFinal counts: 7, 25\n" },
         .{ .source = "examples/text.nov", .output = "Message: café 😀 / tea time / bonjour\nEdges: c / r; badge: é 😀\nEmoji: scalar 5\nTransport: 27 scalars, 31 bytes\nDecoded: café 😀 / tea time / bonjour\n——— ready\n" },
         .{ .source = "examples/types.nov", .output = "Before packing: Books: 800g (Service.standard)\nReady: Books: 850g (Service.express)\nScan: B2, 850g\nDelivery: sent to Lyon/B2\n" },
-        .{ .source = "examples/functions.nov", .output = "Accepted: [4, 7]\nPrepared: [12, 18]\nReport: #1=12, #2=18\nProcessed: 2\nEmpty batch: No accepted scores\n" },
+        .{ .source = "examples/functions.nov", .output = "Accepted: [4, 7]\nPrepared: [12, 18]\nTotal: 30\nReport: #1=12, #2=18\nProcessed: 2\nEmpty batch: No accepted scores\n" },
         .{ .source = "examples/errors.nov", .output = "3 tickets cost 15 credits\nNo quantity supplied\nCannot quote: not a decimal quantity: ParseIntError.invalidInput\nCannot quote: quantity must be between 1 and 12\n" },
     };
     for (programs) |program| {
@@ -1978,7 +1978,7 @@ fn addMemFnCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std
         "let old=@import(\"lib/trivial.nov\")\nlet main:()=old.noop()\n",
         "let std=@import(\"std\")\nlet main:()={let old=std.fn.constant(1)\n}\n",
         "let std=@import(\"std\")\nlet f:(text:str)->uint=@len(text)\nlet g:(value:bool)->bool=value\nlet main:()={let bad=std.fn.compose(f,g)\n}\n",
-        "let std=@import(\"std\")\nlet f:(value:int)->int=value\nlet main:()={let bad=std.fn.neg(f)\n}\n",
+        "let std=@import(\"std\")\nlet f:(value:int)->int=value\nlet main:()={let bad=std.fn.negate(f)\n}\n",
     }, 0..) |source, i| {
         const path = b.fmt("removed-helper-module-{d}.nov", .{i});
         _ = removed.add(path, source);
@@ -1995,9 +1995,40 @@ fn addMemFnCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std
         }
     }
     addArrayValueHelperCliTests(b, exe, test_step, "mem.nov", @embedFile("tests/mem.nov"), "Swapped: 2 1\nReplaced: 2 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS replace_scalars_preserves_exact_types\nPASS replace_nested_arrays_preserves_independent_storage\nPASS replace_records_and_union_payloads\nPASS replace_functions_share_cells_and_ranges_copy_bounds\nPASS replace_destinations_and_argument_order\nPASS replace_queries_do_not_mutate_or_evaluate_arguments\n8 passed; 0 failed; 8 total\n");
-    addArrayValueHelperCliTests(b, exe, test_step, "fn.nov", @embedFile("tests/fn.nov"), "Identity: 2\nConstant: 2\nFlipped: 7\nComposed: 8\nNegated: true\n", "PASS identity_values_and_copies\nPASS const_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\nPASS compose_distinct_types_order_and_shared_state\nPASS compose_managed_results_and_unevaluated_queries\nPASS neg_inverts_once_and_preserves_shared_captures\n7 passed; 0 failed; 7 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "fn.nov", @embedFile("tests/fn.nov"), "Identity: 2\nConstant: 2\nFlipped: 7\nComposed: 8\nNegated: true\n", "PASS identity_values_and_copies\nPASS const_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\nPASS compose_distinct_types_order_and_shared_state\nPASS compose_managed_results_and_unevaluated_queries\nPASS negate_inverts_once_and_preserves_shared_captures\nPASS apply_preserves_types_copies_and_shared_state\nPASS arithmetic_helpers_infer_types_and_follow_numeric_rules\nPASS comparison_helpers_preserve_structural_and_ieee_rules\nPASS bitwise_and_unary_helpers_preserve_exact_types\nPASS operator_helpers_support_mixed_nominal_hooks\nPASS operator_callbacks_evaluate_once_left_to_right_and_queries_are_pure\n13 passed; 0 failed; 13 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    for ([_][]const u8{
+        "let main:()={let bad=std.fn.apply(1)\n}",
+        "let main:()={let bad=std.fn.apply(1,true)\n}",
+        "let main:()={let bad=std.fn.apply(true,(value:int)->int{value})\n}",
+        "let main:()={let bad=std.fn.add(@as(i8,1),@as(i16,2))\n}",
+        "let main:()={let bad=std.fn.add(@as(i8,1),@as(u8,2))\n}",
+        "let main:()={let bad=std.fn.div(@as(int,1),@as(f64,2.0))\n}",
+        "let main:()={let bad=std.fn.rem(1.0,2.0)\n}",
+        "let main:()={let bad=std.fn.bitNot(1.0)\n}",
+        "let main:()={let bad=std.fn.neg(@as(uint,1))\n}",
+        "let main:()={let bad=std.fn.negate(1)\n}",
+        "let f:(value:int)->bool=true\nlet main:()={let bad=std.fn.neg(f)\n}",
+        "let main:()={let bad=std.fn.lessThan(\"a\",\"b\")\n}",
+        "let f:()={}\nlet main:()={let bad=std.fn.equal(f,f)\n}",
+        "let P=struct{n:int,\n@[operator(.add)]\nlet plus:(a:P,b:int)->int=a.n+b\n}\nlet main:()={let bad=std.fn.add(P.[n=1],2)\n}",
+        "let main:()={let query:@TypeOf(std.fn.negate(1))=true\n}",
+    }, 0..) |source, i| {
+        const path = b.fmt("invalid-fn-helper-{d}.nov", .{i});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\n{s}\n", .{source}));
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
     for ([_][]const u8{
         "let n:uint=1\nlet old=std.mem.replace(&n,2)",
         "let mut n:u8=1\nlet replacement:u16=2\nlet old=std.mem.replace(&n,replacement)",

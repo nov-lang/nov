@@ -11299,6 +11299,301 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
 }
 
+test "fn operator helpers actual stdlib source free allocation free builtin wrap div IEEE exact types O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let main:()={
+        \\let add:(i8,i8)->i8=std.fn.add
+        \\let sub:(u8,u8)->u8=std.fn.sub
+        \\let mul:(i16,i16)->i16=std.fn.mul
+        \\let div:(i32,i32)->i32=std.fn.div
+        \\let rem:(i64,i64)->i64=std.fn.rem
+        \\let band:(u16,u16)->u16=std.fn.bitAnd
+        \\let bor:(u32,u32)->u32=std.fn.bitOr
+        \\let xor:(u64,u64)->u64=std.fn.bitXor
+        \\let negate:(i8)->i8=std.fn.neg
+        \\let not:(u8)->u8=std.fn.bitNot
+        \\@assert(add(127,1)==-128 and sub(0,1)==255 and mul(32767,2)==-2)
+        \\@assert(div(-7,2)==-3 and rem(-7,2)==-1)
+        \\@assert(std.fn.div(@as(i8,-128),@as(i8,-1))==-128)
+        \\@assert(std.fn.rem(@as(i8,-128),@as(i8,-1))==0)
+        \\@assert(band(6,3)==2 and bor(4,3)==7 and xor(6,3)==5)
+        \\@assert(negate(-128)==-128 and not(0)==255)
+        \\let signed:(int,int)->int=std.fn.add
+        \\let unsigned:(uint,uint)->uint=std.fn.mul
+        \\@assert(signed(2,3)==5 and unsigned(6,7)==42)
+        \\@assert(std.fn.equal(true,true) and std.fn.notEqual('a','b'))
+        \\@assert(std.fn.equal("ab","ab") and std.fn.notEqual("ab","ac"))
+        \\@assert(std.fn.lessThan(1,2) and std.fn.lessOrEqual(2,2))
+        \\@assert(std.fn.greaterThan(2,1) and std.fn.greaterOrEqual(2,2))
+        \\@assert(!std.fn.equal(1,2) and !std.fn.notEqual(2,2))
+        \\@assert(!std.fn.lessThan(2,2) and !std.fn.lessOrEqual(3,2))
+        \\@assert(!std.fn.greaterThan(2,2) and !std.fn.greaterOrEqual(1,2))
+        \\let zero:f64=0.0
+        \\let inf=std.fn.div(1.0,zero)
+        \\let nan=std.fn.div(zero,zero)
+        \\@assert(std.fn.equal(zero,-zero) and !std.fn.equal(nan,nan))
+        \\@assert(std.fn.notEqual(nan,nan) and !std.fn.lessThan(nan,zero))
+        \\@assert(!std.fn.lessOrEqual(nan,zero) and !std.fn.greaterThan(nan,zero))
+        \\@assert(!std.fn.greaterOrEqual(nan,zero))
+        \\@assert(std.fn.div(1.0,std.fn.neg(zero))==-inf)
+        \\@assert(std.fn.add(1.5,2.0)==3.5 and std.fn.sub(1.5,2.0)==-0.5)
+        \\@assert(std.fn.mul(inf,2.0)==inf and std.fn.neg(inf)==-inf)
+        \\let smallDiv:(f32,f32)->f32=std.fn.div
+        \\let smallAdd:(f32,f32)->f32=std.fn.add
+        \\let smallNeg:(f32)->f32=std.fn.neg
+        \\let smallZero:f32=0.0
+        \\let smallInf=smallDiv(1.0,smallZero)
+        \\let smallNan=smallDiv(smallZero,smallZero)
+        \\@assert(smallAdd(1.25,2.5)==3.75 and smallDiv(1.0,smallNeg(smallZero))==-smallInf)
+        \\@assert(std.fn.notEqual(smallNan,smallNan) and !std.fn.lessOrEqual(smallNan,smallZero))
+        \\let query:@TypeOf(std.fn.add(@as(u8,255),@as(u8,1)))=7
+        \\@assert(query==@as(u8,7))
+        \\}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) { fail_allocations = 1; nov_main(); return 0; }
+    , false);
+}
+
+test "fn operator helpers actual stdlib source free nested concat independent copies forced GC O0 O3 runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let make:()->[][]int=[[1],[2]]
+        \\let concat:(a:[][]int,b:[][]int)->[][]int=std.fn.add(a,b)
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, result = {0};
+        \\    void **roots[] = {&input.data, &result.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    input = nov_make(); result = nov_concat(input, input);
+        \\    nov_array *a = input.data, *b = result.data;
+        \\    if (result.len != 4 || a == b || a[0].data == b[0].data || b[0].data == b[2].data) return 1;
+        \\    ((intptr_t *)a[0].data)[0] = 9; ((intptr_t *)b[1].data)[0] = 8;
+        \\    if (((intptr_t *)b[0].data)[0] != 1 || ((intptr_t *)b[2].data)[0] != 1 || ((intptr_t *)b[3].data)[0] != 2 || ((intptr_t *)a[1].data)[0] != 2) return 2;
+        \\    input = (nov_array){0}; nov_gc_collect(&nov_rt_heap); b = result.data;
+        \\    if (((intptr_t *)b[1].data)[0] != 8 || ((intptr_t *)b[3].data)[0] != 2) return 3;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 4;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array input = {0}; void **roots[] = {&input.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    input = nov_make(); fail_allocations = 1; (void)nov_concat(input, input); return 0;
+        \\}
+    , true);
+}
+
+test "fn apply actual stdlib source free scalar exact types allocation free O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let widen:(x:i8)->i64=if x==7 {7} else {0}
+        \\let positive:(x:int)->bool=x>0
+        \\let main:()={
+        \\let apply:(i8,(i8)->i64)->i64=std.fn.apply
+        \\let result:i64=apply(7,widen)
+        \\@assert(result==7 and std.fn.apply(1,positive))
+        \\@assert(std.fn.apply(@as(u8,0),std.fn.bitNot)==@as(u8,255))
+        \\@assert(std.fn.apply(@as(f32,1.5),std.fn.neg)==@as(f32,-1.5))
+        \\std.fn.apply(positive,(f:(int)->bool){@assert(f(2))})
+        \\}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) { fail_allocations = 1; nov_main(); return 0; }
+    , false);
+}
+
+test "fn apply actual stdlib source free managed result independent copies forced GC O0 O3 runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let make:()->[][]int=[[1],[2]]
+        \\let copy:(input:[][]int)->[][]int=std.fn.apply(input,std.fn.identity)
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, first = {0}, second = {0};
+        \\    void **roots[] = {&input.data, &first.data, &second.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 3);
+        \\    input = nov_make(); first = nov_copy(input); second = nov_copy(input);
+        \\    nov_array *a = input.data, *b = first.data, *c = second.data;
+        \\    if (first.len != 2 || second.len != 2 || a == b || b == c || a[0].data == b[0].data || b[0].data == c[0].data) return 1;
+        \\    ((intptr_t *)a[0].data)[0] = 9; ((intptr_t *)b[1].data)[0] = 8;
+        \\    if (((intptr_t *)b[0].data)[0] != 1 || ((intptr_t *)c[0].data)[0] != 1 || ((intptr_t *)c[1].data)[0] != 2 || ((intptr_t *)a[1].data)[0] != 2) return 2;
+        \\    input = (nov_array){0}; nov_gc_collect(&nov_rt_heap); b = first.data; c = second.data;
+        \\    if (((intptr_t *)b[1].data)[0] != 8 || ((intptr_t *)c[1].data)[0] != 2) return 3;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 4;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array input = {0}; void **roots[] = {&input.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    input = nov_make(); fail_allocations = 1; (void)nov_copy(input); return 0;
+        \\}
+    , true);
+}
+
+test "fn apply actual stdlib source free eager LTR once readonly TypeOf closure cells void forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let main:()={
+        \\let mut source=[[1],[2]]
+        \\let mut events=0
+        \\let value=()->[][]int{events=events*10+1
+        \\source}
+        \\let callback=()->([][]int)->[][]int{events=events*10+2
+        \\source=[[9]]
+        \\(rows:[][]int)->[][]int{events=events*10+3
+        \\@assert(rows==[[1],[2]])
+        \\rows}}
+        \\let query:@TypeOf(std.fn.apply(value(),callback()))=[]
+        \\@assert(@len(query)==0 and events==0 and source==[[1],[2]])
+        \\let mut result=std.fn.apply(value(),callback())
+        \\@assert(events==123 and result==[[1],[2]] and source==[[9]])
+        \\result[0]=[8]
+        \\@assert(source==[[9]])
+        \\let mut calls=0
+        \\let tick=()->int{calls+=1
+        \\calls}
+        \\let saved=std.fn.apply(tick,std.fn.identity)
+        \\@assert(calls==0 and saved()==1 and tick()==2)
+        \\let invoke=(run:()->int){@assert(run()==3)}
+        \\std.fn.apply(saved,invoke)
+        \\@assert(calls==3)
+        \\let nothing=()->void{calls+=1}
+        \\std.fn.apply(nothing,(run:()->void){run()})
+        \\@assert(calls==4)
+        \\}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "fn operator helpers actual stdlib source free public mixed hooks callbacks fold sort effects TypeOf forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let Amount=struct{value:int,
+        \\@[public]
+        \\@[operator(.add)]
+        \\let add:(a:Amount,b:int)->Amount=.[value=a.value+b]
+        \\@[public]
+        \\@[operator(.sub)]
+        \\let sub:(a:Amount,b:int)->int=a.value-b
+        \\@[public]
+        \\@[operator(.neg)]
+        \\let neg:(a:Amount)->int=-a.value
+        \\@[public]
+        \\@[operator(.equal)]
+        \\let equal:(a:Amount,b:int)->bool=a.value==b
+        \\}
+        \\let Row=struct{key:int,compare:(int,int)->bool,
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let less:(a:Row,b:Row)->bool=a.compare(a.key,b.key)
+        \\}
+        \\let main:()={
+        \\let mixed:(Amount,int)->int=std.fn.sub
+        \\let unary:(Amount)->int=std.fn.neg
+        \\@assert(mixed(Amount.[value=9],2)==7 and unary(Amount.[value=9])==-9)
+        \\@assert(std.fn.equal(Amount.[value=2],2) and std.fn.notEqual(Amount.[value=2],3))
+        \\let total=std.array.fold([1,2,3],Amount.[value=10],std.fn.add)
+        \\@assert(total.value==16)
+        \\let mut calls=0
+        \\let compare=(a:int,b:int)->bool{calls+=1
+        \\a<b}
+        \\let a=Row.[key=1,compare]
+        \\let b=Row.[key=2,compare]
+        \\let query:@TypeOf(std.fn.lessThan(a,b))=false
+        \\@assert(!query and calls==0)
+        \\@assert(std.fn.lessThan(a,b) and calls==1)
+        \\@assert(std.fn.lessOrEqual(a,b) and calls==2)
+        \\@assert(std.fn.greaterThan(b,a) and calls==3)
+        \\@assert(std.fn.greaterOrEqual(b,a) and calls==4)
+        \\let sorted=std.array.sort([b,a],std.fn.lessThan)
+        \\@assert(sorted[0].key==1 and sorted[1].key==2 and calls==5)
+        \\let descending=std.array.sort([a,b],std.fn.greaterThan)
+        \\@assert(descending[0].key==2 and descending[1].key==1 and calls==6)
+        \\let mut events=0
+        \\let left=()->Amount{events=events*10+1
+        \\Amount.[value=9]}
+        \\let right=()->int{events=events*10+2
+        \\2}
+        \\let resultType:@TypeOf(std.fn.sub(left(),right()))=0
+        \\@assert(events==0 and resultType==0)
+        \\@assert(std.fn.sub(left(),right())==7 and events==12)
+        \\let positive=(x:int)->bool{x>0}
+        \\@assert(std.fn.negate(positive)(0) and !std.fn.negate(positive)(1))
+        \\}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "fn operator helpers actual stdlib source free eager integer panic propagation O0 O3" {
+    for ([_][]const u8{ "div", "rem" }) |name| {
+        const source = try std.fmt.allocPrint(test_gpa, "let std=@import(\"std\")\nlet left:()->int={{@print(\"L\")\n7}}\nlet right:()->int={{@print(\"R\")\n0}}\nlet main:()={{let result=std.fn.{s}(left(),right())\n@println(\"unreachable\",result)}}", .{name});
+        defer test_gpa.free(source);
+        const library = try emitApprovedHelperSourceFree(test_gpa, source);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "LR", if (std.mem.eql(u8, name, "div")) "panic: division by zero\n" else "panic: remainder by zero\n", mode);
+    }
+}
+
+test "fn apply actual stdlib source free callback panic after eager value constructor invocation O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let value:()->int={@print("V")
+        \\7}
+        \\let callback:()->(int)->int={@print("C")
+        \\(x:int)->int{@print(x)
+        \\@panic("apply stopped")}}
+        \\let main:()={let result=std.fn.apply(value(),callback())
+        \\@println("unreachable",result)}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "VC7", "panic: apply stopped\n", mode);
+}
+
+test "fn apply actual stdlib source free callback managed allocation runtime OOM O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\@[extern("enable_failure")]
+        \\let enableFailure:()
+        \\let allocate:(x:int)->[][]int={enableFailure()
+        \\[[x]]}
+        \\let run:()->[][]int=std.fn.apply(7,allocate)
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\void enable_failure(void) { fail_allocations = 1; }
+        \\int main(void) { nov_rt_heap.collect_every_allocation = 1; (void)nov_run(); return 0; }
+    , true);
+}
+
 test "default source free small compiler allocation rollback" {
     // Exercise factory/default ownership without sweeping stdlib import allocations.
     const source =

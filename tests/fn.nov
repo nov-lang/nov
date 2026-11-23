@@ -10,7 +10,7 @@ let main: () = {
     let increment = (value: int) -> int { value + 1 }
     @println("Composed:", std.fn.compose(double, increment)(3))
     let positive = (value: int) -> bool { value > 0 }
-    @println("Negated:", std.fn.neg(positive)(0))
+    @println("Negated:", std.fn.negate(positive)(0))
     std.fn.noop()
 }
 
@@ -124,25 +124,236 @@ let compose_managed_results_and_unevaluated_queries: () = {
     let query: @TypeOf(std.fn.compose(row, make())) = composed
     @assert(calls == 0 and query(0).values == [1, 2])
     let isEmpty = (values: []int) -> bool { @len(values) == 0 }
-    let negQuery: @TypeOf(std.fn.neg(isEmpty)) = std.fn.neg(isEmpty)
+    let negQuery: @TypeOf(std.fn.negate(isEmpty)) = std.fn.negate(isEmpty)
     @assert(negQuery([1]))
 }
 
 @[test]
-let neg_inverts_once_and_preserves_shared_captures: () = {
+let negate_inverts_once_and_preserves_shared_captures: () = {
     let mut calls: uint = 0
     let positive = (value: int) -> bool {
         calls += 1
         value > 0
     }
-    let nonpositive = std.fn.neg(positive)
+    let nonpositive = std.fn.negate(positive)
     let copied = nonpositive
     @assert(calls == 0)
     @assert(nonpositive(0) and calls == 1)
     @assert(copied(-1) and calls == 2)
     @assert(nonpositive(1) == false and calls == 3)
-    @assert(std.fn.neg(nonpositive)(2) and calls == 4)
+    @assert(std.fn.negate(nonpositive)(2) and calls == 4)
     @assert(std.array.filter([-1, 0, 1], nonpositive) == [-1, 0] and calls == 7)
     let empty = (text: str) -> bool { @len(text) == 0 }
-    @assert(std.fn.neg(empty)("é") and std.fn.neg(empty)("") == false)
+    @assert(std.fn.negate(empty)("é") and std.fn.negate(empty)("") == false)
+}
+
+@[test]
+let apply_preserves_types_copies_and_shared_state: () = {
+    let count = (text: str) -> uint { @len(text) }
+    let length: uint = std.fn.apply("hello", count)
+    @assert(length == 5)
+    let mut source = Row.[ values = [1, 2] ]
+    let mut result = std.fn.apply(source, std.fn.identity)
+    source.values[0] = 9
+    result.values[1] = 8
+    @assert(source.values == [9, 2] and result.values == [1, 8])
+    let mut calls = 0
+    let tick = (value: int) -> int {
+        calls += value
+        calls
+    }
+    let copied = std.fn.apply(tick, std.fn.identity)
+    @assert(copied(2) == 2 and tick(3) == 5)
+    let visit = (value: int) { calls += value }
+    std.fn.apply(4, visit)
+    @assert(calls == 9)
+    let fail = (value: int) -> std.Result(int, str) { .err["ordinary error"] }
+    @assert(std.fn.apply(0, fail) == std.Result(int, str).err["ordinary error"])
+}
+
+@[test]
+let arithmetic_helpers_infer_types_and_follow_numeric_rules: () = {
+    let wrapped: u8 = std.fn.add(@as(u8, 255), @as(u8, 1))
+    let underflow: u16 = std.fn.sub(@as(u16, 0), @as(u16, 1))
+    let product: i8 = std.fn.mul(@as(i8, 64), @as(i8, 2))
+    @assert(wrapped == 0 and underflow == 65535 and product == -128)
+    @assert(std.fn.div(-7, 3) == -2 and std.fn.rem(-7, 3) == -1)
+    @assert(std.fn.div(@as(i8, -128), @as(i8, -1)) == -128)
+    @assert(std.fn.rem(@as(i8, -128), @as(i8, -1)) == 0)
+    let unsigned: uint = std.fn.div(@as(uint, 9), @as(uint, 2))
+    let single: f32 = std.fn.add(@as(f32, 1.5), @as(f32, 2.0))
+    let double: f64 = std.fn.mul(@as(f64, 1.5), @as(f64, 2.0))
+    @assert(unsigned == 4 and single == 3.5 and double == 3.0)
+    let infinity = std.fn.div(@as(f64, 1.0), @as(f64, 0.0))
+    let nan = std.fn.div(@as(f64, 0.0), @as(f64, 0.0))
+    @assert(infinity > 1.0 and nan != nan)
+    @assert(std.fn.add("hé", "llo") == "héllo")
+    let mut source = [[1]]
+    let mut joined = std.fn.add(source, [[2]])
+    source[0] = [9]
+    joined[1] = [8]
+    @assert(source == [[9]] and joined == [[1], [8]])
+    @assert(std.array.fold([1, 2, 3], 0, std.fn.add) == 6)
+    let subtract: (int, int) -> int = std.fn.sub
+    @assert(std.fn.flip(subtract)(3, 10) == 7)
+}
+
+@[test]
+let comparison_helpers_preserve_structural_and_ieee_rules: () = {
+    @assert(std.fn.equal(Row.[ values = [1, 2] ], Row.[ values = [1, 2] ]))
+    @assert(std.fn.notEqual([[1], [2]], [[1], [3]]))
+    let some: std.Option([]int) = .some[[1, 2]]
+    let same: std.Option([]int) = .some[[1, 2]]
+    let none: std.Option([]int) = .none[]
+    @assert(std.fn.equal(some, same) and std.fn.notEqual(some, none))
+    @assert(std.fn.equal("a\0b", "a\0b") and std.fn.notEqual("a\0b", "a\0c"))
+    let zero: f64 = 0.0
+    let negativeZero: f64 = -0.0
+    let nan = std.fn.div(zero, zero)
+    @assert(std.fn.equal(zero, negativeZero) and !std.fn.notEqual(zero, negativeZero))
+    @assert(!std.fn.equal(nan, nan) and std.fn.notEqual(nan, nan))
+    @assert(!std.fn.lessThan(nan, zero) and !std.fn.lessOrEqual(nan, zero))
+    @assert(!std.fn.greaterThan(nan, zero) and !std.fn.greaterOrEqual(nan, zero))
+    @assert(!std.fn.equal([nan], [nan]))
+    @assert(std.fn.lessOrEqual(2, 2) and std.fn.greaterOrEqual(2, 2))
+    @assert(std.array.sort([3, 1, 2], std.fn.lessThan) == [1, 2, 3])
+    @assert(std.array.sort([3, 1, 2], std.fn.greaterThan) == [3, 2, 1])
+}
+
+@[test]
+let bitwise_and_unary_helpers_preserve_exact_types: () = {
+    let masked: u8 = std.fn.bitAnd(@as(u8, 12), @as(u8, 5))
+    let combined: u16 = std.fn.bitOr(@as(u16, 12), @as(u16, 5))
+    let toggled: u32 = std.fn.bitXor(@as(u32, 12), @as(u32, 5))
+    let inverted: u64 = std.fn.bitNot(@as(u64, 0))
+    let signed: i16 = std.fn.bitNot(@as(i16, 0))
+    let native: uint = std.fn.bitNot(@as(uint, 0))
+    @assert(masked == 4 and combined == 13 and toggled == 9)
+    @assert(inverted == 18446744073709551615 and signed == -1 and native > 0)
+    let minimum: i8 = std.fn.neg(@as(i8, -128))
+    let negative: i64 = std.fn.neg(@as(i64, 7))
+    let single: f32 = std.fn.neg(@as(f32, 1.5))
+    let negativeZero: f64 = std.fn.neg(@as(f64, 0.0))
+    @assert(minimum == -128 and negative == -7 and single == -1.5)
+    @assert(std.fn.div(@as(f64, 1.0), negativeZero) < 0.0)
+    @assert(std.array.map([1, -2, 3], std.fn.neg) == [-1, 2, -3])
+    @assert(std.array.map([0, 1], std.fn.bitNot) == [-1, -2])
+}
+
+let Operand = struct {
+    value: int,
+
+    @[public]
+    @[operator(.add)]
+    let add: (left: Operand, right: int) -> []int = [left.value, right]
+    @[public]
+    @[operator(.sub)]
+    let sub: (left: Operand, right: int) -> int = left.value - right
+    @[public]
+    @[operator(.mul)]
+    let mul: (left: int, right: Operand) -> str = "{left}:{right.value}"
+    @[public]
+    @[operator(.div)]
+    let div: (left: Operand, right: int) -> int = left.value / right
+    @[public]
+    @[operator(.rem)]
+    let rem: (left: Operand, right: int) -> int = left.value % right
+    @[public]
+    @[operator(.bit_and)]
+    let bitAnd: (left: Operand, right: int) -> int = left.value & right
+    @[public]
+    @[operator(.bit_or)]
+    let bitOr: (left: Operand, right: int) -> int = left.value | right
+    @[public]
+    @[operator(.bit_xor)]
+    let bitXor: (left: Operand, right: int) -> int = left.value ^ right
+    @[public]
+    @[operator(.neg)]
+    let negative: (value: Operand) -> int = -value.value
+    @[public]
+    @[operator(.equal)]
+    let equal: (left: Operand, right: int) -> bool = left.value == right
+    @[public]
+    @[operator(.less_than)]
+    let less: (left: Operand, right: int) -> bool = left.value < right
+    @[public]
+    @[operator(.less_than)]
+    let lessReversed: (left: int, right: Operand) -> bool = left < right.value
+}
+
+let Output = struct {
+    write: (int),
+
+    @[public]
+    @[operator(.add)]
+    let send: (left: Output, right: int) = left.write(right)
+}
+
+@[test]
+let operator_helpers_support_mixed_nominal_hooks: () = {
+    let value = Operand.[ value = 12 ]
+    let mut result: []int = std.fn.add(value, 5)
+    result[0] = 99
+    @assert(std.fn.add(value, 5) == [12, 5] and value.value == 12)
+    @assert(std.fn.sub(value, 5) == 7 and std.fn.mul(2, value) == "2:12")
+    @assert(std.fn.div(value, 5) == 2 and std.fn.rem(value, 5) == 2)
+    @assert(std.fn.bitAnd(value, 5) == 4 and std.fn.bitOr(value, 5) == 13)
+    @assert(std.fn.bitXor(value, 5) == 9 and std.fn.neg(value) == -12)
+    @assert(std.fn.equal(value, 12) and std.fn.notEqual(value, 5))
+    @assert(std.fn.lessThan(value, 13) and std.fn.greaterThan(value, 11))
+    @assert(std.fn.lessOrEqual(value, 12) and std.fn.greaterOrEqual(value, 12))
+    @assert(std.fn.lessThan(11, value) and std.fn.greaterThan(13, value))
+    @assert(std.fn.lessOrEqual(12, value) and std.fn.greaterOrEqual(12, value))
+    let multiply: (int, Operand) -> str = std.fn.mul
+    @assert(std.fn.flip(multiply)(value, 2) == "2:12")
+    let mut total = 0
+    let output = Output.[
+        write = (number: int) { total += number }
+    ]
+    std.fn.add(output, 3)
+    @assert(total == 3)
+}
+
+@[test]
+let operator_callbacks_evaluate_once_left_to_right_and_queries_are_pure: () = {
+    let mut events: []int = []
+    let left = () -> Operand {
+        events += [1]
+        Operand.[ value = 12 ]
+    }
+    let right = () -> int {
+        events += [2]
+        5
+    }
+    let sum: @TypeOf(std.fn.add(left(), right())) = [0]
+    let comparison: @TypeOf(std.fn.greaterThan(left(), right())) = false
+    let negative: @TypeOf(std.fn.neg(left())) = 0
+    let arithmeticNegation: (int) -> int = std.fn.neg
+    let applied: @TypeOf(std.fn.apply(right(), arithmeticNegation)) = 0
+    @assert(events == [] and sum == [0] and !comparison and negative == 0 and applied == 0)
+    @assert(std.fn.add(left(), right()) == [12, 5] and events == [1, 2])
+    events = []
+    @assert(std.fn.greaterThan(left(), right()) and events == [1, 2])
+    events = []
+    let makeTransform = () -> (int) -> int {
+        events += [3]
+        (value: int) -> int {
+            events += [4]
+            value * 2
+        }
+    }
+    @assert(std.fn.apply(right(), makeTransform()) == 10 and events == [2, 3, 4])
+    let mut source = [1]
+    let replace = () -> []int {
+        source[0] = 9
+        [2]
+    }
+    @assert(std.fn.add(source, replace()) == [1, 2] and source == [9])
+    let mut calls = 0
+    let output = Output.[
+        write = (number: int) { calls += number }
+    ]
+    let query: @TypeOf(std.fn.add(output, right())) = std.fn.noop()
+    let voidApply: @TypeOf(std.fn.apply(3, output.write)) = std.fn.noop()
+    @assert(calls == 0 and events == [2, 3, 4])
 }

@@ -1,17 +1,14 @@
 ; Turn raw scores into a short report using reusable callbacks.
 let std = @import("std")
 
-; Backtick types are inferred from the callback and its input.
-let apply: (value: `T, transform: (`T) -> `U) -> `U = transform(value)
-
 let main: () = {
     let scores = [-3, 0, 4, 7]
     let rejected = (score: int) -> bool { score <= 0 }
-    let accepted = std.array.filter(scores, std.fn.neg(rejected))
+    let accepted = std.array.filter(scores, std.fn.negate(rejected))
 
     let bonus = 2
-    let adjust = (score: int) -> int { score + bonus }
-    let double = (score: int) -> int { score * 2 }
+    let adjust = (score: int) -> int { std.fn.add(score, bonus) }
+    let double = (score: int) -> int { std.fn.mul(score, 2) }
     let prepare = std.fn.compose(double, adjust)
     let prepared = std.array.map(accepted, prepare)
 
@@ -23,9 +20,12 @@ let main: () = {
     }
     let labels = std.array.map(prepared, annotate)
     let render = (parts: []str) -> str { std.string.join(parts, ", ") }
-    let report = apply(labels, render)
+    let report = std.fn.apply(labels, render)
+    ; The generic operator helper specializes to this fold's integer callback.
+    let total = std.array.fold(prepared, 0, std.fn.add)
     @println("Accepted:", accepted)
     @println("Prepared:", prepared)
+    @println("Total:", total)
     @println("Report:", report)
 
     let label: (name: str, value: int) -> str = "{name}: {value}"

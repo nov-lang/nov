@@ -29,11 +29,11 @@ bare names. String values use the `str` type; the module remains `std.string`.
 `std.mem` provides `swap(&mut T, &mut T)`, `replace(&mut T, T) -> T`, and
 `take(&mut T) -> T`. `std.fn` provides `identity(T) -> T`,
 `const(T) -> () -> T`, `noop()`, `compose((B) -> C, (A) -> B) -> (A) -> C`,
-`flip((A, B) -> C) -> (B, A) -> C`, and `neg((T) -> bool) -> (T) -> bool`.
+`flip((A, B) -> C) -> (B, A) -> C`, and `negate((T) -> bool) -> (T) -> bool`.
 Types are inferred at each call. Ordinary value-copy rules apply; `const`
 captures its argument by value, while copied closures share their captured cells.
 `compose(f, g)(x)` calls `g(x)` then `f` on its result, once each.
-`neg(predicate)(x)` calls the predicate once and negates its boolean result.
+`negate(predicate)(x)` calls the predicate once and negates its boolean result.
 Neither helper invokes its callbacks during construction.
 `replace(&value, replacement)` installs the replacement and returns the old value.
 The destination must be mutable and the replacement must match its type exactly.
@@ -41,7 +41,7 @@ Normal recursive value-copy rules apply to both the returned and stored values;
 function copies retain shared captured cells. Arguments evaluate once, destination
 before replacement; an unevaluated `@TypeOf` query neither borrows nor mutates.
 See [`tests/mem.nov`](../tests/mem.nov) (eight tests) and
-[`tests/fn.nov`](../tests/fn.nov) (seven tests) for usage.
+[`tests/fn.nov`](../tests/fn.nov) (thirteen tests) for usage.
 `fn` is an ordinary identifier, not a reserved keyword.
 Run `zig build test-cli-mem-fn` for the migration CLI coverage.
 
@@ -77,6 +77,71 @@ has no automatic default. See [Default values](../README.md#default-values) and
 Future direction only: compiler-recognized protocols may be replaced/generalized
 by a Rust-like trait system, including user-defined annotations. No trait syntax
 or implementation is approved; user-defined annotations are not supported now.
+
+## Function application and operator callbacks
+
+All `std.fn` helpers are ordinary public Nov functions. In addition to the
+combinators above, they expose these exact generic signatures:
+
+```nov
+apply(value: `T, transform: (`T) -> `U) -> `U
+add(left: `A, right: `B) -> `C          ; left + right
+sub(left: `A, right: `B) -> `C          ; left - right
+mul(left: `A, right: `B) -> `C          ; left * right
+div(left: `A, right: `B) -> `C          ; left / right
+rem(left: `A, right: `B) -> `C          ; left % right
+bitAnd(left: `A, right: `B) -> `C       ; left & right
+bitOr(left: `A, right: `B) -> `C        ; left | right
+bitXor(left: `A, right: `B) -> `C       ; left ^ right
+neg(value: `T) -> `U                   ; -value
+bitNot(value: `T) -> `U                ; ~value
+equal(left: `A, right: `B) -> bool     ; left == right
+notEqual(left: `A, right: `B) -> bool  ; left != right
+lessThan(left: `A, right: `B) -> bool  ; left < right
+lessOrEqual(left: `A, right: `B) -> bool ; left <= right
+greaterThan(left: `A, right: `B) -> bool ; left > right
+greaterOrEqual(left: `A, right: `B) -> bool ; left >= right
+```
+
+`apply(value, transform)` calls `transform(value)` once and returns its exact
+result, including `void` or an ordinary user error result; it does not unwrap or
+catch errors/panics. `neg` is arithmetic negation, while `negate(predicate)`
+returns a predicate that negates the original boolean result. This replaces the
+previous predicate name `neg`; there is no compatibility alias.
+
+Operator helpers directly execute the corresponding operator. Builtin numeric
+operands retain exact types (no widening, casts or implicit conversions), wrapping
+integer arithmetic/negation, truncating integer division and remainder, and
+existing division-by-zero panics and signed-minimum / -1 wrapping rules. Floats
+retain IEEE division, NaN and signed-zero behavior. Addition also accepts strings
+and exact-element-type arrays. Equality remains recursive for structs, arrays
+and unions, with IEEE equality for nested floats; builtin float comparisons with
+NaN are unordered, including `<=` and `>=`. Bitwise operations remain integer-only
+except for the existing nominal binary hooks; no bit-not hook, shifts, new
+operators or builtins are introduced.
+
+Independent `A`, `B` and `C` allow existing exact mixed nominal operator signatures
+and results different from either operand, including managed values, functions
+and `void`. Hooks used through this library must be accessible `@[public]`
+methods. Lookup, ambiguity and derived nominal comparisons obey the
+[existing operator rules](#equality-and-operator-metadata); expected result types
+do not select an overload. Unsupported operand combinations diagnose normally.
+
+Arguments evaluate eagerly once, left to right, before callbacks/operators run;
+this also holds for comparisons whose nominal hook reverses operands. Ordinary
+argument snapshots and independent recursive array/record result copies apply;
+immutable strings may share storage and copied closures share captured cells.
+`@TypeOf` validates types without evaluating arguments, invoking callbacks/hooks,
+mutating state or triggering runtime panics.
+
+Helpers specialize as ordinary typed callbacks, for example
+`std.array.fold([1, 2, 3], 0, std.fn.add)`,
+`std.array.sort([3, 1, 2], std.fn.lessThan)` and
+`std.array.map([1, -2], std.fn.neg)`. When higher-order generic inference has
+insufficient context, bind a concrete signature first, such as
+`let subtract: (int, int) -> int = std.fn.sub`, then `std.fn.flip(subtract)`.
+See [`examples/functions.nov`](../examples/functions.nov) for application,
+arithmetic and folding without local helper definitions.
 
 ## Math helpers
 
