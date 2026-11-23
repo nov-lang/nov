@@ -64,9 +64,7 @@ let eager_once_only_arguments_and_pure_type_queries: () = {
     let minimum: @TypeOf(abs(@as(i8, -128))) = 4
     @assert(query == 3 and minimum == 4 and calls == 1)
     let stop = () -> int {
-        abs(
-            { return 9 }
-        )
+        abs({ return 9 })
     }
     @assert(stop() == 9)
 }

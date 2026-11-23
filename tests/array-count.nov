@@ -4,10 +4,7 @@ let yes: (value: `T) -> bool = true
 let no: (value: `T) -> bool = false
 
 let main: () = {
-    let passing = count(
-        [42, 81, 59, 90, 60],
-        (score) { score >= 60 }
-    )
+    let passing = count([42, 81, 59, 90, 60], (score) { score >= 60 })
     @println("Passing:", passing)
 }
 
@@ -53,12 +50,7 @@ let managed_snapshot_and_callback_copies: () = {
     @assert(result == 2 and seen == [1, 2] and source[0].values == [[99]])
     @assert(count([[[1]], [[2]]], yes) == 2)
     let payloads: []std.Option([][]int) = [.some[[[4]]], .none[]]
-    @assert(
-        count(
-            payloads,
-            (value) { value.isSome() }
-        ) == 1
-    )
+    @assert(count(payloads, (value) { value.isSome() }) == 1)
 }
 
 let Choice = enum {
@@ -68,20 +60,10 @@ let Choice = enum {
 
 @[test]
 let storable_types_and_shared_closure_cells: () = {
-    @assert(
-        count(
-            [true, false],
-            (value) { value }
-        ) == 1
-    )
+    @assert(count([true, false], (value) { value }) == 1)
     @assert(count(["é", "😀"], yes) == 2 and count(['é', 'a'], no) == 0)
     @assert(count([Choice.one, .two], yes) == 2)
-    @assert(
-        count(
-            [1..4, 5..9],
-            (value) { @len(value) == 4 }
-        ) == 1
-    )
+    @assert(count([1..4, 5..9], (value) { @len(value) == 4 }) == 1)
     @assert(count([@as(i8, 1)], yes) == 1 and count([@as(u8, 1)], yes) == 1)
     @assert(count([@as(i16, 1)], yes) == 1 and count([@as(u16, 1)], yes) == 1)
     @assert(count([@as(i32, 1)], yes) == 1 and count([@as(u32, 1)], yes) == 1)
@@ -96,12 +78,7 @@ let storable_types_and_shared_closure_cells: () = {
         calls
     }
     let callbacks = [tick, tick, tick]
-    @assert(
-        count(
-            callbacks,
-            (callback) { callback() > 1 }
-        ) == 2
-    )
+    @assert(count(callbacks, (callback) { callback() > 1 }) == 2)
     @assert(calls == 3 and callbacks[0]() == 4 and tick() == 5)
 }
 

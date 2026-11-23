@@ -42,9 +42,7 @@ let arrays_slices_blocks_if_and_match: () = {
             1
         }
     ) = 6
-    let branch: @TypeOf(
-        if true { 1 } else { fail() }
-    ) = 7
+    let branch: @TypeOf(if true { 1 } else { fail() }) = 7
     let matched: @TypeOf(
         match true {
             true => 1
@@ -89,9 +87,7 @@ let references_borrows_and_type_only_captures: () = {
     @assert(p.* == 3 and reference.* == 3 and type_only() == 4)
     let mut other = 5
     let q = &other
-    let callback: @TypeOf(
-        () -> int { other }
-    ) = () -> int { 6 }
+    let callback: @TypeOf(() -> int { other }) = () -> int { 6 }
     q.* += 1
     @assert(q.* == 6 and callback() == 6)
     let mut reserved = 10
@@ -126,9 +122,7 @@ let closures_and_inferred_generic_calls: () = {
         )
     ) = ["safe"]
     let generic: @TypeOf(identity(@as(u8, 1))) = 7
-    let closure: @TypeOf(
-        (value: int) -> int { value + 1 }
-    ) = (value) { value + 2 }
+    let closure: @TypeOf((value: int) -> int { value + 1 }) = (value) { value + 2 }
     @assert(calls == 0 and items[0] == "safe" and generic == 7 and closure(3) == 5)
 }
 
@@ -138,13 +132,5 @@ let main: () = {
     @println("Literals:", @TypeOf(1), @TypeOf(1.5), @TypeOf('λ'))
     let text = "λ世"
     @println("Expressions:", @TypeOf(p.*), @TypeOf(result()), @TypeOf(text[0..1]))
-    @println(
-        "Generic:",
-        @TypeOf(
-            std.array.map(
-                [1, 2],
-                (item) { "{item}" }
-            )
-        )
-    )
+    @println("Generic:", @TypeOf(std.array.map([1, 2], (item) { "{item}" })))
 }

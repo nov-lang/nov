@@ -292,9 +292,11 @@ let trim: (text: str) -> str = {
 }
 
 @[public]
-let replace: (text: str, pattern: str, replacement: str) -> str = {
-    join(split(text, pattern), replacement)
-}
+let replace: (
+    text: str,
+    pattern: str,
+    replacement: str
+) -> str = { join(split(text, pattern), replacement) }
 
 @[public]
 let repeat: (text: str, count: uint) -> str = {

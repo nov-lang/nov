@@ -64,9 +64,7 @@ let overrides_apply_recursively_and_inequality_negates: () = {
     let b = User.[ id = 7, name = "Grace" ]
     let c = User.[ id = 8, name = "Ada" ]
     @assert(a == b and a != c)
-    @assert(
-        { a != b } == false
-    )
+    @assert({ a != b } == false)
     @assert([a] == [b] and [[a]] == [[b]])
     @assert(b in [c, a])
     let success: std.Option(User) = .some[a]

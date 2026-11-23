@@ -3,32 +3,17 @@ let std = @import("std")
 
 let main: () = {
     let raw: []int = [72, -5, 90, 48, 65, 100]
-    let valid = std.array.filter(
-        raw,
-        (score) { score >= 0 }
-    )
-    let adjusted = std.array.map(
-        valid,
-        (score) { std.math.clamp(score + 5, 0, 100) }
-    )
-    let ranked = std.array.sort(
-        adjusted,
-        (a, b) { a > b }
-    )
+    let valid = std.array.filter(raw, (score) { score >= 0 })
+    let adjusted = std.array.map(valid, (score) { std.math.clamp(score + 5, 0, 100) })
+    let ranked = std.array.sort(adjusted, (a, b) { a > b })
     @println("Raw scores: {raw}")
     @println("Adjusted ranking: {ranked}")
 
-    let passing = std.array.count(
-        ranked,
-        (score) { score >= 70 }
-    )
+    let passing = std.array.count(ranked, (score) { score >= 70 })
     let total = std.array.fold(ranked, 0, std.fn.add)
     @println("Passing: {passing} of {@len(ranked)}")
     @println("Total points: {total}")
-    match std.array.findLastIndex(
-        ranked,
-        (score) { score >= 70 }
-    ) {
+    match std.array.findLastIndex(ranked, (score) { score >= 70 }) {
         .some[index] => { @println("Last passing index: {index}") }
         .none => { @println("No passing scores") }
     }

@@ -27,6 +27,11 @@ const CompactSpan = struct {
     node: Ast.Node.Index,
     start: usize,
     end: usize,
+    kind: enum { block, call_list, list } = .block,
+
+    fn lessThan(_: void, a: CompactSpan, b: CompactSpan) bool {
+        return if (a.start == b.start) a.end > b.end else a.start < b.start;
+    }
 };
 
 const ExpressionContext = struct {
@@ -117,28 +122,66 @@ fn renderTreeWithWidth(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixu
         try renderTreeInner(&output, ast, fixups, &expanded, &spans);
         const text = output.written();
         var changed = false;
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var start: usize = 0;
-        var first_span: usize = 0;
-        while (lines.next()) |line| {
-            const end = start + line.len;
-            // Count scalar starts rather than UTF-8 bytes. Token contents are
-            // copied unchanged; this is only a layout measurement.
-            var width: usize = 0;
-            for (line) |byte| {
-                if (byte & 0xc0 != 0x80) width += 1;
+        // Calls are recorded after their arguments, so nested spans arrive in
+        // postorder. Sort outer spans first rather than assuming disjointness.
+        std.mem.sort(CompactSpan, spans.items, {}, CompactSpan.lessThan);
+        for (spans.items) |span| {
+            if (std.mem.indexOfScalar(u8, text[span.start..span.end], '\n') != null) {
+                const entry = try expanded.getOrPut(buffer.allocator, span.node);
+                changed = changed or !entry.found_existing;
             }
-            // Compact blocks cannot contain other blocks, so spans arrive in
-            // output order. Sweep them rather than rescanning for every line.
-            while (first_span < spans.items.len and spans.items[first_span].end <= start) : (first_span += 1) {}
-            if (width > 100) {
-                for (spans.items[first_span..]) |span| {
-                    if (span.start >= end) break;
-                    const entry = try expanded.getOrPut(buffer.allocator, span.node);
-                    changed = changed or !entry.found_existing;
+        }
+        // Stabilize actual multiline arguments before measuring width. Their
+        // enclosing calls may give compact lambdas enough room on a new line.
+        if (changed) continue;
+        // A source-preserving list can relieve the entire physical line,
+        // including calls outside its span (prototype results and constructor
+        // types, for example). Stabilize those lists before committing any call
+        // width decisions. Lists inside a compact call wait for that call first.
+        for ([_]bool{ true, false }) |source_lists_first| {
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            var start: usize = 0;
+            var first_span: usize = 0;
+            while (lines.next()) |line| {
+                const end = start + line.len;
+                // Count scalar starts rather than UTF-8 bytes. Token contents
+                // are copied unchanged; this is only a layout measurement.
+                var width: usize = 0;
+                for (line) |byte| {
+                    if (byte & 0xc0 != 0x80) width += 1;
                 }
+                while (first_span < spans.items.len and spans.items[first_span].end <= start) : (first_span += 1) {}
+                if (width > 100) {
+                    var has_call = false;
+                    for (spans.items[first_span..]) |span| {
+                        if (span.start >= end) break;
+                        if (span.end > start and span.kind == .call_list) {
+                            has_call = true;
+                            break;
+                        }
+                    }
+                    var containing_end: usize = 0;
+                    for (spans.items[first_span..]) |span| {
+                        if (span.start >= end) break;
+                        if (span.end <= start or span.start < containing_end) continue;
+                        if (source_lists_first) {
+                            if (!has_call or span.kind == .block) continue;
+                            containing_end = span.end;
+                            if (span.kind == .call_list) continue;
+                        } else {
+                            if (span.kind == .list) continue;
+                            if (has_call and span.kind != .call_list) continue;
+                            // Reconsider nested arguments at their new
+                            // indentation on the next whole-tree pass.
+                            containing_end = span.end;
+                        }
+                        const entry = try expanded.getOrPut(buffer.allocator, span.node);
+                        changed = changed or !entry.found_existing;
+                    }
+                }
+                start = end + 1;
             }
-            start = end + 1;
+            if (changed) break;
         }
         if (!changed) break;
     }
@@ -223,7 +266,7 @@ fn renderMember(
                 if (data.rhs != 0) {
                     const args = [_]Ast.Node.Index{data.rhs};
                     const close = ast.lastToken(attribute) - 1;
-                    try self.renderList(token + 2, close, &args, false);
+                    try self.renderList(attribute, token + 2, close, &args, false);
                     try self.renderToken(close, .none);
                 }
                 try self.renderToken(ast.lastToken(attribute), .endline);
@@ -342,12 +385,14 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
                 ais.popSpace();
                 ais.popIndent();
             }
-            try self.renderToken(block.ast.rbrace, space);
+            const close_lexeme = tokenSliceForRender(ast, block.ast.rbrace);
+            try ais.writer().writeAll(close_lexeme);
             if (compact) try self.compact_spans.append(self.allocator, .{
                 .node = group,
                 .start = start,
                 .end = self.output.written().len,
             });
+            try self.renderSpace(block.ast.rbrace, close_lexeme.len, space);
         },
         .loop_range => {
             const loop = ast.fullRange(node).?;
@@ -519,15 +564,28 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
                 .array_init_two, .array_init_two_comma => buffer[0..@as(usize, if (buffer[1] != 0) 2 else if (buffer[0] != 0) 1 else 0)],
                 else => ast.extra_data[datas[node].lhs..datas[node].rhs],
             };
-            try self.renderList(main_tokens[node], ast.lastToken(node), items, false);
+            try self.renderList(node, main_tokens[node], ast.lastToken(node), items, false);
             return self.renderToken(ast.lastToken(node), space);
         },
 
         .call_one, .call_one_comma, .call, .call_comma => {
             const call = ast.fullCall(node).?;
             try self.renderExpression(call.ast.fn_expr, .none);
-            try self.renderList(call.ast.lparen, ast.lastToken(node), call.ast.args, false);
-            return self.renderToken(ast.lastToken(node), space);
+            const open = call.ast.lparen;
+            const close = ast.lastToken(node);
+            const multiline = self.expanded.contains(node) or hasComment(ast, open, close);
+            const start = self.output.written().len;
+            try self.renderListLayout(open, close, call.ast.args, false, multiline);
+            // Exclude closing-token spacing/comments: an outer statement's
+            // newline is not a multiline argument of this call.
+            try ais.writer().writeAll(tokenSliceForRender(ast, close));
+            if (!multiline and call.ast.args.len != 0) try self.compact_spans.append(self.allocator, .{
+                .node = node,
+                .start = start,
+                .end = self.output.written().len,
+                .kind = .call_list,
+            });
+            return self.renderSpace(close, tokenSliceForRender(ast, close).len, space);
         },
 
         .array_access,
@@ -538,11 +596,13 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
             try self.renderExpression(suffix.lhs, .none);
             // Unlike literal/call lists, the parser requires the closing index
             // bracket immediately after the expression (no newline token).
-            const multiline = self.listIsMultiline(lbracket, ast.lastToken(node));
+            const multiline = self.expanded.contains(node) or self.listIsMultiline(lbracket, ast.lastToken(node));
+            const start = self.output.written().len;
             if (multiline) try ais.pushIndent(.normal);
             defer if (multiline) ais.popIndent();
             try self.renderToken(lbracket, if (multiline) .newline else .none);
             try self.renderExpression(suffix.rhs, .none);
+            if (!multiline) try self.recordListSpan(node, start);
             return self.renderToken(ast.lastToken(node), space); // ]
         },
 
@@ -613,7 +673,8 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
             if (init.type_node != 0) try self.renderExpression(init.type_node, .none);
             const is_struct = node_tags[node] == .struct_init;
             if (is_struct) try self.renderToken(main_tokens[node] - 1, .none);
-            const multiline = self.listIsMultiline(main_tokens[node], ast.lastToken(node));
+            const multiline = self.expanded.contains(node) or self.listIsMultiline(main_tokens[node], ast.lastToken(node));
+            const start = self.output.written().len;
             if (multiline) try ais.pushIndent(.normal);
             try self.renderToken(main_tokens[node], if (multiline) .newline else if (init.fields.len != 0) .space else .none);
             for (init.fields) |field| {
@@ -632,6 +693,7 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
                 if (comma) try self.renderToken(last + 1, if (multiline) .newline else .space);
             }
             if (multiline) ais.popIndent();
+            if (!multiline) try self.recordListSpan(node, start);
             return self.renderToken(ast.lastToken(node), space);
         },
         .container_decl_trailing,
@@ -661,7 +723,7 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
                 }
             }
             close -= 1;
-            try self.renderList(proto.lparen, close, proto.ast.params, true);
+            try self.renderList(node, proto.lparen, close, proto.ast.params, true);
             if (proto.ast.return_type) |result| {
                 try self.renderToken(close, .space);
                 try self.renderToken(close + 1, .space);
@@ -760,7 +822,8 @@ fn inlineBlockExpression(self: *Render, node: Ast.Node.Index) bool {
     if (ast.nodes.items(.tag)[node] == .decl) return false;
     const first = ast.firstToken(node);
     const last = ast.lastToken(node);
-    if (!ast.tokensOnSameLine(first, last)) return false;
+    // Rendered spans, rather than source newlines, determine whether this
+    // expression stays on one line (in particular after normalizing calls).
     // Nested blocks and control flow have their own multiline layout. Keep
     // their enclosing block expanded, even when its source happens to fit.
     for (ast.tokens.items(.tag)[first .. last + 1]) |tag| switch (tag) {
@@ -772,12 +835,27 @@ fn inlineBlockExpression(self: *Render, node: Ast.Node.Index) bool {
 
 /// Preserve separators exactly, including trailing commas. Flattening all
 /// newlines can change expression continuation semantics.
-fn renderList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
+fn renderList(self: *Render, node: Ast.Node.Index, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
+    const multiline = self.expanded.contains(node) or self.listIsMultiline(open, close);
+    const start = self.output.written().len;
+    try self.renderListLayout(open, close, items, named, multiline);
+    if (!multiline) try self.recordListSpan(node, start);
+}
+
+// Legacy lists retain their source-layout policy, but must follow children
+// that acquire newlines during width passes to keep repeated formatting stable.
+fn recordListSpan(self: *Render, node: Ast.Node.Index, start: usize) Error!void {
+    try self.compact_spans.append(self.allocator, .{
+        .node = node,
+        .start = start,
+        .end = self.output.written().len,
+        .kind = .list,
+    });
+}
+
+fn renderListLayout(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool, multiline: bool) RenderError!void {
     const ast = self.ast;
     const tags = ast.tokens.items(.tag);
-    // Nested blocks may expand even when originally compact. Keep enclosing
-    // lists multiline on the first pass too, preserving stable repeated formatting.
-    const multiline = self.listIsMultiline(open, close);
     if (multiline) try self.ais.pushIndent(.normal);
     defer if (multiline) self.ais.popIndent();
     try self.renderToken(open, if (multiline) .newline else .none);

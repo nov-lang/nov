@@ -70,8 +70,20 @@ let enum_union_and_generic_ordering: () = {
     @assert(@min([.high, Ranked.low]) == Ranked.low)
     let rankedQuery: @TypeOf(@min([.high, Ranked.low])) = .low
     @assert(rankedQuery == Ranked.low)
-    @assert(@max([.[ key = 1, name = "first", values = [] ], Entry.[ key = 2, name = "second", values = [] ]]).key == 2)
-    let entryQuery: @TypeOf(@min([.[ key = 1, name = "first", values = [] ], Entry.[ key = 2, name = "second", values = [] ]])) = .[ key = 0, name = "query", values = [] ]
+    @assert(
+        @max(
+            [.[ key = 1, name = "first", values = [] ], Entry.[ key = 2, name = "second", values = [] ]]
+        ).key == 2
+    )
+    let entryQuery: @TypeOf(
+        @min(
+            [.[ key = 1, name = "first", values = [] ], Entry.[ key = 2, name = "second", values = [] ]]
+        )
+    ) = .[
+        key = 0,
+        name = "query",
+        values = []
+    ]
     @assert(entryQuery.key == 0)
     @assert(@min([.number[-2], Amount.empty[]]) == Amount.number[-2])
     let amountQuery: @TypeOf(@min([.number[-2], Amount.empty[]])) = .empty[]
@@ -136,11 +148,7 @@ let arguments_are_eager_and_comparisons_run_afterwards: () = {
     @assert(@max([make(7)]).key == 7 and events == [7])
     events = []
     let stop = () -> int {
-        @max(
-            make(1),
-            { return 7 },
-            make(2)
-        )
+        @max(make(1), { return 7 }, make(2))
     }
     @assert(stop() == 7 and events == [1])
     events = []

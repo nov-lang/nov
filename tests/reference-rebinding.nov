@@ -31,16 +31,12 @@ let branches_match_and_block: () = {
         } else {
             p = &a
         }
-        @assert(
-            p.* == if flag { 10 } else { 1 }
-        )
+        @assert(p.* == if flag { 10 } else { 1 })
         match flag {
             true => { p = &a }
             false => { p = &b }
         }
-        @assert(
-            p.* == if flag { 1 } else { 10 }
-        )
+        @assert(p.* == if flag { 1 } else { 10 })
         { p = &b }
         ; The unconditional rebind kills all previous possible targets.
         a += 1
@@ -57,9 +53,7 @@ let branches_match_and_block: () = {
         ; Both branches release a, including accesses inside each branch.
         a += 1
         @assert(p.* == 12)
-        @assert(
-            a == if flag { 4 } else { 5 }
-        )
+        @assert(a == if flag { 4 } else { 5 })
         ; A reference declared inside a block may select an outer owner.
         {
             let mut q = &a
@@ -81,18 +75,14 @@ let short_circuit_selection: () = {
             true
         }
         @assert(both == flag)
-        @assert(
-            p.* == if flag { 10 } else { 1 }
-        )
+        @assert(p.* == if flag { 10 } else { 1 })
         p = &a
         let either = flag or {
             p = &b
             false
         }
         @assert(either == flag)
-        @assert(
-            p.* == if flag { 1 } else { 10 }
-        )
+        @assert(p.* == if flag { 1 } else { 10 })
     }
 }
 
@@ -106,17 +96,13 @@ let zero_one_many_iterations: () = {
             p = &b
             p.* += 1
         }
-        @assert(
-            p.* == if count == 0 { 1 } else { 10 + count }
-        )
+        @assert(p.* == if count == 0 { 1 } else { 10 + count })
         p = &a
         let mut i: int = 0
         loop i < count : i += 1 {
             p = &b
         }
-        @assert(
-            p.* == if count == 0 { 1 } else { 10 + count }
-        )
+        @assert(p.* == if count == 0 { 1 } else { 10 + count })
     }
 }
 
@@ -148,9 +134,7 @@ let condition_continuation_and_exhaustion: () = {
         } {
             continue
         }
-        @assert(
-            p.* == if count == 0 { 1 } else { 10 }
-        )
+        @assert(p.* == if count == 0 { 1 } else { 10 })
         loop false {
             p = &a
         } else {
@@ -177,9 +161,7 @@ let break_and_continue_paths: () = {
         } else {
             p = &a
         }
-        @assert(
-            p.* == if flag { 10 } else { 1 }
-        )
+        @assert(p.* == if flag { 10 } else { 1 })
     }
 }
 
@@ -192,9 +174,7 @@ let readonly_targets: () = {
         if flag {
             view = &b
         }
-        @assert(
-            view.* == if flag { 7 } else { 3 }
-        )
+        @assert(view.* == if flag { 7 } else { 3 })
         @assert("{@TypeOf(view)}" == "&u8")
     }
     let mut writable: u8 = 9
@@ -228,9 +208,7 @@ let array_elements_different_owners: () = {
         } else {
             p = &b[-1]
         }
-        @assert(
-            p.* == if flag { 2 } else { 30 }
-        )
+        @assert(p.* == if flag { 2 } else { 30 })
         p = &a[0]
         @assert(p.* == 2)
         p = &b[0]

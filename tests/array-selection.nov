@@ -126,10 +126,7 @@ let recursive_copies_in_both_directions: () = {
     let mut source = [Row.[ values = [[1, 2], [3]] ], Row.[ values = [[4]] ]]
     let mut taken = std.array.take(source, 2)
     let mut dropped = std.array.drop(source, 0)
-    let found = std.array.findLast(
-        source,
-        (value: Row) -> bool { true }
-    )
+    let found = std.array.findLast(source, (value: Row) -> bool { true })
     let mut row = taken[0]
     let mut inner = row.values[0]
     inner[0] = 8
@@ -182,10 +179,7 @@ let closures_share_capture_environments: () = {
     check_family(functions)
     let taken = std.array.take(functions, 1)
     let dropped = std.array.drop(functions, 1)
-    let found = std.array.findLast(
-        functions,
-        (value: () -> int) -> bool { true }
-    ).unwrapOr(next)
+    let found = std.array.findLast(functions, (value: () -> int) -> bool { true }).unwrapOr(next)
     @assert(count == 0)
     @assert(taken[0]() == 1 and dropped[0]() == 2 and found() == 3)
     @assert(functions[0]() == 4 and next() == 5)
@@ -227,10 +221,7 @@ let main: () = {
     @println("Numbers:", numbers)
     @println(
         "Last above two:",
-        std.array.findLast(
-            numbers,
-            (value: int) -> bool { value > 2 }
-        ).unwrapOr(0)
+        std.array.findLast(numbers, (value: int) -> bool { value > 2 }).unwrapOr(0)
     )
     @println("Take two:", std.array.take(numbers, 2))
     @println("Drop two:", std.array.drop(numbers, 2))

@@ -129,10 +129,7 @@ let function_elements_and_other_index_types: () = {
         count
     }
     let functions: []() -> int = [next, next, next]
-    let index = std.array.findIndex(
-        functions,
-        (value: () -> int) -> bool { value() == 2 }
-    )
+    let index = std.array.findIndex(functions, (value: () -> int) -> bool { value() == 2 })
     @assert(index.unwrapOr(99) == 1 and count == 2)
     std.array.each(
         functions,
@@ -228,9 +225,6 @@ let main: () = {
     @println("First:", std.array.find(numbers, large))
     @println("Index:", std.array.findIndex(numbers, large))
     @print("Each:")
-    std.array.each(
-        numbers,
-        (value) { @print(" {value}") }
-    )
+    std.array.each(numbers, (value) { @print(" {value}") })
     @println("")
 }

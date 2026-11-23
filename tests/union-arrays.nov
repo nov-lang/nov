@@ -142,39 +142,21 @@ let closure_snapshots_and_shared_cells: () = {
 let mapping_and_finding_arrays: () = {
     let some: Option(int) = .some[7]
     let none: Option(int) = .none[]
-    let mapped: Option([]int) = some.map(
-        (value) { [value, value + 1] }
-    )
+    let mapped: Option([]int) = some.map((value) { [value, value + 1] })
     @assert(mapped.unwrapOr([])[1] == 8)
-    @assert(
-        none.map(
-            (value) -> []int { @panic("none must skip array callback") }
-        ).isNone()
-    )
+    @assert(none.map((value) -> []int { @panic("none must skip array callback") }).isNone())
     let good: Result(int, []str) = .ok[4]
     let bad: Result(int, []str) = .err[["missing"]]
-    let result: Result([]int, []str) = good.map(
-        (value) { [value] }
-    )
+    let result: Result([]int, []str) = good.map((value) { [value] })
     @assert(result.unwrapOr([])[0] == 4)
-    @assert(
-        bad.map(
-            (value) -> []int { @panic("error must skip array callback") }
-        ).isErr()
-    )
+    @assert(bad.map((value) -> []int { @panic("error must skip array callback") }).isErr())
     let mut rows: [][]int = [[1], [2, 3]]
-    let found: Option([]int) = std.array.find(
-        rows,
-        (row) { @len(row) == 2 }
-    )
+    let found: Option([]int) = std.array.find(rows, (row) { @len(row) == 2 })
     rows[1] = [9]
     let mut detached = found.unwrapOr([])
     detached[0] = 8
     @assert(found.unwrapOr([])[0] == 2)
-    let missing = std.array.find(
-        rows,
-        (row) { @len(row) == 0 }
-    )
+    let missing = std.array.find(rows, (row) { @len(row) == 0 })
     @assert(missing.isNone())
 }
 

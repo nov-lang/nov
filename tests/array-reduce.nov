@@ -49,12 +49,7 @@ let exact_numeric_types_and_ieee_seed_preservation: () = {
     @assert(present(small) == @as(f32, 5.5) and present(large) == @as(f64, 5.5))
     let zero: f64 = 0.0
     let nan = zero / zero
-    let kept = present(
-        reduce(
-            [nan],
-            (left, right) { @panic("singleton callback") }
-        )
-    )
+    let kept = present(reduce([nan], (left, right) { @panic("singleton callback") }))
     @assert(kept != kept)
     let negative = present(reduce([-zero], first))
     @assert(1.0 / negative < 0.0)
@@ -81,14 +76,7 @@ let managed_results_are_recursively_independent: () = {
     source[0] = Row.[ values = [[7]] ]
     @assert(present(result).values == [[1], [2]])
     @assert(selected.values == [[8], [2]] and other.values == [[1], [9]])
-    @assert(
-        present(
-            reduce(
-                [[[1]], [[2]]],
-                (a, b) { a + b }
-            )
-        ) == [[1], [2]]
-    )
+    @assert(present(reduce([[[1]], [[2]]], (a, b) { a + b })) == [[1], [2]])
     let unions: []std.Option([][]int) = [.some[[[4]]], .none[]]
     let mut payload = present(present(reduce(unions, first)))
     payload[0] = [6]
@@ -102,22 +90,8 @@ let Choice = enum {
 
 @[test]
 let storable_types_and_shared_closure_cells: () = {
-    @assert(
-        present(
-            reduce(
-                [true, false],
-                (a, b) { a and b }
-            )
-        ) == false
-    )
-    @assert(
-        present(
-            reduce(
-                ["é", "😀"],
-                (a, b) { a + b }
-            )
-        ) == "é😀"
-    )
+    @assert(present(reduce([true, false], (a, b) { a and b })) == false)
+    @assert(present(reduce(["é", "😀"], (a, b) { a + b })) == "é😀")
     @assert(present(reduce(['é', 'a'], first)) == 'é')
     @assert(present(reduce([Choice.one, .two], first)) == Choice.one)
     @assert(@len(present(reduce([1..4, 5..9], first))) == 3)
@@ -155,14 +129,7 @@ let eager_snapshots_aliases_inference_and_pure_queries: () = {
     @assert(@len(source) == 0)
     let concrete: ([]u8, (u8, u8) -> u8) -> std.Option(u8) = reduce
     @assert(present(concrete([9, 2], subtract)) == @as(u8, 7))
-    @assert(
-        present(
-            reduce(
-                [9, 2],
-                (a, b) { a - b }
-            )
-        ) == 7
-    )
+    @assert(present(reduce([9, 2], (a, b) { a - b })) == 7)
     let mut constructed = 0
     let make = () -> (int, int) -> int {
         constructed += 1

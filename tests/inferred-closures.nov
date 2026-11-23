@@ -7,27 +7,14 @@ let double = (value: int) { value * 2 }
 
 @[test]
 let inferred_callbacks = () {
-    let doubled = std.array.map(
-        [1, 2, 3],
-        (x) { x * 2 }
-    )
-    let selected = std.array.filter(
-        doubled,
-        (x) { x > 2 }
-    )
-    let total = std.array.fold(
-        selected,
-        0,
-        (sum, x) { sum + x }
-    )
+    let doubled = std.array.map([1, 2, 3], (x) { x * 2 })
+    let selected = std.array.filter(doubled, (x) { x > 2 })
+    let total = std.array.fold(selected, 0, (sum, x) { sum + x })
     @assert(total == 10)
     @assert(double(4) == 8)
 
     let offset = 5
-    let shifted = std.array.map(
-        [1, 2],
-        (x) { x + offset }
-    )
+    let shifted = std.array.map([1, 2], (x) { x + offset })
     @assert(shifted[0] == 6 and shifted[1] == 7)
 
     let mut count = 0
@@ -44,19 +31,9 @@ let inferred_callbacks = () {
 }
 
 let main = () {
-    let doubled = std.array.map(
-        [1, 2, 3],
-        (x) { x * 2 }
-    )
-    let selected = std.array.filter(
-        doubled,
-        (x) { x > 2 }
-    )
-    let total = std.array.fold(
-        selected,
-        0,
-        (sum, x) { sum + x }
-    )
+    let doubled = std.array.map([1, 2, 3], (x) { x * 2 })
+    let selected = std.array.filter(doubled, (x) { x > 2 })
+    let total = std.array.fold(selected, 0, (sum, x) { sum + x })
     @println("Doubled: {doubled}")
     @println("Selected: {selected}; total: {total}")
 }

@@ -54,10 +54,7 @@ let exact_types_generic_callbacks_and_storable_elements: () = {
     let bytes: []u8 = [1, 2, 3]
     let exact: @TypeOf(bytes[1..]) = [2, 3]
     @assert(exact == tail(bytes))
-    let sliced = std.array.map(
-        [[1, 2], [3]],
-        (items) { items[1..] }
-    )
+    let sliced = std.array.map([[1, 2], [3]], (items) { items[1..] })
     @assert(sliced == [[2], []])
     let booleans = [true, false]
     let runes = ['é', 'a']
@@ -119,15 +116,7 @@ let knownCount = @len(knownBase[..=1])
 @[test]
 let known_data_and_slice_based_reduce: () = {
     @assert(known == [2, 3] and knownCount == 2)
-    let result = std.array.reduce(
-        [20, 5, 3],
-        (a, b) { a - b }
-    )
+    let result = std.array.reduce([20, 5, 3], (a, b) { a - b })
     @assert(result.unwrapOr(0) == 12)
-    @assert(
-        std.array.reduce(
-            @as([]int, []),
-            (a, b) { a + b }
-        ).isNone()
-    )
+    @assert(std.array.reduce(@as([]int, []), (a, b) { a + b }).isNone())
 }

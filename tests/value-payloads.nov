@@ -219,21 +219,22 @@ let range_copies_exact_bounds_and_inclusive_max: () = {
 
 @[test]
 let find_and_map_function_and_range_results: () = {
-    let found: Option(Callback) = std.array.find(
+    let found: Option(
+        Callback
+    ) = std.array.find(
         [increment],
         (callback: Callback) -> bool { callback(2) == 3 }
     )
     @assert(callOption(found).unwrapOr(0) == 4)
-    let missing: Option(Callback) = std.array.find(
+    let missing: Option(
+        Callback
+    ) = std.array.find(
         @as([]Callback, []),
         (callback: Callback) -> bool { true }
     )
     @assert(missing.isNone())
     let ranges: []IntRange = [@as(int, 1)..4, @as(int, 5)..=6]
-    let selected: Option(IntRange) = std.array.find(
-        ranges,
-        (range: IntRange) -> bool { true }
-    )
+    let selected: Option(IntRange) = std.array.find(ranges, (range: IntRange) -> bool { true })
     @assert(sumOption(selected).unwrapOr(0) == 6)
     let plain: []PlainFnUnion = [.none[], .function[increment]]
     let nested = std.array.find(
@@ -253,9 +254,7 @@ let find_and_map_function_and_range_results: () = {
         }
     )
     @assert(callOption(mapped).unwrapOr(0) == 10)
-    let mappedRange: Option(IntRange) = source.map(
-        (base) { base..=base }
-    )
+    let mappedRange: Option(IntRange) = source.map((base) { base..=base })
     @assert(sumOption(mappedRange).unwrapOr(0) == 7)
     let result: Result(int, str) = .ok[8]
     let resultFunction = result.map(
@@ -277,9 +276,7 @@ let find_and_map_function_and_range_results: () = {
         }
     )
     let none: Option(int) = .none[]
-    let skipped: Option(Callback) = none.map(
-        (base) -> Callback { @panic("inactive map") }
-    )
+    let skipped: Option(Callback) = none.map((base) -> Callback { @panic("inactive map") })
     @assert(skipped.isNone())
 }
 
@@ -292,7 +289,9 @@ let custom_hooks_nested_helpers_and_inactive_values: () = {
     @assert("{range}" == "range:3")
     @assert("{inactive}" == "empty")
     let nested: []Envelope = [.value[function], .value[range], .value[inactive], .none[]]
-    @assert("{nested}" == "[Envelope.value[callback:5], Envelope.value[range:3], Envelope.value[empty], Envelope.none]")
+    @assert(
+        "{nested}" == "[Envelope.value[callback:5], Envelope.value[range:3], Envelope.value[empty], Envelope.none]"
+    )
 }
 
 let main: () = {

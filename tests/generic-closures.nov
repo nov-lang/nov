@@ -38,9 +38,7 @@ let verifyDirect: () = {
     let callback: (str) -> str = local
     @assert(number == 42 and callback("typed") == "typed")
     @assert(@as((bool) -> bool, identity)(true))
-    @assert(
-        (value: `V) -> `V { value }(@as(int, 7)) == 7
-    )
+    @assert((value: `V) -> `V { value }(@as(int, 7)) == 7)
 }
 
 let verifyCallbacks: () = {
@@ -50,12 +48,7 @@ let verifyCallbacks: () = {
     let number: uint = apply(local, 42)
     let reversed: int = reverse(43, identity)
     @assert(number == 42 and reversed == 43)
-    @assert(
-        apply(
-            (value: `V) -> `V { value },
-            true
-        )
-    )
+    @assert(apply((value: `V) -> `V { value }, true))
 }
 
 let verifyShared: () = {

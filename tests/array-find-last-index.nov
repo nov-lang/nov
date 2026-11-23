@@ -4,10 +4,7 @@ let yes: (value: `T) -> bool = true
 let no: (value: `T) -> bool = false
 
 let main: () = {
-    let last = findLastIndex(
-        [42, 81, 59, 90, 60],
-        (score) { score >= 80 }
-    )
+    let last = findLastIndex([42, 81, 59, 90, 60], (score) { score >= 80 })
     @println("Last high score index:", last.unwrapOr(99))
 }
 
@@ -61,12 +58,7 @@ let managed_snapshot_and_callback_copies: () = {
     @assert(source[0].values == [[99]])
     @assert(findLastIndex([[[1]], [[2]]], yes).unwrapOr(99) == 1)
     let payloads: []std.Option([][]int) = [.some[[[4]]], .none[]]
-    @assert(
-        findLastIndex(
-            payloads,
-            (value) { value.isSome() }
-        ).unwrapOr(99) == 0
-    )
+    @assert(findLastIndex(payloads, (value) { value.isSome() }).unwrapOr(99) == 0)
 }
 
 let Choice = enum {
@@ -76,21 +68,11 @@ let Choice = enum {
 
 @[test]
 let storable_types_and_shared_closure_cells: () = {
-    @assert(
-        findLastIndex(
-            [true, false],
-            (value) { value }
-        ).unwrapOr(99) == 0
-    )
+    @assert(findLastIndex([true, false], (value) { value }).unwrapOr(99) == 0)
     @assert(findLastIndex(["é", "😀"], yes).unwrapOr(99) == 1)
     @assert(findLastIndex(['é', 'a'], no).isNone())
     @assert(findLastIndex([Choice.one, .two], yes).unwrapOr(99) == 1)
-    @assert(
-        findLastIndex(
-            [1..4, 5..9],
-            (value) { @len(value) == 3 }
-        ).unwrapOr(99) == 0
-    )
+    @assert(findLastIndex([1..4, 5..9], (value) { @len(value) == 3 }).unwrapOr(99) == 0)
     @assert(findLastIndex([@as(i8, 1)], yes).unwrapOr(99) == 0)
     @assert(findLastIndex([@as(u8, 1)], yes).unwrapOr(99) == 0)
     @assert(findLastIndex([@as(i16, 1)], yes).unwrapOr(99) == 0)
@@ -109,12 +91,7 @@ let storable_types_and_shared_closure_cells: () = {
         calls
     }
     let callbacks = [tick, tick, tick]
-    @assert(
-        findLastIndex(
-            callbacks,
-            (callback) { callback() == 2 }
-        ).unwrapOr(99) == 1
-    )
+    @assert(findLastIndex(callbacks, (callback) { callback() == 2 }).unwrapOr(99) == 1)
     @assert(calls == 2 and callbacks[0]() == 3 and tick() == 4)
 }
 

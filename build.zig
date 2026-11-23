@@ -4005,7 +4005,12 @@ fn addGenericMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\let Hidden: (T: type) -> type = struct {
         \\    value: T,
         \\    @[public]
-        \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U).[ value = convert(self.value) ]
+        \\    let map: (
+        \\        self: Hidden(T),
+        \\        convert: (T) -> `U
+        \\    ) -> Hidden(`U) = Hidden(`U).[
+        \\        value = convert(self.value)
+        \\    ]
         \\    let private: (self: Hidden(T), value: `U) -> `U = value
         \\    @[public]
         \\    let read: (self: Hidden(T), value: `U) -> uint = secret
@@ -6801,9 +6806,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\let viaFile: (value: O) -> direct.Option(int) = value
         \\let viaAlias: (value: alternate.Option(int)) -> O = value
         \\let make: (present: bool) -> O = {
-        \\    @print(
-        \\        if present { "S" } else { "N" }
-        \\    )
+        \\    @print(if present { "S" } else { "N" })
         \\    if present { .some[1] } else { .none[] }
         \\}
         \\let eager: () -> int = {
@@ -6824,22 +6827,44 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\}
         \\let propagate: (value: O) -> standard.Option(str) = .some["value:{value.!}"]
         \\let main: () = {
-        \\    @println(propagate(make(true)).unwrapOr("bad"), standard.Option(str).unwrapOr(propagate(make(false)), "none"))
+        \\    @println(
+        \\        propagate(make(true)).unwrapOr("bad"),
+        \\        standard.Option(str).unwrapOr(propagate(make(false)), "none")
+        \\    )
         \\    @println(make(true).unwrapOr(eager()))
         \\    @println(O.unwrapOr(make(false), eager()))
         \\    @println(O.unwrapOrElse(make(true), lazy))
         \\    @println(make(false).unwrapOrElse(lazy))
-        \\    @println(viaAlias(viaFile(O.some[3])).unwrapOr(0), viaFile(alternate.Option(int).none[]).unwrapOr(4))
+        \\    @println(
+        \\        viaAlias(viaFile(O.some[3])).unwrapOr(0),
+        \\        viaFile(alternate.Option(int).none[]).unwrapOr(4)
+        \\    )
         \\    let yes: standard.Option(bool) = .some[true]
         \\    let no: direct.Option(bool) = .none[]
-        \\    @println(yes.unwrapOr(false), standard.Option(bool).unwrapOr(no, false), no.unwrapOrElse(flag), standard.Option(bool).unwrapOrElse(yes, flag))
+        \\    @println(
+        \\        yes.unwrapOr(false),
+        \\        standard.Option(bool).unwrapOr(no, false),
+        \\        no.unwrapOrElse(flag),
+        \\        standard.Option(bool).unwrapOrElse(yes, flag)
+        \\    )
         \\    let word: standard.Option(str) = .some["s" + "ome"]
         \\    let empty: direct.Option(str) = .none[]
-        \\    @println(word.unwrapOr("bad"), standard.Option(str).unwrapOr(empty, "eager"), empty.unwrapOrElse(text), standard.Option(str).unwrapOrElse(word, text))
+        \\    @println(
+        \\        word.unwrapOr("bad"),
+        \\        standard.Option(str).unwrapOr(empty, "eager"),
+        \\        empty.unwrapOrElse(text),
+        \\        standard.Option(str).unwrapOrElse(word, text)
+        \\    )
         \\    let item: standard.Option(Record) = .some[Record.[ value = "some record" ]]
         \\    let absent: direct.Option(Record) = .none[]
-        \\    @println(item.unwrapOr(Record.[ value = "bad" ]).value, standard.Option(Record).unwrapOr(absent, Record.[ value = "eager record" ]).value)
-        \\    @println(absent.unwrapOrElse(record).value, standard.Option(Record).unwrapOrElse(item, record).value)
+        \\    @println(
+        \\        item.unwrapOr(Record.[ value = "bad" ]).value,
+        \\        standard.Option(Record).unwrapOr(absent, Record.[ value = "eager record" ]).value
+        \\    )
+        \\    @println(
+        \\        absent.unwrapOrElse(record).value,
+        \\        standard.Option(Record).unwrapOrElse(item, record).value
+        \\    )
         \\    @println(unit(standard.Option(void).some[]), unit(direct.Option(void).none[]))
         \\    @print("some:")
         \\    standard.Option(void).some[].unwrapOrElse(unitCallback)
@@ -6878,7 +6903,10 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    @println(item.isSome(), standard.Option(Record).none[].isNone())
         \\    @println(standard.Option(void).some[].isSome(), standard.Option(void).none[].isNone())
         \\    @println(standard.Result(void, void).ok[].isOk(), standard.Result(void, void).err[].isErr())
-        \\    @println(standard.Option(bool).some[false].isSome(), standard.Result(bool, str).ok[false].isOk())
+        \\    @println(
+        \\        standard.Option(bool).some[false].isSome(),
+        \\        standard.Result(bool, str).ok[false].isOk()
+        \\    )
         \\    @println(ok.unwrapOr(Record.[ text = "fallback" ]).text, err.isErr())
         \\}
         \\

@@ -62,8 +62,12 @@ let integer_widths_and_extreme_bounds: () = {
     @assert(std.range.toArray(@as(i8, -128)..-126) == @as([]i8, [-128, -127]))
     @assert(std.range.toArray(@as(i8, 126)..=127) == @as([]i8, [126, 127]))
     @assert(std.range.toArray(@as(uint, 4)..6) == @as([]uint, [4, 5]))
-    @assert("{@as(u64, 18446744073709551615)..=18446744073709551615}" == "18446744073709551615..=18446744073709551615")
-    @assert("{@as(i64, -9223372036854775808)..=-9223372036854775808}" == "-9223372036854775808..=-9223372036854775808")
+    @assert(
+        "{@as(u64, 18446744073709551615)..=18446744073709551615}" == "18446744073709551615..=18446744073709551615"
+    )
+    @assert(
+        "{@as(i64, -9223372036854775808)..=-9223372036854775808}" == "-9223372036854775808..=-9223372036854775808"
+    )
 }
 
 @[test]
@@ -81,14 +85,8 @@ let evaluation_snapshots_queries_and_independent_outputs: () = {
     let second = std.range.toArray(bounds)
     first[0] = 9
     @assert(first == [9] and second == [1])
-    let grouped: @TypeOf(
-        { 0 }..{ 2 }
-    ) = { 0 }..{ 2 }
-    let values: @TypeOf(
-        std.range.toArray(
-            { 0 }..{ 2 }
-        )
-    ) = std.range.toArray(grouped)
+    let grouped: @TypeOf({ 0 }..{ 2 }) = { 0 }..{ 2 }
+    let values: @TypeOf(std.range.toArray({ 0 }..{ 2 })) = std.range.toArray(grouped)
     @assert(values == @as([]uint, [0, 1]))
     let large: @TypeOf(
         { 18446744073709551614 }..={ 18446744073709551615 }

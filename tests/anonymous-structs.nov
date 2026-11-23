@@ -80,10 +80,7 @@ let snapshots_and_closure_fields: () = {
 
 @[test]
 let generic_mapping: () = {
-    let mapped = std.array.map(
-        [1, 2],
-        (value) { .[ value = value, label = "item:{value}" ] }
-    )
+    let mapped = std.array.map([1, 2], (value) { .[ value = value, label = "item:{value}" ] })
     let copied = std.array.map(mapped, identity)
     @assert(copied[0].value == 1 and copied[1].label == "item:2")
     let pair = identity(.[ true, "ok" ])

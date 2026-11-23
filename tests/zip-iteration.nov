@@ -49,9 +49,7 @@ let source_order: () = {
     }.. {
         @assert(order == 1234)
         @assert(a == c)
-        @assert(
-            b == if index == 0 { 'é' } else { '😀' }
-        )
+        @assert(b == if index == 0 { 'é' } else { '😀' })
         count += 1
     }
     @assert(order == 1234)
@@ -61,12 +59,8 @@ let source_order: () = {
         text = "a😀"
         text
     }, 0.. {
-        @assert(
-            a == if index == 0 { 'é' } else { 'a' }
-        )
-        @assert(
-            b == if index == 0 { 'a' } else { '😀' }
-        )
+        @assert(a == if index == 0 { 'é' } else { 'a' })
+        @assert(b == if index == 0 { 'a' } else { '😀' })
     }
 }
 
@@ -86,7 +80,13 @@ let range_cardinalities: () = {
         count += 1
     }
     @assert(count == 4)
-    loop a, b in @as(u64, 18446744073709551615)..=18446744073709551615, @as(i64, 9223372036854775807)..=9223372036854775807 {
+    loop a, b in @as(
+        u64,
+        18446744073709551615
+    )..=18446744073709551615, @as(
+        i64,
+        9223372036854775807
+    )..=9223372036854775807 {
         @assert(a == 18446744073709551615)
         @assert(b == 9223372036854775807)
         continue

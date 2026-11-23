@@ -21,10 +21,7 @@ let projections: () = {
     let p = &nested
     p.0.1 += 1
     @assert(p.0.1 == 7 and p.*.0.1 == 7)
-    let pairs = std.array.map(
-        [1, 2],
-        (value) { .[ value, "item:{value}" ] }
-    )
+    let pairs = std.array.map([1, 2], (value) { .[ value, "item:{value}" ] })
     let projected = std.array.map(pairs, first)
     @assert(projected[0] == 1 and projected[1] == 2)
     @assert(identity(pairs[1]).1 == "item:2")

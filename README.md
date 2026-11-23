@@ -588,11 +588,21 @@ branches can stay inline only in value-producing positions, such as an initializ
 operand, argument or returned value, not as standalone statements. An `if` without
 `else` expands. This is a syntactic decision: explicit `void`/omitted function
 results are statements; inferred closure tails are potential returned values.
-Compact blocks expand if the entire physical line exceeds **100 characters**
-(Unicode scalars), including indentation, surrounding code and trailing comments.
-Conditional branches share that width decision. Tokens such as long string
-literals are never split, and unrelated long expressions are not wrapped by this
-block-layout rule. Blocks with declarations, multiple statements, comments or
+Calls stay on one line when their rendered arguments are compact and the entire
+physical line fits within **100 characters** (Unicode scalars), including
+indentation, surrounding code and trailing comments. Existing argument-list
+newlines or a compact closure alone do not force expansion:
+
+```nov
+let valid = std.array.filter(raw, (score) { score >= 0 })
+```
+
+Multiline arguments, comments requiring line breaks, or excess width expand the
+call's argument list. The call expands before its compact closure bodies, allowing
+those bodies to remain inline at their new indentation. Compact blocks also expand
+when their whole line exceeds the limit, and conditional branches share that
+width decision. Tokens such as long string literals are never split; unrelated
+long expressions are not wrapped by this call/block-layout rule. Blocks with declarations, multiple statements, comments or
 multiline contents keep their expanded layout.
 Both commands accept multiple files and directories:
 

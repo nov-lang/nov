@@ -52,9 +52,7 @@ let native_signed_limits: () = {
     let minimum = string.parseInt(minstring).unwrapOr(0)
     let maximum = string.parseInt(maxstring).unwrapOr(0)
     @assert(minimum < 0 and -minimum == minimum)
-    @assert(
-        maximum == -{ minimum + 1 }
-    )
+    @assert(maximum == -{ minimum + 1 })
     @assert(signedError(aboveMax, .overflow))
     @assert(signedError("+" + aboveMax, .overflow))
     @assert(signedError(belowMin, .overflow))

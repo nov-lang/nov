@@ -41,5 +41,12 @@ let main: () -> void = {
         break "First multiple: " + "found"
     }
     @println(message, found, total)
-    @println("Bounded search:", range_has_number(23, 29, 28), range_has_number(23, 28, 28), range_has_number(28, 28, 28), bounded_multiple(23, 29, 7), bounded_multiple(23, 28, 7))
+    @println(
+        "Bounded search:",
+        range_has_number(23, 29, 28),
+        range_has_number(23, 28, 28),
+        range_has_number(28, 28, 28),
+        bounded_multiple(23, 29, 7),
+        bounded_multiple(23, 28, 7)
+    )
 }

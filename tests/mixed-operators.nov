@@ -106,10 +106,7 @@ let generic_containers_functions_and_callbacks: () = {
     @assert(Box(int).[ value = 3 ] + 4 == 7)
     @assert(4 + Box(int).[ value = 3 ] == 7)
     @assert(Box(str).[ value = "a" ] + "b" == "ab")
-    let doubled = std.array.map(
-        [vector],
-        (item) { item * 2.0 }
-    )
+    let doubled = std.array.map([vector], (item) { item * 2.0 })
     @assert(doubled == [Vector.[ x = 2.0, y = 4.0 ]])
     let dot: @TypeOf(multiply(vector, vector)) = 5.0
     @assert(dot == 5.0)
