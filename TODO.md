@@ -60,6 +60,19 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+``std.math.abs(value: `T) -> `T`` is delivered as ordinary generic Nov for
+native `int`, `i8`/`i16`/`i32`/`i64` and `f32`/`f64`, with exact input/output
+types. Numeric-zero context rejects nonnumeric/nominal types; existing unary
+negation rejects unsigned integers. Zero normalizes to positive zero; negative
+values negate and panic `absolute value overflow` if the wrapped result remains
+negative, covering every signed minimum. NaN propagates and negative infinity
+becomes positive infinity. Arguments evaluate eagerly once, aliases/callbacks
+specialize normally, and `@TypeOf` executes no effects or panics. No new builtin,
+reflection or optimization is introduced. See `examples/math-abs.nov` (four
+tests), `zig build test-cli-math-abs` (all modes, relocated imports, check/emit-c
+negatives and signed-minimum panics), and the actual-stdlib source-free O0/O3
+backend test with allocations forced to fail, including overflow paths.
+
 ``std.math.clamp(value: `T, lower: `T, upper: `T) -> `T`` is delivered as ordinary
 Nov with exact same-type arguments and accessible ordering. It validates
 `lower <= upper` before comparing the value, panicking `invalid clamp bounds`
@@ -70,8 +83,8 @@ no equality hook. Eager left-to-right arguments, snapshots, independent managed
 results, shared closure cells and effect-free queries retain ordinary semantics.
 See `examples/math-clamp.nov` (six tests), `zig build test-cli-math-clamp`
 (all three modes, relocated imports, negative fixtures and reversed/NaN panics),
-and the actual-stdlib source-free forced-GC O0/O3 backend test. `abs` remains
-unimplemented; no new builtin or optimization work is introduced.
+and the actual-stdlib source-free forced-GC O0/O3 backend test. No new builtin
+or optimization work is introduced.
 
 `std.array.min(items: []T) -> Option(T)` and `std.array.max` are delivered as
 ordinary Nov wrappers: empty input returns `.none[]`, otherwise

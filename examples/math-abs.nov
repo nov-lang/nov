@@ -1,0 +1,76 @@
+let std = @import("std")
+let abs = std.math.abs
+
+let main: () = {
+    @println("Absolute:", abs(-12))
+}
+
+@[test]
+let exact_signed_numeric_types: () = {
+    @assert(abs(-7) == 7 and abs(7) == 7 and abs(0) == 0)
+    let a: i8 = abs(@as(i8, -127))
+    let b: i16 = abs(@as(i16, -32767))
+    let c: i32 = abs(@as(i32, -2147483647))
+    let d: i64 = abs(@as(i64, -9223372036854775807))
+    let e: f32 = abs(@as(f32, -1.5))
+    let f: f64 = abs(@as(f64, -2.5))
+    @assert(a == 127 and b == 32767 and c == 2147483647 and d == 9223372036854775807)
+    @assert(e == 1.5 and f == 2.5)
+    let native: @TypeOf(abs(-1)) = @as(int, 1)
+    let exact: @TypeOf(abs(@as(i8, -1))) = a
+    @assert(native == 1 and exact == 127)
+    @assert(abs(@as(i8, 0)) == 0 and abs(@as(i16, 0)) == 0)
+    @assert(abs(@as(i32, 0)) == 0 and abs(@as(i64, 0)) == 0)
+    @assert(abs(@as(i8, 127)) == 127 and abs(@as(i64, 9223372036854775807)) == 9223372036854775807)
+}
+
+let apply: (value: `T, callback: (`T) -> `T) -> `T = callback(value)
+let forward: (value: `T) -> `T = abs(value)
+
+@[test]
+let generic_aliases_and_callbacks: () = {
+    let callback: (i8) -> i8 = abs
+    let floatCallback: (f32) -> f32 = std.math.abs
+    @assert(callback(-9) == 9 and floatCallback(-1.5) == 1.5)
+    @assert(apply(@as(i16, -12), abs) == @as(i16, 12))
+    @assert(forward(@as(i64, -17)) == @as(i64, 17))
+}
+
+@[test]
+let ieee_nan_infinities_and_normalized_zeros: () = {
+    let zero: f64 = 0.0
+    let nan = zero / zero
+    let inf = 1.0 / zero
+    let kept = abs(nan)
+    @assert(kept != kept and abs(-inf) == inf and abs(inf) == inf)
+    @assert(1.0 / abs(-zero) == inf and 1.0 / abs(zero) == inf)
+    let smallZero: f32 = 0.0
+    let smallNaN = smallZero / smallZero
+    let smallInf = @as(f32, 1.0) / smallZero
+    let small = abs(smallNaN)
+    @assert(small != small and abs(-smallInf) == smallInf and abs(smallInf) == smallInf)
+    @assert(@as(f32, 1.0) / abs(-smallZero) == smallInf)
+    @assert(@as(f32, 1.0) / abs(smallZero) == smallInf)
+}
+
+@[test]
+let eager_once_only_arguments_and_pure_type_queries: () = {
+    let mut calls = 0
+    let make = () -> i8 {
+        calls += 1
+        let result: i8 = -7
+        result
+    }
+    @assert(abs(make()) == 7 and calls == 1)
+    let query: @TypeOf(abs(make())) = 3
+    let minimum: @TypeOf(abs(@as(i8, -128))) = 4
+    @assert(query == 3 and minimum == 4 and calls == 1)
+    let stop = () -> int {
+        abs(
+            {
+                return 9
+            }
+        )
+    }
+    @assert(stop() == 9)
+}

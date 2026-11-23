@@ -249,6 +249,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_flat_map_tests = b.step("test-cli-array-flat-map", "Run standard-library array flatMap CLI tests");
     addArrayValueHelperCliTests(b, exe, array_flat_map_tests, "array-flat-map.nov", @embedFile("examples/array-flat-map.nov"), "Expanded: [1, 1, 2, 2, 3, 3]\n", "PASS order_empty_results_and_callback_count\nPASS flatten_one_layer_and_recursive_independence\nPASS storable_outputs_and_shared_closures\nPASS snapshots_inference_and_queries\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_flat_map_tests);
+    const math_abs_tests = b.step("test-cli-math-abs", "Run standard-library math abs CLI tests");
+    addMathAbsCliTests(b, exe, math_abs_tests);
+    test_step.dependOn(math_abs_tests);
     const math_clamp_tests = b.step("test-cli-math-clamp", "Run standard-library math clamp CLI tests");
     addMathClampCliTests(b, exe, math_clamp_tests);
     test_step.dependOn(math_clamp_tests);
@@ -1466,6 +1469,84 @@ fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
             reject.expectStdOutEqual("");
             reject.expectStdErrMatch("error:");
             test_step.dependOn(&reject.step);
+        }
+    }
+}
+
+fn addMathAbsCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "math-abs.nov", @embedFile("examples/math-abs.nov"), "Absolute: 12\n", "PASS exact_signed_numeric_types\nPASS generic_aliases_and_callbacks\nPASS ieee_nan_infinities_and_normalized_zeros\nPASS eager_once_only_arguments_and_pure_type_queries\n4 passed; 0 failed; 4 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const fmt = b.addRunArtifact(exe);
+    fmt.setCwd(fixtures.getDirectory());
+    fmt.addArgs(&.{ "fmt", "--check", "lib/math.nov" });
+    fmt.expectExitCode(0);
+    fmt.expectStdOutEqual("");
+    fmt.expectStdErrEqual("");
+    test_step.dependOn(&fmt.step);
+    for ([_][]const u8{
+        "",     "1,2", "@as(uint,1)", "@as(u8,1)", "@as(u16,1)", "@as(u32,1)", "@as(u64,1)",
+        "true", "'a'", "\"text\"",    "[1]",       "S.[n=1]",    "E.a",        "U.some[1]",
+    }, 0..) |args, index| {
+        const path = b.fmt("bad-abs-{d}.nov", .{index});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet S=struct{{n:int,\n@[public]\n@[operator(.equal)]\nlet equal:(a:S,b:S)->bool=a.n==b.n\n@[public]\n@[operator(.less_than)]\nlet less:(a:S,b:S)->bool=a.n<b.n\n}}\nlet E=enum{{a,}}\nlet U=union{{some:int,}}\nlet main:()={{let result=std.math.abs({s})\n}}\n", .{args}));
+        for ([_]bool{ false, true }) |emit_c| {
+            const reject = b.addRunArtifact(exe);
+            reject.step.name = b.fmt("CLI abs: reject {s} ({s})", .{ path, if (emit_c) "emit-c" else "check" });
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit_c) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+    for ([_][]const u8{
+        "let result:i16=std.math.abs(@as(i8,-1))",
+        "let result:f64=std.math.abs(@as(f32,-1.0))",
+
+        "let callback:(i8)->i16=std.math.abs",
+        "let callback:(f32)->f64=std.math.abs",
+    }, 0..) |statement, index| {
+        const path = b.fmt("bad-abs-result-{d}.nov", .{index});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet main:()={{{s}\n}}\n", .{statement}));
+        for ([_]bool{ false, true }) |emit_c| {
+            const reject = b.addRunArtifact(exe);
+            reject.step.name = b.fmt("CLI abs: reject {s} ({s})", .{ path, if (emit_c) "emit-c" else "check" });
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit_c) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+    for ([_][]const u8{
+        "@as(int,-9223372036854775807)-1", "@as(i8,-128)",                    "@as(i16,-32768)",
+        "@as(i32,-2147483648)",            "@as(i64,-9223372036854775807)-1",
+    }, 0..) |minimum, index| {
+        const path = b.fmt("panic-abs-{d}.nov", .{index});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet verify:()={{let result=std.math.abs({s})\n@println(\"unreachable\",result)\n}}\nlet main:()=verify()\n@[test]\nlet signed_minimum:()=verify()\n", .{minimum}));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI abs: {s} {s} {s}", .{ command, path, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, path, "--lib-dir" });
+                run.addDirectoryArg(library);
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "FAIL signed_minimum (exit 1)\n0 passed; 1 failed; 1 total\n" else "");
+                run.expectStdErrEqual("panic: absolute value overflow\n");
+                test_step.dependOn(&run.step);
+            }
         }
     }
 }

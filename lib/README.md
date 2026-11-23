@@ -80,6 +80,23 @@ or implementation is approved; user-defined annotations are not supported now.
 
 ## Math helpers
 
+``std.math.abs(value: `T) -> `T`` is an ordinary generic Nov function accepting
+only native `int`, `i8`/`i16`/`i32`/`i64`, and `f32`/`f64`, preserving the exact
+input type. Unsigned integers reject through the existing unary-negation rule;
+bools, runes, strings and nominal types reject through numeric-zero context.
+Zero returns positive zero (including `-0.0`); negative values are negated,
+and a still-negative result panics with `absolute value overflow`. Thus every
+signed integer minimum panics under the existing wrapping negation contract.
+Negative infinity becomes positive infinity, positive infinity is unchanged,
+and NaN propagates. The argument evaluates eagerly exactly once; `@TypeOf`
+executes neither argument effects nor overflow panics. Generic aliases and typed
+callbacks use ordinary function semantics. No builtin or reflection is added,
+and numeric execution needs no managed allocation. See
+[`examples/math-abs.nov`](../examples/math-abs.nov) (four tests),
+`zig build test-cli-math-abs` (all modes, relocated imports, check/emit-c rejection
+fixtures and all signed-minimum panics), and the source-free O0/O3 backend test
+with forced allocation failure.
+
 ``std.math.clamp(value: `T, lower: `T, upper: `T) -> `T`` is an ordinary Nov
 function requiring one exact ordered type (builtin integers/floats or accessible
 nominal less-than hooks). It first checks `lower <= upper`, otherwise panicking
@@ -94,7 +111,7 @@ Arguments evaluate once, eagerly left-to-right, before bounds validation or valu
 comparisons. Ordinary argument snapshots and recursive independent managed-result
 storage apply; copied callbacks still share captured cells. `@TypeOf` queries
 execute neither arguments, comparisons nor panics. No new builtin or ordering rule
-is introduced; `abs` is not implemented. See
+is introduced. See
 [`examples/math-clamp.nov`](../examples/math-clamp.nov) (six tests) and
 `zig build test-cli-math-clamp` for all three modes, relocated imports, rejection
 fixtures and invalid-bound panics.

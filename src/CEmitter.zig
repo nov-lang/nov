@@ -11259,6 +11259,65 @@ test "mem replace actual stdlib source free independent backing forced GC O0 O3 
     , true);
 }
 
+test "math abs actual stdlib source free allocation free signed numeric O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let abs=std.math.abs
+        \\let apply:(value:`T,callback:(`T)->`T)->`T=callback(value)
+        \\let main:()={
+        \\@assert(abs(-7)==7 and abs(0)==0 and abs(7)==7)
+        \\let a:i8=abs(@as(i8,-127))
+        \\let b:i16=abs(@as(i16,-32767))
+        \\let c:i32=abs(@as(i32,-2147483647))
+        \\let d:i64=abs(@as(i64,-9223372036854775807))
+        \\@assert(a==127 and b==32767 and c==2147483647 and d==9223372036854775807)
+        \\let callback:(i8)->i8=abs
+        \\@assert(callback(-9)==9 and apply(@as(i16,-12),abs)==12)
+        \\let mut calls=0
+        \\let value=abs({calls+=1
+        \\let result=-7
+        \\result})
+        \\let query:@TypeOf(abs({calls+=1
+        \\let result=-8
+        \\result}))=3
+        \\let minimum:@TypeOf(abs(@as(i8,-128)))=4
+        \\@assert(value==7 and calls==1 and query==3 and minimum==4)
+        \\let zero:f64=0.0
+        \\let nan=zero/zero
+        \\let inf=1.0/zero
+        \\let kept=abs(nan)
+        \\@assert(kept!=kept and abs(-inf)==inf and abs(inf)==inf)
+        \\@assert(1.0/abs(-zero)==inf and 1.0/abs(zero)==inf and abs(-1.5)==1.5)
+        \\let smallZero:f32=0.0
+        \\let smallInf=@as(f32,1.0)/smallZero
+        \\let small=abs(smallZero/smallZero)
+        \\@assert(small!=small and abs(-smallInf)==smallInf and abs(smallInf)==smallInf)
+        \\@assert(@as(f32,1.0)/abs(-smallZero)==smallInf and @as(f32,1.0)/abs(smallZero)==smallInf)
+        \\@assert(abs(@as(f32,-1.5))==@as(f32,1.5))}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    fail_allocations = 1;
+        \\    nov_main();
+        \\    return 0;
+        \\}
+    , false);
+    for ([_][]const u8{
+        "@as(int,-9223372036854775807)-1", "@as(i8,-128)",                    "@as(i16,-32768)",
+        "@as(i32,-2147483648)",            "@as(i64,-9223372036854775807)-1",
+    }) |minimum| {
+        const program = try std.fmt.allocPrint(test_gpa, "let std=@import(\"std\")\nlet main:()={{let result=std.math.abs({s})\n@assert(result==0)\n}}", .{minimum});
+        defer test_gpa.free(program);
+        const panic_library = try emitApprovedHelperSourceFree(test_gpa, program);
+        defer test_gpa.free(panic_library);
+        const c = try std.mem.concat(test_gpa, u8, &.{ approved_helper_allocator, panic_library, "int main(void) { fail_allocations=1; nov_main(); return 0; }\n" });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty;", 1, "", "panic: absolute value overflow\n", mode);
+    }
+}
+
 test "math clamp actual stdlib source free bounds first snapshots independent storage forced GC O0 O3" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let std=@import("std")
