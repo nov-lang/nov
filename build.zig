@@ -79,11 +79,110 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("test-cli", "Run CLI integration tests");
     test_step.dependOn(cli_step);
     addCliTests(b, exe, cli_step);
+    const example_step = b.step("test-examples", "Check and run curated examples");
+    addExampleTests(b, exe, example_step);
+    cli_step.dependOn(example_step);
     addImportCliTests(b, exe, cli_step);
     addGcTests(b, test_step);
 
     const fmt_step = b.step("fmt", "Format all source files");
     fmt_step.dependOn(&b.addFmt(.{ .paths = b.pathList(&.{ "build.zig", "src" }) }).step);
+}
+
+fn addExampleTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const programs = [_]struct { source: []const u8, output: []const u8 }{
+        .{ .source = "examples/basics.nov", .output = "Fibonacci:\n  0: 0\n  1: 1\n  2: 1\n  3: 2\n  4: 3\n  5: 5\n  6: 8\n  7: 13\nTotal: 33\nFizzBuzz:\n  1: 1\n  2: 2\n  3: Fizz\n  4: 4\n  5: Buzz\n  6: Fizz\n  7: 7\n  8: 8\n  9: Fizz\n  10: Buzz\n  11: 11\n  12: Fizz\n  13: 13\n  14: 14\n  15: FizzBuzz\nFirst even Fibonacci above 10: 34\n" },
+        .{ .source = "examples/collections.nov", .output = "Raw scores: [72, -5, 90, 48, 65, 100]\nAdjusted ranking: [100, 95, 77, 70, 53]\nPassing: 4 of 5\nTotal points: 395\nLast passing index: 3\nLowest score: 53\nHighest score: 100\nEmpty batch has no minimum\nPreview: [0, 95, 77, 70, 53]\nPublished ranking: [100, 95, 77, 70, 53]\n" },
+        .{ .source = "examples/numbers.nov", .output = "Capacity: 24\nAdjustment magnitude: 7\nBounded signal: 2.5\nInvoice: 35\nSetting 42: 42\nSetting 125: 100\nSetting -7: 0\nSetting 12px: ParseIntError.invalidInput\n" },
+        .{ .source = "examples/references.nov", .output = "Morning after advance: 5\nSnapshot: 2\nActive morning: 7\nActive afternoon: 24\nReadonly count: 24\nReadonly field: 24\nFinal counts: 7, 25\n" },
+        .{ .source = "examples/text.nov", .output = "Message: café 😀 / tea time / bonjour\nEdges: c / r; badge: é 😀\nEmoji: scalar 5\nTransport: 27 scalars, 31 bytes\nDecoded: café 😀 / tea time / bonjour\n——— ready\n" },
+        .{ .source = "examples/types.nov", .output = "Before packing: Books: 800g (Service.standard)\nReady: Books: 850g (Service.express)\nScan: B2, 850g\nDelivery: sent to Lyon/B2\n" },
+        .{ .source = "examples/functions.nov", .output = "Accepted: [4, 7]\nPrepared: [12, 18]\nReport: #1=12, #2=18\nProcessed: 2\nEmpty batch: No accepted scores\n" },
+        .{ .source = "examples/errors.nov", .output = "3 tickets cost 15 credits\nNo quantity supplied\nCannot quote: not a decimal quantity: ParseIntError.invalidInput\nCannot quote: quantity must be between 1 and 12\n" },
+    };
+    for (programs) |program| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("Example: run {s} {s}", .{ program.source, mode });
+            run.setCwd(b.path("."));
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArg("run");
+            run.addFileArg(b.path(program.source));
+            if (mode.len != 0) run.addArg(mode);
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(b.path("lib"));
+            run.expectExitCode(0);
+            run.expectStdOutEqual(program.output);
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    var sources: [programs.len + 2][]const u8 = undefined;
+    for (programs, 0..) |program, i| sources[i] = program.source;
+    sources[programs.len] = "examples/test.nov";
+    sources[programs.len + 1] = "examples/ffi.nov";
+    for (sources) |source| {
+        for ([_][]const u8{ "fmt", "check" }) |command| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("Example: {s} {s}", .{ command, source });
+            check.setCwd(b.path("."));
+            check.addArgs(&.{ command, if (std.mem.eql(u8, command, "fmt")) "--check" else "--semantic" });
+            check.addFileArg(b.path(source));
+            if (std.mem.eql(u8, command, "check")) {
+                check.addArg("--lib-dir");
+                check.addDirectoryArg(b.path("lib"));
+            }
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_]bool{ false, true }) |filtered| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("Example: test guide {s} (filtered={})", .{ mode, filtered });
+            run.setCwd(b.path("."));
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArg("test");
+            run.addFileArg(b.path("examples/test.nov"));
+            if (mode.len != 0) run.addArg(mode);
+            if (filtered) run.addArgs(&.{ "--filter", "addition", "--timeout-ms", "1000" });
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(b.path("lib"));
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (filtered) "PASS addition\n1 passed; 0 failed; 1 total\n" else "PASS addition\nPASS array_copies\nPASS option_value\n3 passed; 0 failed; 3 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const emit = b.addRunArtifact(exe);
+    emit.step.name = "Example: emit FFI library without main";
+    emit.setCwd(b.path("."));
+    emit.addArgs(&.{ "emit-c", "--library" });
+    emit.addFileArg(b.path("examples/ffi.nov"));
+    emit.addArg("--lib-dir");
+    emit.addDirectoryArg(b.path("lib"));
+    emit.expectExitCode(0);
+    emit.expectStdErrEqual("");
+    const c_source = emit.captureStdOut(.{});
+    for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
+        const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", optimization });
+        compile.addFileArg(c_source);
+        compile.addFileArg(b.path("examples/ffi.c"));
+        compile.addArg("-o");
+        const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "ffi.exe" else "ffi");
+        const run = std.Build.Step.Run.create(b, b.fmt("Example: FFI separate-TU C ABI {s}", .{optimization}));
+        run.addFileArg(binary);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("Order total: 47\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
 }
 
 fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
@@ -145,7 +244,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
     const range_type_tests = b.step("test-cli-range-types", "Run source range type, printing and standard-library conversion CLI tests");
-    addArrayValueHelperCliTests(b, exe, range_type_tests, "range-types.nov", @embedFile("examples/range-types.nov"), "..u8\n0..10\n-10..=20\n1..5\nValues: [1, 2, 3, 4]\n", "PASS range_types_aliases_fields_and_callbacks\nPASS range_printing_and_nested_values\nPASS empty_descending_and_inclusive_ranges\nPASS integer_widths_and_extreme_bounds\nPASS evaluation_snapshots_queries_and_independent_outputs\n5 passed; 0 failed; 5 total\n");
+    addArrayValueHelperCliTests(b, exe, range_type_tests, "range-types.nov", @embedFile("tests/range-types.nov"), "..u8\n0..10\n-10..=20\n1..5\nValues: [1, 2, 3, 4]\n", "PASS range_types_aliases_fields_and_callbacks\nPASS range_printing_and_nested_values\nPASS empty_descending_and_inclusive_ranges\nPASS integer_widths_and_extreme_bounds\nPASS evaluation_snapshots_queries_and_independent_outputs\n5 passed; 0 failed; 5 total\n");
     test_step.dependOn(range_type_tests);
     const default_tests = b.step("test-cli-defaults", "Run default values, constructors and generic take CLI tests");
     addDefaultCliTests(b, exe, default_tests);
@@ -247,7 +346,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addArrayHelperCliTests(b, exe, array_helper_tests);
     test_step.dependOn(array_helper_tests);
     const array_flat_map_tests = b.step("test-cli-array-flat-map", "Run standard-library array flatMap CLI tests");
-    addArrayValueHelperCliTests(b, exe, array_flat_map_tests, "array-flat-map.nov", @embedFile("examples/array-flat-map.nov"), "Expanded: [1, 1, 2, 2, 3, 3]\n", "PASS order_empty_results_and_callback_count\nPASS flatten_one_layer_and_recursive_independence\nPASS storable_outputs_and_shared_closures\nPASS snapshots_inference_and_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayValueHelperCliTests(b, exe, array_flat_map_tests, "array-flat-map.nov", @embedFile("tests/array-flat-map.nov"), "Expanded: [1, 1, 2, 2, 3, 3]\n", "PASS order_empty_results_and_callback_count\nPASS flatten_one_layer_and_recursive_independence\nPASS storable_outputs_and_shared_closures\nPASS snapshots_inference_and_queries\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_flat_map_tests);
     const math_abs_tests = b.step("test-cli-math-abs", "Run standard-library math abs CLI tests");
     addMathAbsCliTests(b, exe, math_abs_tests);
@@ -259,14 +358,14 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addArrayExtremaCliTests(b, exe, array_extrema_tests);
     test_step.dependOn(array_extrema_tests);
     const array_reverse_tests = b.step("test-cli-array-reverse", "Run standard-library array reverse CLI tests");
-    addArrayValueHelperCliTests(b, exe, array_reverse_tests, "array-reverse.nov", @embedFile("examples/array-reverse.nov"), "Reversed: [3, 2, 1]\nOriginal: [1, 2, 3]\n", "PASS order_empty_and_singleton\nPASS recursive_storage_independence\nPASS storable_types_and_shared_closure_cells\nPASS inferred_callback_and_unevaluated_query\n4 passed; 0 failed; 4 total\n");
+    addArrayValueHelperCliTests(b, exe, array_reverse_tests, "array-reverse.nov", @embedFile("tests/array-reverse.nov"), "Reversed: [3, 2, 1]\nOriginal: [1, 2, 3]\n", "PASS order_empty_and_singleton\nPASS recursive_storage_independence\nPASS storable_types_and_shared_closure_cells\nPASS inferred_callback_and_unevaluated_query\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_reverse_tests);
     const array_count_tests = b.step("test-cli-array-count", "Run standard-library array count CLI tests");
-    addArrayValueHelperCliTests(b, exe, array_count_tests, "array-count.nov", @embedFile("examples/array-count.nov"), "Passing: 3\n", "PASS source_order_empty_and_once_per_element\nPASS managed_snapshot_and_callback_copies\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayValueHelperCliTests(b, exe, array_count_tests, "array-count.nov", @embedFile("tests/array-count.nov"), "Passing: 3\n", "PASS source_order_empty_and_once_per_element\nPASS managed_snapshot_and_callback_copies\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n4 passed; 0 failed; 4 total\n");
     addArrayPredicateQueryCliTests(b, exe, array_count_tests, "count", "uint", "");
     test_step.dependOn(array_count_tests);
     const array_find_last_index_tests = b.step("test-cli-array-find-last-index", "Run standard-library array findLastIndex CLI tests");
-    addArrayValueHelperCliTests(b, exe, array_find_last_index_tests, "array-find-last-index.nov", @embedFile("examples/array-find-last-index.nov"), "Last high score index: 3\n", "PASS reverse_order_short_circuit_and_boundaries\nPASS managed_snapshot_and_callback_copies\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayValueHelperCliTests(b, exe, array_find_last_index_tests, "array-find-last-index.nov", @embedFile("tests/array-find-last-index.nov"), "Last high score index: 3\n", "PASS reverse_order_short_circuit_and_boundaries\nPASS managed_snapshot_and_callback_copies\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n4 passed; 0 failed; 4 total\n");
     addArrayPredicateQueryCliTests(b, exe, array_find_last_index_tests, "findLastIndex", "std.Option(uint)", ".unwrapOr(99)");
     test_step.dependOn(array_find_last_index_tests);
     const array_reduce_tests = b.step("test-cli-array-reduce", "Run standard-library array reduce CLI tests");
@@ -365,15 +464,15 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("needs-format.nov", "let answer=1+2*3\n");
     _ = fixtures.add("let-only.nov", "let number: i32 = 42\n");
     _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
-    _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
-    _ = fixtures.add("fibo.nov", @embedFile("examples/fibo.nov"));
-    _ = fixtures.add("fizzbuzz.nov", @embedFile("examples/fizzbuzz.nov"));
-    _ = fixtures.add("range-search.nov", @embedFile("examples/range-search.nov"));
+    _ = fixtures.add("checkout.nov", @embedFile("tests/checkout.nov"));
+    _ = fixtures.add("fibo.nov", @embedFile("tests/fibo.nov"));
+    _ = fixtures.add("fizzbuzz.nov", @embedFile("tests/fizzbuzz.nov"));
+    _ = fixtures.add("range-search.nov", @embedFile("tests/range-search.nov"));
     _ = fixtures.add("bitwise.nov", "let main: () -> void = {let n: i8 = -128\nlet m: u64 = 18446744073709551615\n@println(n | 127, n & 127, n ^ -1, m ^ m)}\n");
-    _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
-    _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
-    _ = fixtures.add("type-aliases.nov", @embedFile("examples/type-aliases.nov"));
-    _ = fixtures.add("type.nov", @embedFile("examples/type.nov"));
+    _ = fixtures.add("strings.nov", @embedFile("tests/strings.nov"));
+    _ = fixtures.add("interpolation.nov", @embedFile("tests/interpolation.nov"));
+    _ = fixtures.add("type-aliases.nov", @embedFile("tests/type-aliases.nov"));
+    _ = fixtures.add("type.nov", @embedFile("tests/type.nov"));
     _ = fixtures.add("enums.nov", "let Kind=enum{not_found,permission_denied,io,\n@[stringify]\nlet toString:(k:Kind)->str=match k{.not_found=>\"not_found\"\n.permission_denied | .io=>\"other\"}\n}\nlet Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(uint,Kind)\nlet Error=struct{kind:Kind=.not_found,message:str,}\nlet fail:()->R=.err[.not_found]\nlet pass:()->R={let n=fail().!\n.ok[n]}\nlet main:()={let e=Error.[message=\"not \"+\"found\"]\n@println(e.kind,e.message,Kind.io!=.not_found,match pass(){.ok[n] => \"{n}\"\n.err[k] => \"{k}\"})}");
     _ = fixtures.add("instance-methods.nov", "let K=enum{x,y,\nlet eql:(a:K,b:K)->bool=a==b\n}\nlet Alias=R\nlet R=struct{s:str,\nlet text:(r:Alias)->str=r.s\n}\nlet main:()={let k=K.x\n@println(Alias.[s=\"hel\"+\"lo\"].text(),k.eql(.x),K.y.eql(k))}");
     _ = fixtures.add("instance-signature.nov", "let R=struct{let bad:()->bool=true\n}\nlet main:()=R.[].bad()");
@@ -454,10 +553,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
     _ = fixtures.add("interpolation-name.nov", "let main: () -> void = @println(\"{missing}\")\n");
     _ = fixtures.add("interpolation-global.nov", "let n: int = 1\nlet text: str = \"{n}\"\n");
-    _ = fixtures.add("inferred-locals.nov", @embedFile("examples/inferred-locals.nov"));
+    _ = fixtures.add("inferred-locals.nov", @embedFile("tests/inferred-locals.nov"));
     _ = fixtures.add("inferred-integer.nov", "let main: () -> void = {let n = 1\n@println(n)}\n");
     _ = fixtures.add("inferred-empty-array.nov", "let main: () -> void = {let a = []\n}\n");
-    _ = fixtures.add("scalar-arrays.nov", @embedFile("examples/arrays.nov"));
+    _ = fixtures.add("scalar-arrays.nov", @embedFile("tests/arrays.nov"));
     _ = fixtures.add("membership-default.nov", "let main: () -> void = @println(1 in [1, 2])\n");
     _ = fixtures.add("membership-width.nov", "let f: (n: i16, a: []i8) -> bool = n in a\n");
     _ = fixtures.add("membership-string.nov", "let main: () -> void = @println(\"a\" in \"abc\")\n");
@@ -469,7 +568,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("if-program.nov", "let divide: (n: int) -> int = 1 / n\nlet main: () -> void = {\nlet n: int = if false {divide(0)} else if true {42} else {divide(0)}\nif n == 42 {@println(n)}\n}\n");
     _ = fixtures.add("return-program.nov", "let f: (c: bool) -> int = {if c {{return 42}}\n1 / 0}\nlet main: () -> void = {let b: bool = false and {return}\n@println(f(true), b)\nreturn}\n");
     _ = fixtures.add("mutable-program.nov", "let f: (c: bool) -> int = {let mut n: int = 1\nn += if c {return 42} else {2}\nn}\nlet main: () -> void = {let mut n: int = 1\nif true {n += 2}\nlet b: bool = false and {n = 99\ntrue}\n@println(n, b, f(true), f(false))}\n");
-    _ = fixtures.add("loop-values.nov", @embedFile("examples/loop-values.nov"));
+    _ = fixtures.add("loop-values.nov", @embedFile("tests/loop-values.nov"));
     _ = fixtures.add("inclusive-range.nov",
         \\let main: () = {
         \\    loop i in 0..=2 {
@@ -1300,7 +1399,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 fn addInferredClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("inferred-closures.nov", @embedFile("examples/inferred-closures.nov"));
+    _ = fixtures.add("inferred-closures.nov", @embedFile("tests/inferred-closures.nov"));
     for ([_][]const u8{ "fmt", "check" }) |command| {
         const check = b.addRunArtifact(exe);
         check.setCwd(fixtures.getDirectory());
@@ -1335,7 +1434,7 @@ fn addInferredClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
 
 fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("closures.nov", @embedFile("examples/closures.nov"));
+    _ = fixtures.add("closures.nov", @embedFile("tests/closures.nov"));
     _ = fixtures.add("factory.nov", "@[public]\nlet counter=()->()->uint {let mut n:uint=0\n()->uint {n+=1\nn}}\n");
     _ = fixtures.add("imported.nov", "let api=@import(\"factory.nov\")\nlet main=(){let next=api.counter()\n@println(next(),next())}\n");
     _ = fixtures.add("excluded.nov", "@[test]\nlet ignored = (bad: Missing) {unknown()}\nlet main = () {let f = () -> int {7}\n@assert(f() == 7)}\n");
@@ -1392,7 +1491,7 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
 }
 
 fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "defaults.nov", @embedFile("examples/defaults.nov"), "Number: 0\nConfig: Config[ count: 3, names: [Ada] ]\nTaken: [1, 2]\nRemaining: []\nOption: Option(u8).none\n", "PASS scalar_array_and_range_defaults\nPASS declared_defaults_aliases_and_independent_arrays\nPASS custom_constructors_override_and_select_variants\nPASS take_returns_old_values_and_installs_defaults\nPASS take_managed_payloads_preserves_independence\nPASS runtime_factories_and_unevaluated_type_queries\nPASS generic_default_inference_and_reference_places\n7 passed; 0 failed; 7 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "defaults.nov", @embedFile("tests/defaults.nov"), "Number: 0\nConfig: Config[ count: 3, names: [Ada] ]\nTaken: [1, 2]\nRemaining: []\nOption: Option(u8).none\n", "PASS scalar_array_and_range_defaults\nPASS declared_defaults_aliases_and_independent_arrays\nPASS custom_constructors_override_and_select_variants\nPASS take_returns_old_values_and_installs_defaults\nPASS take_managed_payloads_preserves_independence\nPASS runtime_factories_and_unevaluated_type_queries\nPASS generic_default_inference_and_reference_places\n7 passed; 0 failed; 7 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("models.nov",
@@ -1485,7 +1584,7 @@ fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
 }
 
 fn addMathAbsCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "math-abs.nov", @embedFile("examples/math-abs.nov"), "Absolute: 12\n", "PASS exact_signed_numeric_types\nPASS generic_aliases_and_callbacks\nPASS ieee_nan_infinities_and_normalized_zeros\nPASS eager_once_only_arguments_and_pure_type_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "math-abs.nov", @embedFile("tests/math-abs.nov"), "Absolute: 12\n", "PASS exact_signed_numeric_types\nPASS generic_aliases_and_callbacks\nPASS ieee_nan_infinities_and_normalized_zeros\nPASS eager_once_only_arguments_and_pure_type_queries\n4 passed; 0 failed; 4 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     const fmt = b.addRunArtifact(exe);
@@ -1563,7 +1662,7 @@ fn addMathAbsCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
 }
 
 fn addMathClampCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "math-clamp.nov", @embedFile("examples/math-clamp.nov"), "Clamped: 10\n", "PASS exact_numeric_types_and_inclusive_bounds\nPASS stable_ties_and_independent_managed_results\nPASS enum_union_and_generic_owner_ordering\nPASS ieee_nan_signed_zero_and_infinities\nPASS eager_arguments_and_bounds_first_comparison_order\nPASS snapshots_shared_cells_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "math-clamp.nov", @embedFile("tests/math-clamp.nov"), "Clamped: 10\n", "PASS exact_numeric_types_and_inclusive_bounds\nPASS stable_ties_and_independent_managed_results\nPASS enum_union_and_generic_owner_ordering\nPASS ieee_nan_signed_zero_and_infinities\nPASS eager_arguments_and_bounds_first_comparison_order\nPASS snapshots_shared_cells_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("models.nov",
@@ -1649,7 +1748,7 @@ fn addMathClampCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
 }
 
 fn addArrayExtremaCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "array-extrema.nov", @embedFile("examples/array-extrema.nov"), "Minimum: 3\nMaximum: 8\nEmpty: true\n", "PASS empty_singleton_and_exact_numeric_types\nPASS stable_ties_and_recursive_storage_independence\nPASS enum_union_generic_hooks_and_callbacks\nPASS float_nan_and_signed_zero_preserve_first\nPASS eager_arguments_comparison_order_and_shared_cells\nPASS snapshots_and_typeof_queries_are_pure\n6 passed; 0 failed; 6 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "array-extrema.nov", @embedFile("tests/array-extrema.nov"), "Minimum: 3\nMaximum: 8\nEmpty: true\n", "PASS empty_singleton_and_exact_numeric_types\nPASS stable_ties_and_recursive_storage_independence\nPASS enum_union_generic_hooks_and_callbacks\nPASS float_nan_and_signed_zero_preserve_first\nPASS eager_arguments_comparison_order_and_shared_cells\nPASS snapshots_and_typeof_queries_are_pure\n6 passed; 0 failed; 6 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("models.nov",
@@ -1711,7 +1810,7 @@ fn addArrayExtremaCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
 }
 
 fn addExtremaCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "extrema.nov", @embedFile("examples/extrema.nov"), "Minimum: 3\nMaximum: 8\nBest: second\n", "PASS exact_contextual_types_and_numeric_bounds\nPASS custom_order_stable_ties_and_independent_results\nPASS enum_union_and_generic_ordering\nPASS float_nan_and_signed_zero_keep_the_first_value\nPASS arguments_are_eager_and_comparisons_run_afterwards\nPASS array_snapshot_survives_comparator_owner_mutation\nPASS known_data_globals_and_unevaluated_queries\n7 passed; 0 failed; 7 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "extrema.nov", @embedFile("tests/extrema.nov"), "Minimum: 3\nMaximum: 8\nBest: second\n", "PASS exact_contextual_types_and_numeric_bounds\nPASS custom_order_stable_ties_and_independent_results\nPASS enum_union_and_generic_ordering\nPASS float_nan_and_signed_zero_keep_the_first_value\nPASS arguments_are_eager_and_comparisons_run_afterwards\nPASS array_snapshot_survives_comparator_owner_mutation\nPASS known_data_globals_and_unevaluated_queries\n7 passed; 0 failed; 7 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("models.nov",
@@ -1892,8 +1991,8 @@ fn addMemFnCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std
             test_step.dependOn(&reject.step);
         }
     }
-    addArrayValueHelperCliTests(b, exe, test_step, "mem.nov", @embedFile("examples/mem.nov"), "Swapped: 2 1\nReplaced: 2 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS replace_scalars_preserves_exact_types\nPASS replace_nested_arrays_preserves_independent_storage\nPASS replace_records_and_union_payloads\nPASS replace_functions_share_cells_and_ranges_copy_bounds\nPASS replace_destinations_and_argument_order\nPASS replace_queries_do_not_mutate_or_evaluate_arguments\n8 passed; 0 failed; 8 total\n");
-    addArrayValueHelperCliTests(b, exe, test_step, "fn.nov", @embedFile("examples/fn.nov"), "Identity: 2\nConstant: 2\nFlipped: 7\nComposed: 8\nNegated: true\n", "PASS identity_values_and_copies\nPASS const_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\nPASS compose_distinct_types_order_and_shared_state\nPASS compose_managed_results_and_unevaluated_queries\nPASS neg_inverts_once_and_preserves_shared_captures\n7 passed; 0 failed; 7 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "mem.nov", @embedFile("tests/mem.nov"), "Swapped: 2 1\nReplaced: 2 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS replace_scalars_preserves_exact_types\nPASS replace_nested_arrays_preserves_independent_storage\nPASS replace_records_and_union_payloads\nPASS replace_functions_share_cells_and_ranges_copy_bounds\nPASS replace_destinations_and_argument_order\nPASS replace_queries_do_not_mutate_or_evaluate_arguments\n8 passed; 0 failed; 8 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "fn.nov", @embedFile("tests/fn.nov"), "Identity: 2\nConstant: 2\nFlipped: 7\nComposed: 8\nNegated: true\n", "PASS identity_values_and_copies\nPASS const_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\nPASS compose_distinct_types_order_and_shared_state\nPASS compose_managed_results_and_unevaluated_queries\nPASS neg_inverts_once_and_preserves_shared_captures\n7 passed; 0 failed; 7 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     for ([_][]const u8{
@@ -1921,7 +2020,7 @@ fn addMemFnCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std
 }
 
 fn addMatchPayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "match-payloads.nov", @embedFile("examples/match-payloads.nov"), "Value: 42\n", "PASS result_option_and_nested_payload_bindings\nPASS bindings_are_prong_local_and_optional\nPASS payload_arrays_keep_value_copy_semantics\nPASS function_payloads_and_unevaluated_queries\n4 passed; 0 failed; 4 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "match-payloads.nov", @embedFile("tests/match-payloads.nov"), "Value: 42\n", "PASS result_option_and_nested_payload_bindings\nPASS bindings_are_prong_local_and_optional\nPASS payload_arrays_keep_value_copy_semantics\nPASS function_payloads_and_unevaluated_queries\n4 passed; 0 failed; 4 total\n");
     const fixtures = b.addWriteFiles();
     for ([_]struct { source: []const u8, syntax_error: bool }{
         .{ .source = "let f:(u:U)->int=match u{.ok=>|value|value\n_=>0}", .syntax_error = true },
@@ -1957,7 +2056,7 @@ fn addMatchPayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
 }
 
 fn addMixedOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "mixed-operators.nov", @embedFile("examples/mixed-operators.nov"), "Scaled: Vector[ x: 2, y: 4 ]\nDot: 5\nScalar on left: Vector[ x: 2, y: 4 ]\n", "PASS mixed_signatures_and_distinct_results\nPASS mixed_equality_preserves_structural_equality\nPASS mixed_ordering_resolves_reversed_signatures\nPASS compound_results_and_snapshots\nPASS generic_containers_functions_and_callbacks\nPASS function_and_void_results\nPASS unique_parameter_context_and_unevaluated_queries\n7 passed; 0 failed; 7 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "mixed-operators.nov", @embedFile("tests/mixed-operators.nov"), "Scaled: Vector[ x: 2, y: 4 ]\nDot: 5\nScalar on left: Vector[ x: 2, y: 4 ]\n", "PASS mixed_signatures_and_distinct_results\nPASS mixed_equality_preserves_structural_equality\nPASS mixed_ordering_resolves_reversed_signatures\nPASS compound_results_and_snapshots\nPASS generic_containers_functions_and_callbacks\nPASS function_and_void_results\nPASS unique_parameter_context_and_unevaluated_queries\n7 passed; 0 failed; 7 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("units.nov",
@@ -2034,7 +2133,7 @@ fn addMixedOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
 }
 
 fn addOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "operators.nov", @embedFile("examples/operators.nov"), "Sum: 17\nNegative: -5\nOrdering: true false\nCompound: 17\n", "PASS arithmetic_negation_and_bitwise\nPASS derived_ordering_and_sort\nPASS compound_local_field_element_and_reference_targets\nPASS snapshots_and_compound_rhs_replacement\nPASS generic_hooks_inferred_callbacks_and_queries\nPASS enum_union_and_contextual_literals\nPASS operand_evaluation_precedes_reversed_ordering\n7 passed; 0 failed; 7 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "operators.nov", @embedFile("tests/operators.nov"), "Sum: 17\nNegative: -5\nOrdering: true false\nCompound: 17\n", "PASS arithmetic_negation_and_bitwise\nPASS derived_ordering_and_sort\nPASS compound_local_field_element_and_reference_targets\nPASS snapshots_and_compound_rhs_replacement\nPASS generic_hooks_inferred_callbacks_and_queries\nPASS enum_union_and_contextual_literals\nPASS operand_evaluation_precedes_reversed_ordering\n7 passed; 0 failed; 7 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("models.nov",
@@ -2105,7 +2204,7 @@ fn addOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *
 }
 
 fn addEqualityCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "equality.nov", @embedFile("examples/equality.nov"), "Arrays: true\nSame user: true\nMembership: true\n", "PASS arrays_nested_values_and_membership\nPASS records_unions_enums_and_anonymous_values\nPASS overrides_apply_recursively_and_inequality_negates\nPASS enum_and_union_overrides\nPASS ieee_float_equality\nPASS hook_order_shortcircuit_snapshots_and_queries\n6 passed; 0 failed; 6 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "equality.nov", @embedFile("tests/equality.nov"), "Arrays: true\nSame user: true\nMembership: true\n", "PASS arrays_nested_values_and_membership\nPASS records_unions_enums_and_anonymous_values\nPASS overrides_apply_recursively_and_inequality_negates\nPASS enum_and_union_overrides\nPASS ieee_float_equality\nPASS hook_order_shortcircuit_snapshots_and_queries\n6 passed; 0 failed; 6 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("models.nov",
@@ -2188,7 +2287,7 @@ fn addEqualityCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *
 
 fn addArrayConcatCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("array-concat.nov", @embedFile("examples/array-concat.nov"));
+    _ = fixtures.add("array-concat.nov", @embedFile("tests/array-concat.nov"));
     const check = b.addRunArtifact(exe);
     check.setCwd(fixtures.getDirectory());
     check.addArgs(&.{ "check", "--semantic", "array-concat.nov" });
@@ -2244,7 +2343,7 @@ fn addArrayConcatCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
 
 fn addClearCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("clear.nov", @embedFile("examples/array-clear.nov"));
+    _ = fixtures.add("clear.nov", @embedFile("tests/array-clear.nov"));
     const check = b.addRunArtifact(exe);
     check.setCwd(fixtures.getDirectory());
     check.addArgs(&.{ "check", "--semantic", "clear.nov" });
@@ -2345,7 +2444,7 @@ fn addLenCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.B
 
 fn addRangeLengthCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("range-length.nov", @embedFile("examples/range-length.nov"));
+    _ = fixtures.add("range-length.nov", @embedFile("tests/range-length.nov"));
     _ = fixtures.add("counts.nov",
         \\@[public]
         \\let exclusive: uint = @len(2..5)
@@ -2465,7 +2564,7 @@ fn addRangeLengthCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
 
 fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("string-bytes.nov", @embedFile("examples/string-bytes.nov"));
+    _ = fixtures.add("string-bytes.nov", @embedFile("tests/string-bytes.nov"));
     _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
         "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[0] == 'é')\n@assert(alias.*[-2] == '😀')\n@assert(alias.*[-1] == '\\0')\n@assert(@len(alias.*) == 3)}\n");
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
@@ -2549,7 +2648,7 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
 
 fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("string-slices.nov", @embedFile("examples/string-slices.nov"));
+    _ = fixtures.add("string-slices.nov", @embedFile("tests/string-slices.nov"));
     _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
         "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[1..-1] == \"😀\")\n@assert(@len(alias.*[..]) == 3)}\n");
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
@@ -2651,7 +2750,7 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
 fn addRuneCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("runes.nov", @embedFile("examples/runes.nov"));
+    _ = fixtures.add("runes.nov", @embedFile("tests/runes.nov"));
     _ = fixtures.add("generic.nov",
         \\let Box: (T: type) -> type = struct {
         \\    value: T,
@@ -2851,7 +2950,7 @@ fn addTestSelectionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
 fn addLanguageTestCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("tests.nov", @embedFile("examples/tests.nov"));
+    _ = fixtures.add("tests.nov", @embedFile("tests/tests.nov"));
     _ = fixtures.add("imported.nov", "@[public]\n@[export(\"test_helper\")]\nlet helper: () -> i32 = 42\n" ++
         "@[test]\nlet panic_test: () = @panic(\"imported test ran\")\n" ++
         "@[test]\nlet ignored: (x: Missing) -> Missing = {let local = @import(\"missing.nov\")\nunknown}\n");
@@ -3028,7 +3127,7 @@ fn addLanguageTestCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
 
 fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("generic-closures.nov", @embedFile("examples/generic-closures.nov"));
+    _ = fixtures.add("generic-closures.nov", @embedFile("tests/generic-closures.nov"));
     _ = fixtures.add("factory.nov",
         \\let secret: int = 10
         \\@[public]
@@ -3120,7 +3219,7 @@ fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
 
 fn addQuotedInterpolationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("quoted-interpolation.nov", @embedFile("examples/quoted-interpolation.nov"));
+    _ = fixtures.add("quoted-interpolation.nov", @embedFile("tests/quoted-interpolation.nov"));
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI quoted interpolation: {s}", .{mode});
@@ -3152,7 +3251,7 @@ fn addQuotedInterpolationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, t
 fn addFloatCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("floats.nov", @embedFile("examples/floats.nov"));
+    _ = fixtures.add("floats.nov", @embedFile("tests/floats.nov"));
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI floats: {s}", .{mode});
@@ -3217,7 +3316,7 @@ fn addTypeOfExpressionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI TypeOf expressions: {s}", .{mode});
         check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
-        check.addFileArg(b.path("examples/type-of-expressions.nov"));
+        check.addFileArg(b.path("tests/type-of-expressions.nov"));
         if (!std.mem.eql(u8, mode, "fmt")) {
             check.addArg("--lib-dir");
             check.addDirectoryArg(b.path("lib"));
@@ -3230,7 +3329,7 @@ fn addTypeOfExpressionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    const source = package.add("type-of-expressions.nov", @embedFile("examples/type-of-expressions.nov"));
+    const source = package.add("type-of-expressions.nov", @embedFile("tests/type-of-expressions.nov"));
     for ([_]bool{ false, true }) |installed| {
         for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
             for ([_][]const u8{ "run", "test" }) |command| {
@@ -3265,7 +3364,7 @@ fn addTypeOfCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI TypeOf: {s}", .{mode});
         check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
-        check.addFileArg(b.path("examples/type-of.nov"));
+        check.addFileArg(b.path("tests/type-of.nov"));
         check.expectExitCode(0);
         check.expectStdOutEqual("");
         check.expectStdErrEqual("");
@@ -3325,7 +3424,7 @@ fn addTypeOfCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
                     run.setCwd(fixtures.getDirectory());
                     run.addArgs(&.{ "imports.nov", "--lib-dir" });
                     run.addDirectoryArg(library.dirname());
-                } else run.addFileArg(b.path("examples/type-of.nov"));
+                } else run.addFileArg(b.path("tests/type-of.nov"));
                 if (mode.len != 0) run.addArg(mode);
                 run.expectExitCode(0);
                 run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
@@ -3380,7 +3479,7 @@ fn addIntegerDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI integer defaults: {s}", .{mode});
         check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
-        check.addFileArg(b.path("examples/integer-defaults.nov"));
+        check.addFileArg(b.path("tests/integer-defaults.nov"));
         check.expectExitCode(0);
         check.expectStdOutEqual("");
         check.expectStdErrEqual("");
@@ -3394,7 +3493,7 @@ fn addIntegerDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
             run.setEnvironmentVariable("NOV_CC", "");
             run.setEnvironmentVariable("CC", "");
             run.addArg(command);
-            run.addFileArg(b.path("examples/integer-defaults.nov"));
+            run.addFileArg(b.path("tests/integer-defaults.nov"));
             if (mode.len != 0) run.addArg(mode);
             run.expectExitCode(0);
             run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
@@ -3430,7 +3529,7 @@ fn addIntegerDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
 
 fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("generic-functions.nov", @embedFile("examples/generic-functions.nov"));
+    _ = fixtures.add("generic-functions.nov", @embedFile("tests/generic-functions.nov"));
     _ = fixtures.add("contextual-value.nov",
         \\let identity: (x: `T) -> `T = x
         \\let verify: () = {
@@ -3653,7 +3752,7 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
 fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const counter = "let C=struct{value:int,let add:(self:&mut C,n:int)={self.*.value+=n}\nlet echo:(self:&mut C,x:`T)->`T=x\nlet read:(self:&C)->int=self.*.value\nlet take:(self:C)->int=self.value\n}\n";
-    _ = fixtures.add("mutable-methods.nov", @embedFile("examples/mutable-methods.nov"));
+    _ = fixtures.add("mutable-methods.nov", @embedFile("tests/mutable-methods.nov"));
     _ = fixtures.add("receiver-order.nov", counter ++
         \\let Callable=struct{call:(int)->int,}
         \\let forward:(p:&mut C,n:int)={p.add(n)}
@@ -3815,7 +3914,7 @@ fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
 
 fn addGenericMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("generic-methods.nov", @embedFile("examples/generic-methods.nov"));
+    _ = fixtures.add("generic-methods.nov", @embedFile("tests/generic-methods.nov"));
     _ = fixtures.add("library.nov",
         \\let secret: uint = 42
         \\let identity: (value: `T) -> `T = value
@@ -4089,11 +4188,11 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
 fn addUnionArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("union-arrays.nov", @embedFile("examples/union-arrays.nov"));
+    _ = fixtures.add("union-arrays.nov", @embedFile("tests/union-arrays.nov"));
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("union-arrays.nov", @embedFile("examples/union-arrays.nov"));
+    _ = package.add("union-arrays.nov", @embedFile("tests/union-arrays.nov"));
     const expected_tests = "PASS binding_assignment_arguments_and_returns\nPASS match_and_success_error_propagation\nPASS nested_strings_and_arrays_of_unions\nPASS closure_snapshots_and_shared_cells\nPASS mapping_and_finding_arrays\nPASS inactive_payloads_and_storable_elements\n6 passed; 0 failed; 6 total\n";
     for ([_]bool{ false, true }) |installed| {
         for ([_][]const u8{ "fmt", "semantic", "run", "test" }) |command| {
@@ -4190,13 +4289,13 @@ fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         \\let Reverse = result.Result(standard.Option(int), str)
         \\
     ;
-    _ = fixtures.add("nested-unions.nov", @embedFile("examples/nested-unions.nov"));
+    _ = fixtures.add("nested-unions.nov", @embedFile("tests/nested-unions.nov"));
     _ = fixtures.add("aliases.nov", aliases_source);
     _ = fixtures.add("api.nov", api_source);
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("nested-unions.nov", @embedFile("examples/nested-unions.nov"));
+    _ = package.add("nested-unions.nov", @embedFile("tests/nested-unions.nov"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
     const expected_tests = "PASS contextual_constructors_and_single_layer_matches\nPASS propagation_preserves_each_family_layer\nPASS recursive_array_storage_is_independent\nPASS closure_snapshots_and_shared_cells\nPASS mapping_and_search_produce_nested_unions\nPASS nested_stringify_and_inactive_payloads\n6 passed; 0 failed; 6 total\n";
@@ -4270,7 +4369,7 @@ fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
 
 fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("storable-arrays.nov", @embedFile("examples/storable-arrays.nov"));
+    _ = fixtures.add("storable-arrays.nov", @embedFile("tests/storable-arrays.nov"));
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI storable arrays: {s}", .{mode});
@@ -4342,8 +4441,8 @@ fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
 
 fn addGlobalCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("globals.nov", @embedFile("examples/globals.nov"));
-    _ = fixtures.add("globals-state.nov", @embedFile("examples/globals-state.nov"));
+    _ = fixtures.add("globals.nov", @embedFile("tests/globals.nov"));
+    _ = fixtures.add("globals-state.nov", @embedFile("tests/globals-state.nov"));
     _ = fixtures.add("constants.nov", "@[public]\nlet fixed = 1\nlet hidden = 2\n");
     for ([_][]const u8{ "syntax", "semantic" }) |mode| {
         const check = b.addRunArtifact(exe);
@@ -4411,7 +4510,7 @@ fn addGlobalCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
 
 fn addPrintingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("printing.nov", @embedFile("examples/printing.nov"));
+    _ = fixtures.add("printing.nov", @embedFile("tests/printing.nov"));
     const output = b.fmt(
         "Types: bool []rune Entry Message (i{d}) -> bool\nArray type: []i{d}\n" ++
             "Array: [1, 2, 3]\nNested: [[true, false], []]\n" ++
@@ -4441,7 +4540,7 @@ fn addPrintingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *
 fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("array-helpers.nov", @embedFile("examples/array-helpers.nov"));
+    _ = fixtures.add("array-helpers.nov", @embedFile("tests/array-helpers.nov"));
     _ = fixtures.add("api.nov",
         \\@[public]
         \\let array = @import("std").array
@@ -4676,7 +4775,7 @@ fn addStrCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.B
 fn addIntegerParsingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("integer-parsing.nov", @embedFile("examples/integer-parsing.nov"));
+    _ = fixtures.add("integer-parsing.nov", @embedFile("tests/integer-parsing.nov"));
     const aliases_source =
         \\let std=@import("std")
         \\let direct=@import("lib/string.nov")
@@ -4696,7 +4795,7 @@ fn addIntegerParsingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("integer-parsing.nov", @embedFile("examples/integer-parsing.nov"));
+    _ = package.add("integer-parsing.nov", @embedFile("tests/integer-parsing.nov"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     for ([_][]const u8{ "integer-parsing.nov", "aliases.nov", "lib/string.nov", "lib/std.nov" }) |source| {
         const check = b.addRunArtifact(exe);
@@ -4766,7 +4865,7 @@ fn addIntegerParsingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
 fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("string-search.nov", @embedFile("examples/string-search.nov"));
+    _ = fixtures.add("string-search.nov", @embedFile("tests/string-search.nov"));
     const aliases_source =
         \\let standard = @import("std")
         \\let direct = @import("lib/string.nov")
@@ -4817,7 +4916,7 @@ fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("string-search.nov", @embedFile("examples/string-search.nov"));
+    _ = package.add("string-search.nov", @embedFile("tests/string-search.nov"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     for ([_]bool{ false, true }) |installed| {
         for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
@@ -4870,7 +4969,7 @@ fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
 fn addStringConversionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("string-conversions.nov", @embedFile("examples/string-conversions.nov"));
+    _ = fixtures.add("string-conversions.nov", @embedFile("tests/string-conversions.nov"));
     const aliases_source =
         \\let standard = @import("std")
         \\let direct = @import("lib/string.nov")
@@ -4925,7 +5024,7 @@ fn addStringConversionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("string-conversions.nov", @embedFile("examples/string-conversions.nov"));
+    _ = package.add("string-conversions.nov", @embedFile("tests/string-conversions.nov"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     for ([_]bool{ false, true }) |installed| {
         for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
@@ -5045,7 +5144,7 @@ fn addStringTransformCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
     for ([_]struct { source: []const u8, contents: []const u8, stdout: []const u8, tests: []const u8 }{
         .{
             .source = "string-transform.nov",
-            .contents = @embedFile("examples/string-transform.nov"),
+            .contents = @embedFile("tests/string-transform.nov"),
             .stdout = "Trimmed: [é😀]\nReplaced: bXna\nRepeated: é😀é😀é😀\nNUL scalars: 3\n",
             .tests = "PASS trim_every_white_space_scalar\nPASS trim_property_boundaries_and_preserved_content\nPASS replace_nonoverlap_growth_deletion_and_boundaries\nPASS replace_exact_utf8_nul_case_and_normalization\nPASS repeat_count_boundaries_and_exact_content\nPASS eager_callee_and_arguments_once_left_to_right\nPASS retained_views_and_results_after_scope_and_gc_churn\n7 passed; 0 failed; 7 total\n",
         },
@@ -5188,13 +5287,13 @@ fn addCollectionHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
     const cases = [_]struct { source: []const u8, contents: []const u8, stdout: []const u8, tests: []const u8 }{
         .{
             .source = "string-join.nov",
-            .contents = @embedFile("examples/string-join.nov"),
+            .contents = @embedFile("tests/string-join.nov"),
             .stdout = "Joined: red, green, blue\nEmpty fields: |red||blue|\nConcatenated: é😀é\nEmpty: []\n",
             .tests = "PASS empty_singleton_and_empty_separator\nPASS separators_and_empty_parts\nPASS exact_utf8_nul_and_no_normalization\nPASS retained_result_and_source_unaffected\nPASS eager_arguments_once_left_to_right\n5 passed; 0 failed; 5 total\n",
         },
         .{
             .source = "array-selection.nov",
-            .contents = @embedFile("examples/array-selection.nov"),
+            .contents = @embedFile("tests/array-selection.nov"),
             .stdout = "Numbers: [3, 1, 4, 2]\nLast above two: 4\nTake two: [3, 1]\nDrop two: [4, 2]\nTake oversized: [3, 1, 4, 2]\nDrop oversized: []\n",
             .tests = "PASS reverse_visit_order_and_shortcircuit\nPASS typed_empty_no_predicate_calls\nPASS take_drop_boundaries_and_order\nPASS generic_storable_families\nPASS recursive_copies_in_both_directions\nPASS predicate_mutations_preserve_snapshot\nPASS closures_share_capture_environments\nPASS eager_arguments_once_left_to_right\n8 passed; 0 failed; 8 total\n",
         },
@@ -5278,7 +5377,7 @@ fn addCollectionHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
 fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("string-split.nov", @embedFile("examples/string-split.nov"));
+    _ = fixtures.add("string-split.nov", @embedFile("tests/string-split.nov"));
     const aliases_source =
         \\let standard = @import("std")
         \\let direct = @import("lib/string.nov")
@@ -5318,7 +5417,7 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("string-split.nov", @embedFile("examples/string-split.nov"));
+    _ = package.add("string-split.nov", @embedFile("tests/string-split.nov"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     for ([_]bool{ false, true }) |installed| {
         for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
@@ -5415,7 +5514,7 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
 
 fn addLastUseCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("last-use.nov", @embedFile("examples/last-use.nov"));
+    _ = fixtures.add("last-use.nov", @embedFile("tests/last-use.nov"));
     for ([_]bool{ false, true }) |semantic| {
         const check = b.addRunArtifact(exe);
         check.setCwd(fixtures.getDirectory());
@@ -5446,7 +5545,7 @@ fn addLastUseCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
 fn addArrayDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("array-defaults.nov", @embedFile("examples/array-defaults.nov"));
+    _ = fixtures.add("array-defaults.nov", @embedFile("tests/array-defaults.nov"));
     _ = fixtures.add("defaults.nov", "@[public]\nlet R=struct{values:[][]str=[[\"é\\0\"],[]],}\n@[public]\nlet Buffer:(T:type)->type=struct{values:[]T=[],}\n");
     _ = fixtures.add("imported.nov",
         \\let api=@import("defaults.nov")
@@ -5658,7 +5757,7 @@ fn addArrayPredicateQueryCliTests(b: *std.Build, exe: *std.Build.Step.Compile, t
 }
 
 fn addArrayReduceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
-    addArrayValueHelperCliTests(b, exe, test_step, "array-reduce.nov", @embedFile("examples/array-reduce.nov"), "Remaining: 12\nEmpty: true\n", "PASS empty_singleton_and_left_fold_order\nPASS exact_numeric_types_and_ieee_seed_preservation\nPASS managed_results_are_recursively_independent\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n5 passed; 0 failed; 5 total\n");
+    addArrayValueHelperCliTests(b, exe, test_step, "array-reduce.nov", @embedFile("tests/array-reduce.nov"), "Remaining: 12\nEmpty: true\n", "PASS empty_singleton_and_left_fold_order\nPASS exact_numeric_types_and_ieee_seed_preservation\nPASS managed_results_are_recursively_independent\nPASS storable_types_and_shared_closure_cells\nPASS eager_snapshots_aliases_inference_and_pure_queries\n5 passed; 0 failed; 5 total\n");
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     const aliases =
@@ -5790,7 +5889,7 @@ fn addArraySortCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
     for ([_]struct { source: []const u8, contents: []const u8, stdout: []const u8, tests: []const u8 }{
         .{
             .source = "array-sort.nov",
-            .contents = @embedFile("examples/array-sort.nov"),
+            .contents = @embedFile("tests/array-sort.nov"),
             .stdout = "Source: [3, 1, 2, 1]\nAscending: [1, 1, 2, 3]\nDescending: [3, 2, 1, 1]\nStable keys: Bo Ada Cy\nSource unchanged: [3, 1, 2, 1]\n",
             .tests = "PASS empty_and_singleton_no_comparisons\nPASS sorted_reverse_duplicates_and_descending\nPASS stable_struct_keys_and_all_equal\nPASS strings_runes_and_finite_floats\nPASS bool_integer_enum_union_and_range_elements\nPASS nested_arrays_and_records_copy_independently\nPASS function_elements_share_closure_captures\nPASS comparator_capture_and_comparison_order\nPASS arguments_once_left_to_right_and_source_snapshot\n9 passed; 0 failed; 9 total\n",
         },
@@ -5894,7 +5993,7 @@ fn addArraySortCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
 fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("array-search.nov", @embedFile("examples/array-search.nov"));
+    _ = fixtures.add("array-search.nov", @embedFile("tests/array-search.nov"));
     const api_source =
         \\@[public]
         \\let any = @import("std").array.any
@@ -5961,7 +6060,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
     // Direct imports must resolve to the same library as the relocated executable.
-    _ = package.add("array-search.nov", @embedFile("examples/array-search.nov"));
+    _ = package.add("array-search.nov", @embedFile("tests/array-search.nov"));
     _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     for ([_]bool{ false, true }) |installed| {
@@ -6048,7 +6147,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
 fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("container-map.nov", @embedFile("examples/container-map.nov"));
+    _ = fixtures.add("container-map.nov", @embedFile("tests/container-map.nov"));
     const aliases_source =
         \\let standard = @import("std")
         \\let directOption = @import("lib/option.nov")
@@ -6114,7 +6213,7 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("container-map.nov", @embedFile("examples/container-map.nov"));
+    _ = package.add("container-map.nov", @embedFile("tests/container-map.nov"));
     _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     const example_tests = "PASS option_variants_and_inferred_results\nPASS result_variants_and_shared_captures\nPASS eager_receiver_and_callback_construction\nPASS record_payloads_and_recursive_array_copies\nPASS inactive_callbacks_and_chained_maps\nPASS chained_container_operations\n6 passed; 0 failed; 6 total\n";
@@ -6215,7 +6314,7 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
 
 fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("array-fields.nov", @embedFile("examples/array-fields.nov"));
+    _ = fixtures.add("array-fields.nov", @embedFile("tests/array-fields.nov"));
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI array fields: {s}", .{mode});
@@ -6274,7 +6373,7 @@ fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
 
 fn addPositionalFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("positional-fields.nov", @embedFile("examples/positional-fields.nov"));
+    _ = fixtures.add("positional-fields.nov", @embedFile("tests/positional-fields.nov"));
     _ = fixtures.add("shapes.nov",
         \\@[public]
         \\let Pair = @TypeOf(.[1, "a"])
@@ -6380,7 +6479,7 @@ fn addAnonymousStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI anonymous structs: {s}", .{mode});
         run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
-        run.addFileArg(b.path("examples/anonymous-structs.nov"));
+        run.addFileArg(b.path("tests/anonymous-structs.nov"));
         if (std.mem.eql(u8, mode, "semantic")) {
             run.addArg("--lib-dir");
             run.addDirectoryArg(b.path("lib"));
@@ -6436,7 +6535,7 @@ fn addAnonymousStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
                 run.expectStdOutEqual(".[ a: 1, label: local ] .[ a: 7, label: module ] .[2, b]\nstruct{ a: i64, label: str } struct{ i64, str }\n");
             } else {
                 run.addArg(command);
-                run.addFileArg(b.path("examples/anonymous-structs.nov"));
+                run.addFileArg(b.path("tests/anonymous-structs.nov"));
                 run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
                     "PASS named_contextual_defaults\nPASS structural_shapes_across_scopes\nPASS inferred_positional_values\nPASS snapshots_and_closure_fields\nPASS generic_mapping\n5 passed; 0 failed; 5 total\n"
                 else
@@ -6482,7 +6581,7 @@ fn addConstructorShorthandCliTests(b: *std.Build, exe: *std.Build.Step.Compile, 
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI constructor shorthand: {s}", .{mode});
         run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
-        run.addFileArg(b.path("examples/constructor-shorthand.nov"));
+        run.addFileArg(b.path("tests/constructor-shorthand.nov"));
         run.expectExitCode(0);
         run.expectStdOutEqual("");
         run.expectStdErrEqual("");
@@ -6496,7 +6595,7 @@ fn addConstructorShorthandCliTests(b: *std.Build, exe: *std.Build.Step.Compile, 
             run.setEnvironmentVariable("NOV_CC", "");
             run.setEnvironmentVariable("CC", "");
             run.addArg(command);
-            run.addFileArg(b.path("examples/constructor-shorthand.nov"));
+            run.addFileArg(b.path("tests/constructor-shorthand.nov"));
             if (mode.len != 0) run.addArg(mode);
             run.expectExitCode(0);
             run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
@@ -6582,7 +6681,7 @@ fn addFieldMutationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\}
         \\
     );
-    _ = fixtures.add("struct-mutation-example.nov", @embedFile("examples/struct-mutation.nov"));
+    _ = fixtures.add("struct-mutation-example.nov", @embedFile("tests/struct-mutation.nov"));
     const programs = [_]struct { source: []const u8, output: []const u8 }{
         .{ .source = "field-mutation.nov", .output = "3 old! true true 8 1 old\n" },
         .{ .source = "struct-mutation-example.nov", .output = "Counter updated 6 true true\nCounter 0 false true\n" },
@@ -6669,7 +6768,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\
     );
     const output = "SNvalue:1 none\nSE1\nNE9\nS1\nNL7\n3 4\ntrue false true true\nsome eager lazy some\nsome record eager record\nlazy record some record\ntrue false\nsome:none:unit:done\n";
-    _ = fixtures.add("options-example.nov", @embedFile("examples/options.nov"));
+    _ = fixtures.add("options-example.nov", @embedFile("tests/options.nov"));
     _ = fixtures.add("variant-predicates.nov", imports ++
         \\let Record = struct {
         \\    text: str,
@@ -6765,7 +6864,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
 
 fn addExportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("exports.nov", @embedFile("examples/exports.nov"));
+    _ = fixtures.add("exports.nov", @embedFile("tests/exports.nov"));
 
     _ = fixtures.add("default.nov", "@[export]\nlet exact: (x: i32) -> i32 = x\n");
     _ = fixtures.add("custom.nov", "@[export(\"custom_exact\")]\nlet renamed: (x: bool) -> bool = x\n");
@@ -6903,7 +7002,7 @@ fn addExportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
         const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-fsanitize=undefined", "-fno-sanitize-recover=all", optimization });
         compile.addFileArg(c_source);
-        compile.addFileArg(b.path("examples/exports.c"));
+        compile.addFileArg(b.path("tests/exports.c"));
         compile.addArg("-o");
         const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "example.exe" else "example");
         const execute = std.Build.Step.Run.create(b, b.fmt("CLI exports: checked-in example {s}", .{optimization}));
@@ -6917,7 +7016,7 @@ fn addExportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
 
 fn addExternCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("extern.nov", @embedFile("examples/extern.nov"));
+    _ = fixtures.add("extern.nov", @embedFile("tests/extern.nov"));
     _ = fixtures.add("libc.nov", "@[extern]\nlet abs: (x: i32) -> i32\nlet main: () = @println(abs(-42))\n");
     _ = fixtures.add("library.nov", "@[extern]\nlet foreign_unit: ()\n@[extern(\"foreign_\\x73top\")]\n@[noreturn]\nlet stop: ()\n");
     var scalar_source: std.Io.Writer.Allocating = .init(b.allocator);
@@ -7021,7 +7120,7 @@ fn addExternCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
         const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-fsanitize=undefined", "-fno-sanitize-recover=all", optimization });
         compile.addFileArg(c_source);
-        compile.addFileArg(b.path("examples/extern.c"));
+        compile.addFileArg(b.path("tests/extern.c"));
         compile.addArg("-o");
         const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "extern.exe" else "extern");
         const execute = std.Build.Step.Run.create(b, b.fmt("CLI extern: checked-in example {s}", .{optimization}));
@@ -7402,7 +7501,7 @@ fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI references: {s}", .{mode});
         check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
-        check.addFileArg(b.path("examples/references.nov"));
+        check.addFileArg(b.path("tests/references.nov"));
         check.expectExitCode(0);
         check.expectStdOutEqual("");
         check.expectStdErrEqual("");
@@ -7416,7 +7515,7 @@ fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
             run.setEnvironmentVariable("NOV_CC", "");
             run.setEnvironmentVariable("CC", "");
             run.addArg(command);
-            run.addFileArg(b.path("examples/references.nov"));
+            run.addFileArg(b.path("tests/references.nov"));
             if (mode.len != 0) run.addArg(mode);
             run.expectExitCode(0);
             run.expectStdOutEqual(if (std.mem.eql(u8, command, "run"))
@@ -7487,7 +7586,7 @@ fn addReferenceParameterCliTests(b: *std.Build, exe: *std.Build.Step.Compile, te
             } else {
                 run.addArg(command);
             }
-            run.addFileArg(b.path("examples/reference-parameters.nov"));
+            run.addFileArg(b.path("tests/reference-parameters.nov"));
             if (!format and !semantic and mode.len != 0) run.addArg(mode);
 
             run.expectExitCode(0);
@@ -7581,7 +7680,7 @@ fn addReferenceRebindingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, te
             } else {
                 run.addArg(command);
             }
-            run.addFileArg(b.path("examples/reference-rebinding.nov"));
+            run.addFileArg(b.path("tests/reference-rebinding.nov"));
             if (!format and !semantic and mode.len != 0) run.addArg(mode);
             run.expectExitCode(0);
             run.expectStdOutEqual(if (format or semantic) "" else if (std.mem.eql(u8, command, "run"))
@@ -7628,7 +7727,7 @@ fn addReferenceRebindingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, te
 }
 
 fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
-    _ = fixtures.add("borrowed-elements.nov", @embedFile("examples/managed-arrays.nov"));
+    _ = fixtures.add("borrowed-elements.nov", @embedFile("tests/managed-arrays.nov"));
     _ = fixtures.add("borrowed-integer.nov",
         \\let main: () = {
         \\    let mut x: uint = 1
@@ -7639,7 +7738,7 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\}
         \\
     );
-    _ = fixtures.add("local-borrows-example.nov", @embedFile("examples/local-borrows.nov"));
+    _ = fixtures.add("local-borrows-example.nov", @embedFile("tests/local-borrows.nov"));
     const programs = [_]struct { source: []const u8, output: []const u8 }{
         .{ .source = "borrowed-integer.nov", .output = "2 1\n" },
         .{ .source = "local-borrows-example.nov", .output = "2 1\ntrue\nhello world hello world\ntrue\n5\n3 2 1\n1 2 \n9\n7\n" },
@@ -7701,7 +7800,7 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
 
 fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("iteration.nov", @embedFile("examples/iteration.nov"));
+    _ = fixtures.add("iteration.nov", @embedFile("tests/iteration.nov"));
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI iteration: {s}", .{mode});
@@ -7971,7 +8070,7 @@ fn addIterationContinuationCliTests(b: *std.Build, exe: *std.Build.Step.Compile,
 
 fn addZipIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    _ = fixtures.add("zip-iteration.nov", @embedFile("examples/zip-iteration.nov"));
+    _ = fixtures.add("zip-iteration.nov", @embedFile("tests/zip-iteration.nov"));
     const output = "0 10\n1 20\n2 30\né a\na 😀\n";
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
@@ -8000,7 +8099,7 @@ fn addZipIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         }
     }
     // Reach the test bodies in ordinary emitted C as well as through `nov test`.
-    const unannotated = std.mem.replaceOwned(u8, b.allocator, @embedFile("examples/zip-iteration.nov"), "@[test]\n", "") catch @panic("OOM");
+    const unannotated = std.mem.replaceOwned(u8, b.allocator, @embedFile("tests/zip-iteration.nov"), "@[test]\n", "") catch @panic("OOM");
     const demo = std.mem.replaceOwned(u8, b.allocator, unannotated, "let main:", "let demo:") catch @panic("OOM");
     _ = fixtures.add("zip-strict.nov", b.fmt("{s}\nlet main:()={{demo()\nmixed_and_unicode()\nsource_order()\nrange_cardinalities()\nopen_indices()\nreference_pairs()\ncontrol_and_captures()}}\n", .{demo}));
     const emit = b.addRunArtifact(exe);
@@ -8143,13 +8242,13 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\let RangeOption = standard.Option(Range)
         \\
     ;
-    _ = fixtures.add("value-payloads.nov", @embedFile("examples/value-payloads.nov"));
+    _ = fixtures.add("value-payloads.nov", @embedFile("tests/value-payloads.nov"));
     _ = fixtures.add("aliases.nov", aliases_source);
     _ = fixtures.add("api.nov", api_source);
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("value-payloads.nov", @embedFile("examples/value-payloads.nov"));
+    _ = package.add("value-payloads.nov", @embedFile("tests/value-payloads.nov"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
     _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
     const expected_tests = "PASS callable_constructors_match_and_propagation\nPASS escaping_shared_cells_and_overwritten_owner\nPASS creation_snapshots_and_later_copies\nPASS range_copies_exact_bounds_and_inclusive_max\nPASS find_and_map_function_and_range_results\nPASS custom_hooks_nested_helpers_and_inactive_values\n6 passed; 0 failed; 6 total\n";
@@ -8230,11 +8329,11 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
 fn addStorableFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
-    _ = fixtures.add("storable-fields.nov", @embedFile("examples/storable-fields.nov"));
+    _ = fixtures.add("storable-fields.nov", @embedFile("tests/storable-fields.nov"));
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
     _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
-    _ = package.add("storable-fields.nov", @embedFile("examples/storable-fields.nov"));
+    _ = package.add("storable-fields.nov", @embedFile("tests/storable-fields.nov"));
     const expected_tests = "PASS constructors_updates_and_nested_paths\nPASS union_field_arrays_copy_across_calls\nPASS escaping_closures_aliases_and_snapshots\nPASS direct_computed_pipe_and_callee_order\nPASS range_fields_reloop_and_inclusive_max\nPASS generic_fields_methods_and_printing\n6 passed; 0 failed; 6 total\n";
     for ([_]bool{ false, true }) |installed| {
         for ([_][]const u8{ "fmt", "semantic", "run", "test" }) |command| {

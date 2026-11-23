@@ -1,0 +1,138 @@
+; nov run tests/generic-functions.nov
+; nov test tests/generic-functions.nov
+; Backtick types are inferred exactly: literals need typed arguments or a result type.
+
+let identity: (value: `T) -> `T = value
+let identityAlias = identity
+let Callback = (uint) -> uint
+let first: (items: []`T) -> `T = items[0]
+let add: (x: `a, y: `b) -> `c = x + y
+let twice: (x: `T) -> `U = add(x, x)
+let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
+let increment: (x: uint) -> uint = x + 1
+let reverseApply: (x: `T, f: (`T) -> `U) -> `U = f(x)
+let chain: (f: (`T) -> `U, g: (`U) -> `V, x: `T) -> `V = g(f(x))
+let fixedCallback: (f: Callback) -> uint = f(42)
+let returnedCallback: () -> Callback = identity
+let contextualInside: (value: `T) -> `T = {
+    let cb: (`T) -> `T = identity
+    cb(value)
+}
+let snapshot: (value: `T) -> () -> `T = () -> `T { value }
+let namedSnapshot: (value: `T) -> (bool) -> `T = {
+    let captured: (ignored: bool) -> `T = value
+    captured
+}
+
+let Box: (T: type) -> type = struct {
+    value: T,
+}
+
+let unwrap: (box: Box(`T)) -> `U = box.value
+let invert: (value: `T) -> `U = !value
+let size: (value: `T) -> `U = @len(value)
+let looped: (value: `T) -> `U = loop {
+    break value
+}
+
+let main: () = {
+    let numbers: []uint = [7, 8]
+    let total: uint = add(1, 2)
+    let saved = snapshot("captured")
+    @println(first(numbers), add(@as(uint, 1), 2), total, add("hello", "!"))
+    @println(apply(increment, 4), unwrap(Box(str).[ value = "boxed" ]), saved())
+    let cb: (uint) -> uint = identity
+    @println(cb(42), @as((uint) -> uint, identity)(43), apply(identity, @as(uint, 44)))
+}
+
+@[test]
+let first_and_nested_arrays: () = {
+    let values: [][]uint = [[7, 8], [9]]
+    @assert(first(first(values)) == 7)
+    @assert(first(["first", "second"]) == "first")
+}
+
+@[test]
+let exact_add_constraints: () = {
+    let total: uint = add(1, 2)
+    @assert(total == 3)
+    @assert(add(@as(uint, 1), 2) == 3)
+    @assert(add("hello", "!") == "hello!")
+    let doubled: uint = twice(4)
+    @assert(doubled == 8)
+}
+
+@[test]
+let ordinary_callback: () = {
+    @assert(apply(increment, 4) == 5)
+    let double = (x: uint) -> uint { x + x }
+    @assert(apply(double, 3) == 6)
+}
+
+@[test]
+let contextual_callback_values: () = {
+    let cb: (uint) -> uint = identity
+    let alias: Callback = identityAlias
+    let cast = @as((uint) -> uint, identity)
+    @assert(cb(42) == 42 and alias(43) == 43 and cast(44) == 44)
+    @assert(fixedCallback(identity) == 42)
+    @assert(returnedCallback()(45) == 45)
+    @assert(contextualInside("inside") == "inside")
+}
+
+@[test]
+let bidirectional_generic_callbacks: () = {
+    @assert(apply(identity, @as(uint, 42)) == 42)
+    let result: uint = apply(identity, 43)
+    let reversed: uint = reverseApply(44, identityAlias)
+    let chained: uint = chain(identity, identityAlias, 45)
+    @assert(result == 43 and reversed == 44 and chained == 45)
+    @assert(chain(identity, increment, @as(uint, 46)) == 47)
+    @assert(chain(increment, identity, @as(uint, 47)) == 48)
+    @assert(apply(identity, "string") == "string")
+}
+
+@[test]
+let stored_contextual_callbacks: () = {
+    let mut slot: Callback = identity
+    slot = increment
+    @assert(slot(4) == 5)
+    slot = identityAlias
+    @assert(slot(4) == 4)
+    let branch: Callback = if true { identity } else { identityAlias }
+    @assert(branch(5) == 5)
+    let mut callbacks: []Callback = [identity, increment, identityAlias]
+    let saved = callbacks
+    callbacks[0] = increment
+    callbacks += [identity]
+    @assert(saved[0](6) == 6 and callbacks[0](6) == 7)
+    @assert(callbacks[1](7) == 8 and callbacks[2](8) == 8)
+    @assert(callbacks[-1](9) == 9)
+}
+
+@[test]
+let nominal_box: () = {
+    let nested = Box(Box(str)).[ value = Box(str).[ value = "nested" ] ]
+    @assert(unwrap(unwrap(nested)) == "nested")
+}
+
+@[test]
+let returned_closures_and_array_copies: () = {
+    let mut values: []str = ["before"]
+    let saved = snapshot(values)
+    let copied = saved()
+    values[0] = "after"
+    @assert(first(copied) == "before")
+    @assert(first(saved()) == "before")
+    @assert(first(values) == "after")
+    let named = namedSnapshot("named")
+    @assert(named(false) == "named")
+}
+
+@[test]
+let body_constraints: () = {
+    @assert(invert(false))
+    @assert(looped(true))
+    @assert(size("abc") == 3)
+    @assert(size([true, false]) == 2)
+}

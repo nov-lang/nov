@@ -1,0 +1,56 @@
+; A parcel keeps its value data separate from its delivery state.
+let Weight = struct {
+    grams: int = 0,
+
+    @[operator(.add)]
+    let add: (a: Weight, b: Weight) -> Weight = Weight.[ grams = a.grams + b.grams ]
+
+    @[stringify]
+    let format: (self: Weight) -> str = "{self.grams}g"
+}
+
+let Service = enum {
+    standard,
+    express,
+}
+
+let Delivery = union {
+    queued,
+    sent: str,
+}
+
+let Parcel = struct {
+    label: str,
+    weight: Weight,
+    service: Service = .standard,
+    delivery: Delivery,
+
+    let pack: (self: &mut Parcel, packaging: Weight) = { self.weight = self.weight + packaging }
+
+    @[stringify]
+    let format: (self: Parcel) -> str = "{self.label}: {self.weight} ({self.service})"
+}
+
+let main: () = {
+    let mut parcel = Parcel.[
+        label = "Books",
+        weight = Weight.[ grams = 800 ],
+        delivery = .queued[]
+    ]
+    let unpacked = parcel
+    parcel.pack(Weight.[ grams = 50 ])
+    parcel.service = .express
+
+    ; An anonymous record holds the address; a positional pair is the scan.
+    let address = .[ city = "Lyon", desk = "B2" ]
+    let scan = .[ address.desk, parcel.weight ]
+    parcel.delivery = .sent["{address.city}/{scan.0}"]
+    let status = match parcel.delivery {
+        .queued => "waiting for dispatch"
+        .sent[route] => "sent to {route}"
+    }
+    @println("Before packing:", unpacked)
+    @println("Ready:", parcel)
+    @println("Scan: {scan.0}, {scan.1}")
+    @println("Delivery:", status)
+}

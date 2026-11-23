@@ -1,0 +1,205 @@
+; nov run --lib-dir lib tests/string-transform.nov
+; nov test --lib-dir lib tests/string-transform.nov
+; Exact stdout:
+; Trimmed: [é😀]
+; Replaced: bXna
+; Repeated: é😀é😀é😀
+; NUL scalars: 3
+
+let std = @import("std")
+
+@[test]
+let trim_every_white_space_scalar: () = {
+    let whitespace = "\u{9}\u{A}\u{B}\u{C}\u{D} \u{85}\u{A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}"
+    @assert(@len(whitespace) == 25)
+    loop scalar in whitespace {
+        let edge = "{scalar}"
+        @assert(std.string.trim(edge) == "")
+        @assert(std.string.trim(edge + "é😀" + edge) == "é😀")
+        @assert(std.string.trim(edge + "x") == "x")
+        @assert(std.string.trim("x" + edge) == "x")
+    }
+    @assert(std.string.trim(whitespace) == "")
+    @assert(std.string.trim(whitespace + "é😀" + whitespace) == "é😀")
+    @assert(std.string.trim("") == "")
+}
+
+@[test]
+let trim_property_boundaries_and_preserved_content: () = {
+    let nonwhite = "\u{8}\u{E}\u{1F}\u{21}\u{84}\u{86}\u{9F}\u{A1}\u{167F}\u{1681}\u{1FFF}\u{200B}\u{2027}\u{202A}\u{202E}\u{2030}\u{205E}\u{2060}\u{2FFF}\u{3001}\u{FEFF}\0\u{301}\u{180E}"
+    loop scalar in nonwhite {
+        let edge = "{scalar}"
+        @assert(std.string.trim(edge) == edge)
+        @assert(std.string.trim(" " + edge + " ") == edge)
+        @assert(std.string.trim(edge + " x " + edge) == edge + " x " + edge)
+    }
+    @assert(std.string.trim(" \té\0😀 e\u{301}\u{3000}") == "é\0😀 e\u{301}")
+    @assert(std.string.trim(" é ") != std.string.trim(" e\u{301} "))
+    @assert(std.string.trim(" \0 \u{301} ") == "\0 \u{301}")
+}
+
+@[test]
+let replace_nonoverlap_growth_deletion_and_boundaries: () = {
+    @assert(std.string.replace("aaaaa", "aa", "X") == "XXa")
+    @assert(std.string.replace("banana", "ana", "X") == "bXna")
+    @assert(std.string.replace("ababa", "aba", "X") == "Xba")
+    @assert(std.string.replace("aaab", "aab", "X") == "aX")
+    @assert(std.string.replace("a::b::::", "::", "LONG") == "aLONGbLONGLONG")
+    @assert(std.string.replace("aaaa", "a", "aa") == "aaaaaaaa")
+    @assert(std.string.replace("::a::::b::", "::", "") == "ab")
+    @assert(std.string.replace("word", "word", "") == "")
+    @assert(std.string.replace("", "x", "y") == "")
+    @assert(std.string.replace("ab", "abc", "y") == "ab")
+    @assert(std.string.replace("abc", "z", "y") == "abc")
+}
+
+@[test]
+let replace_exact_utf8_nul_case_and_normalization: () = {
+    @assert(std.string.replace("é😀x😀x\0e\u{301}", "😀x", "λ\0") == "éλ\0λ\0\0e\u{301}")
+    @assert(std.string.replace("\0a\0\0b\0", "\0", "😀") == "😀a😀😀b😀")
+    @assert(std.string.replace("a\0😀b\0😀", "\0😀", "") == "ab")
+    @assert(std.string.replace("ée\u{301}é", "é", "E") == "Ee\u{301}E")
+    @assert(std.string.replace("ée\u{301}", "e\u{301}", "é") == "éé")
+    @assert(std.string.replace("e\u{301}", "\u{301}", "") == "e")
+    @assert(std.string.replace("é", "\u{A9}", "x") == "é")
+    @assert(std.string.replace("AaA Straße", "a", "x") == "AxA Strxße")
+    @assert(std.string.replace("Straße", "STRASSE", "x") == "Straße")
+    @assert(std.string.replace("", "", "replacement") == "")
+    @assert(std.string.replace("é\0😀", "", "replacement") == "é\0😀")
+    @assert(std.string.replace("text", "", "") == "text")
+}
+
+@[test]
+let repeat_count_boundaries_and_exact_content: () = {
+    @assert(std.string.repeat("é😀\0e\u{301}", 0) == "")
+    @assert(std.string.repeat("é😀\0e\u{301}", 1) == "é😀\0e\u{301}")
+    @assert(std.string.repeat("é😀\0e\u{301}", 2) == "é😀\0e\u{301}é😀\0e\u{301}")
+    @assert(std.string.repeat("x", 3) == "xxx")
+    @assert(std.string.repeat("", 0) == "")
+    @assert(std.string.repeat("", 1) == "")
+    let maximum: uint = 0 - @as(uint, 1)
+    @assert(std.string.repeat("", maximum) == "")
+    @assert(std.string.repeat("", maximum - 1) == "")
+    @assert(@len(std.string.repeat("x", 256)) == 256)
+    @assert(std.string.repeat("e\u{301}", 2) != "éé")
+}
+
+@[test]
+let eager_callee_and_arguments_once_left_to_right: () = {
+    let mut events: int = 0
+    let mut source = "a😀b"
+    let getReplace = () -> (str, str, str) -> str {
+        events = events * 10 + 1
+        std.string.replace
+    }
+    let replaced = getReplace()(
+        {
+            events = events * 10 + 2
+            source
+        },
+        {
+            events = events * 10 + 3
+            source = "changed"
+            "😀"
+        },
+        {
+            events = events * 10 + 4
+            "!"
+        }
+    )
+    @assert(events == 1234 and replaced == "a!b" and source == "changed")
+    events = 0
+    let empty = std.string.replace(
+        {
+            events = events * 10 + 1
+            ""
+        },
+        {
+            events = events * 10 + 2
+            "x"
+        },
+        {
+            events = events * 10 + 3
+            "y"
+        }
+    )
+    @assert(events == 123 and empty == "")
+    events = 0
+    let getRepeat = () -> (str, uint) -> str {
+        events = events * 10 + 1
+        std.string.repeat
+    }
+    let repeated = getRepeat()(
+        {
+            events = events * 10 + 2
+            "é"
+        },
+        {
+            events = events * 10 + 3
+            0
+        }
+    )
+    @assert(events == 123 and repeated == "")
+    events = 0
+    let emptyRepeated = std.string.repeat(
+        {
+            events = events * 10 + 1
+            ""
+        },
+        {
+            events = events * 10 + 2
+            3
+        }
+    )
+    @assert(events == 12 and emptyRepeated == "")
+    events = 0
+    let trimmed = std.string.trim(
+        {
+            events += 1
+            " é "
+        }
+    )
+    @assert(events == 1 and trimmed == "é")
+}
+
+let retained: () -> []str = {
+    let mut source = "prefix:" + " \u{3000}é😀\0e\u{301}\t:suffix"
+    let view = source[7..-7]
+    let trimmed = std.string.trim(view)
+    let pattern = trimmed[1..2]
+    let replacement = trimmed[3..]
+    let replaced = std.string.replace(trimmed, pattern, replacement)
+    let repeated = std.string.repeat(trimmed, 2)
+    source += "changed"
+    source = "different"
+    @assert(source == "different")
+    [trimmed, replaced, repeated, std.string.trim(view[0..2])]
+}
+
+@[test]
+let retained_views_and_results_after_scope_and_gc_churn: () = {
+    let results = retained()
+    let original = results[0]
+    let mut changed = original
+    changed += "!"
+    loop i in 0..2000 {
+        let temporary = "allocation:{i}:é😀"
+        @assert(@len(temporary) > 0)
+    }
+    @assert(original == "é😀\0e\u{301}" and original[1..3] == "😀\0")
+    @assert(results[1] == "ée\u{301}\0e\u{301}")
+    @assert(results[2] == original + original and results[3] == "")
+    @assert(changed == original + "!" and results[0] == original)
+    let trim: (str) -> str = std.string.trim
+    let replace: (str, str, str) -> str = std.string.replace
+    let repeat: (str, uint) -> str = std.string.repeat
+    @assert(trim(" x ") == "x" and replace("aba", "a", "!") == "!b!")
+    @assert(repeat("x", 2) == "xx")
+}
+
+let main: () = {
+    @println("Trimmed: [{std.string.trim("\u{3000} é😀\t")}]")
+    @println("Replaced:", std.string.replace("banana", "ana", "X"))
+    @println("Repeated:", std.string.repeat("é😀", 3))
+    @println("NUL scalars:", @len(std.string.replace("a\0b", "\0", "\0")))
+}

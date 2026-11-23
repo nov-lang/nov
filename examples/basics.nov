@@ -1,0 +1,43 @@
+; Functions, pattern matching, ranges, and control flow in one small report.
+let fibonacci: (n: int) -> int = match n {
+    0 | 1 => n
+    _ => fibonacci(n - 1) + fibonacci(n - 2)
+}
+
+let fizzBuzz: (n: uint) -> str = match n % 3, n % 5 {
+    0, 0 => "FizzBuzz"
+    0, _ => "Fizz"
+    _, 0 => "Buzz"
+    _ => "{n}"
+}
+
+let main: () = {
+    @println("Fibonacci:")
+    let mut total: int = 0
+    let start: int = 0
+    loop n in start..8 {
+        let value = fibonacci(n)
+        total += value
+        @println("  {n}: {value}")
+    }
+    @println("Total: {total}")
+
+    @println("FizzBuzz:")
+    loop n in 1..=15 {
+        @println("  {n}: {fizzBuzz(n)}")
+    }
+
+    ; Skip odd candidates and stop at the first even Fibonacci value above ten.
+    let mut candidate: int = 0
+    loop {
+        let value = fibonacci(candidate)
+        candidate += 1
+        if value % 2 != 0 {
+            continue
+        }
+        if value > 10 {
+            @println("First even Fibonacci above 10: {value}")
+            break
+        }
+    }
+}

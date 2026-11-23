@@ -1,0 +1,33 @@
+; Clean a message for display, then encode it for transport.
+let std = @import("std")
+
+let cleanTag: (tag: str) -> str = { std.string.replace(std.string.trim(tag), "_", " ") }
+
+let main: () = {
+    let incoming = "\u{3000}café_😀 | tea_time | bonjour\t"
+    let fields = std.string.split(std.string.trim(incoming), "|")
+    let tags = std.array.map(fields, cleanTag)
+    let message = std.string.join(tags, " / ")
+    @println("Message:", message)
+
+    ; Indices and inclusive bounds count scalars, not UTF-8 bytes.
+    let first: rune = message[0]
+    let last: rune = message[-1]
+    let badge = tags[0][3..=5]
+    @println("Edges: {first} / {last}; badge: {badge}")
+    let position = match std.string.find(message, "😀") {
+        .some[index] => "scalar {index}"
+        .none => "not found"
+    }
+    @println("Emoji:", position)
+
+    let bytes = std.string.toBytes(message)
+    @println("Transport: {@len(message)} scalars, {@len(bytes)} bytes")
+    match std.string.fromBytes(bytes) {
+        .ok[text] => {
+            @println("Decoded:", text)
+            @println(std.string.repeat("—", 3), "ready")
+        }
+        .err[error] => @println("Decode failed:", error)
+    }
+}

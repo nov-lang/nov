@@ -1,0 +1,38 @@
+; Numeric settings stay in their own types; no implicit conversions are needed.
+let std = @import("std")
+
+let showSetting: (input: str) = {
+    match std.string.parseInt(input) {
+        .ok[value] => {
+            let bounded = std.math.clamp(value, 0, 100)
+            @println("Setting {input}: {bounded}")
+        }
+        .err[error] => { @println("Setting {input}: {error}") }
+    }
+}
+
+let main: () = {
+    ; Native signed and unsigned integers describe different quantities.
+    let batches: uint = 3
+    let perBatch: uint = 8
+    let capacity = batches * perBatch
+    let adjustment: int = -7
+    @println("Capacity: {capacity}")
+    @println("Adjustment magnitude: {std.math.abs(adjustment)}")
+
+    ; Keep f32 sensor arithmetic separate from f64 accounting arithmetic.
+    let sensor: f32 = -1.5
+    let gain: f32 = 2.0
+    let signal = std.math.clamp(std.math.abs(sensor) * gain, 0.0, 2.5)
+    @println("Bounded signal: {signal}")
+    let unitPrice: f64 = 12.5
+    let quantity: f64 = 3.0
+    let discount: f64 = 2.5
+    let invoice = unitPrice * quantity - discount
+    @println("Invoice: {invoice}")
+
+    ; Parsing returns a Result, with both success and failure handled explicitly.
+    loop input in ["42", "125", "-7", "12px"] {
+        showSetting(input)
+    }
+}

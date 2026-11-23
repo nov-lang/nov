@@ -1,0 +1,48 @@
+; Parse an optional quantity and validate it without throwing.
+let std = @import("std")
+let Result = std.Result
+let Option = std.Option
+
+let readQuantity: (input: str) -> Result(int, str) = {
+    match std.string.parseInt(input) {
+        .ok[value] => .ok[value]
+        .err[error] => .err["not a decimal quantity: {error}"]
+    }
+}
+
+let validate: (quantity: int) -> Result(int, str) = {
+    if quantity < 1 or quantity > 12 {
+        .err["quantity must be between 1 and 12"]
+    } else {
+        .ok[quantity]
+    }
+}
+
+let quote: (input: str) -> Result(str, str) = {
+    let parsed = readQuantity(input).!
+    let quantity = validate(parsed).!
+    .ok["{quantity} tickets cost {quantity * 5} credits"]
+}
+
+let supplied: (input: str) -> Option(str) = {
+    let text = std.string.trim(input)
+    if @len(text) == 0 { .none[] } else { .some[text] }
+}
+
+let optionalQuote: (input: str) -> Option(Result(str, str)) = {
+    let text = supplied(input).!
+    .some[quote(text)]
+}
+
+let main: () = {
+    loop input in [" 3 ", "", "many", "15"] {
+        let message = match optionalQuote(input) {
+            .none => "No quantity supplied"
+            .some[result] => match result {
+                .ok[value] => value
+                .err[error] => "Cannot quote: {error}"
+            }
+        }
+        @println(message)
+    }
+}

@@ -1,0 +1,23 @@
+; From the repository root:
+; zig build
+; zig-out/bin/nov emit-c --library examples/ffi.nov > zig-out/ffi.c
+; zig cc -std=c11 -O3 zig-out/ffi.c examples/ffi.c -o zig-out/ffi-demo
+; ./zig-out/ffi-demo
+
+@[extern("c_shipping_fee")]
+let shippingFee: (quantity: u32) -> u32
+
+let Order = struct {
+    quantity: u32,
+    unitPrice: u32,
+
+    let subtotal: (self: Order) -> u32 = self.quantity * self.unitPrice
+}
+
+; C calls this export; Nov calls back into C for the shipping fee.
+; The struct and its layout remain private to Nov.
+@[export]
+let order_total: (quantity: u32, unitPrice: u32) -> u32 = {
+    let order = Order.[ quantity, unitPrice ]
+    order.subtotal() + shippingFee(quantity)
+}

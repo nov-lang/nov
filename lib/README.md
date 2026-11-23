@@ -40,8 +40,8 @@ The destination must be mutable and the replacement must match its type exactly.
 Normal recursive value-copy rules apply to both the returned and stored values;
 function copies retain shared captured cells. Arguments evaluate once, destination
 before replacement; an unevaluated `@TypeOf` query neither borrows nor mutates.
-See [`examples/mem.nov`](../examples/mem.nov) (eight tests) and
-[`examples/fn.nov`](../examples/fn.nov) (seven tests) for usage.
+See [`tests/mem.nov`](../tests/mem.nov) (eight tests) and
+[`tests/fn.nov`](../tests/fn.nov) (seven tests) for usage.
 `fn` is an ordinary identifier, not a reserved keyword.
 Run `zig build test-cli-mem-fn` for the migration CLI coverage.
 
@@ -72,7 +72,7 @@ compile-time-known builtin/declared struct data defaults; any reached custom
 factory call (including Option's) must instead run in `main` or a function called
 from it. `void`, functions, references and metatypes have no default; `std.Result`
 has no automatic default. See [Default values](../README.md#default-values) and
-[`examples/defaults.nov`](../examples/defaults.nov), which contains seven tests.
+[`tests/defaults.nov`](../tests/defaults.nov), which contains seven tests.
 
 Future direction only: compiler-recognized protocols may be replaced/generalized
 by a Rust-like trait system, including user-defined annotations. No trait syntax
@@ -92,7 +92,7 @@ and NaN propagates. The argument evaluates eagerly exactly once; `@TypeOf`
 executes neither argument effects nor overflow panics. Generic aliases and typed
 callbacks use ordinary function semantics. No builtin or reflection is added,
 and numeric execution needs no managed allocation. See
-[`examples/math-abs.nov`](../examples/math-abs.nov) (four tests),
+[`tests/math-abs.nov`](../tests/math-abs.nov) (four tests),
 `zig build test-cli-math-abs` (all modes, relocated imports, check/emit-c rejection
 fixtures and all signed-minimum panics), and the source-free O0/O3 backend test
 with forced allocation failure.
@@ -112,7 +112,7 @@ comparisons. Ordinary argument snapshots and recursive independent managed-resul
 storage apply; copied callbacks still share captured cells. `@TypeOf` queries
 execute neither arguments, comparisons nor panics. No new builtin or ordering rule
 is introduced. See
-[`examples/math-clamp.nov`](../examples/math-clamp.nov) (six tests) and
+[`tests/math-clamp.nov`](../tests/math-clamp.nov) (six tests) and
 `zig build test-cli-math-clamp` for all three modes, relocated imports, rejection
 fixtures and invalid-bound panics.
 
@@ -182,10 +182,10 @@ membership follow the rules above.
 
 `shl`, `shr`, `try`, `deref`, `deref_mut`, `index` and `index_mut` remain reserved
 and diagnose unsupported overloads; no shifts are implemented. There is no
-separate inequality hook. See [`examples/operators.nov`](../examples/operators.nov)
+separate inequality hook. See [`tests/operators.nov`](../tests/operators.nov)
 for seven tests covering a scalar `Number`, generics, compound targets,
 evaluation/snapshots, and enum/union hooks. See
-[`examples/mixed-operators.nov`](../examples/mixed-operators.nov) for mixed operators.
+[`tests/mixed-operators.nov`](../tests/mixed-operators.nov) for mixed operators.
 See [Value equality](../README.md#value-equality) and
 [Operator Overloading](../README.md#operator-overloading) for the full contract.
 
@@ -209,7 +209,7 @@ indexing, destructuring and mixed named/positional construction remain unsupport
 Scalar and array literal defaults, recursive array snapshots and closure-field
 sharing follow the ordinary value rules. Anonymous unions/enums remain deferred; `.some[value]`, `.none[]`,
 array indexing and slicing keep their existing syntax. See
-`examples/anonymous-structs.nov` and `zig build test-cli-anonymous-structs`.
+`tests/anonymous-structs.nov` and `zig build test-cli-anonymous-structs`.
 
 Struct fields may hold every ordinary storable runtime value, including the
 standard library's unions, callbacks and ranges:
@@ -245,11 +245,11 @@ Defaults support scalar literals and nested array literals, including `[]` for
 any storable element type. Nonempty arrays require supported literal leaves;
 computed expressions, callbacks and other aggregate constructors are not enabled.
 Each construction gets independent recursive backing, and explicit overrides skip
-unused defaults. Generic `values: []T = []` works. See `examples/array-defaults.nov`
+unused defaults. Generic `values: []T = []` works. See `tests/array-defaults.nov`
 and `zig build test-cli-array-defaults`. No deferred `#` compile-time arguments
 are enabled. Void/type/
 namespace/reference fields and recursive type/signature graphs remain unsupported.
-See `examples/storable-fields.nov` for a runnable example and six tests.
+See `tests/storable-fields.nov` for a runnable regression and six tests.
 
 ## Result
 
@@ -309,7 +309,7 @@ and `.none => ...` for absence.
   `none` variants with a void `none` payload; it does not depend on the Option name.
   Result-to-Option and Option-to-Result propagation are rejected.
 
-See `examples/options.nov`: division by zero yields `none` rather than panicking,
+See `tests/options.nov`: division by zero yields `none` rather than panicking,
 `.!` propagates it from `Option(uint)` into `Option(str)`, and the fallback runs
 only for the absent quotient.
 
@@ -332,7 +332,7 @@ their capture environments. Arrays do not grant aliases to the union's storage.
 Function, range and nested union payloads are supported under the same acyclic
 rules; references cannot be payloads. Recursive layouts,
 including cycles through arrays, reject. See
-`examples/union-arrays.nov` for a runnable example and six tests.
+See `tests/union-arrays.nov` for a runnable regression and six tests.
 
 ## Nested union payloads
 
@@ -355,7 +355,7 @@ retain recursively independent backing. Inactive by-value fields remain zeroed.
 Malformed active tags panic before allocating copies or invoking formatters.
 Default output retains nested union tags and uses exact nested stringify hooks.
 Struct fields may hold these unions directly; recursive type/layout graphs and
-reference payloads remain unsupported. See `examples/nested-unions.nov` for a runnable example and six tests.
+reference payloads remain unsupported. See `tests/nested-unions.nov` for a runnable regression and six tests.
 
 ## Function and range payloads
 
@@ -387,7 +387,7 @@ or returned ranges preserve their bounds. A generic helper
 strings and finite ranges; no library overload or length protocol is needed.
 `@TypeOf(@len(...))` remains unevaluated and yields `uint`. Unbounded ranges,
 synthetic `.len` properties and reachable 128-bit backend endpoints are not
-supported. See `examples/range-length.nov`.
+supported. See `tests/range-length.nov`.
 
 Ranges print/interpolate as `start..end` or `start..=end` with exact signed/unsigned
 numeric bounds, including extrema. Array/record/union printing recurses and honors
@@ -395,8 +395,8 @@ nested `@[stringify]` hooks. Functions remain unprintable by default, including
 inside a union or array. An enclosing valid `@[stringify]` hook can provide a representation and stop
 structural recursion. Even an empty Option of a callable type needs such a hook
 for printing. Struct fields may also hold these values directly; recursive structural
-signature graphs remain unsupported. See `examples/value-payloads.nov` for a
-runnable example and six tests.
+signature graphs remain unsupported. See `tests/value-payloads.nov` for a
+runnable regression and six tests.
 
 ## Range helpers
 
@@ -415,7 +415,7 @@ let values: []u8 = std.range.toArray(@as(u8, 1)..=3) ; [1, 2, 3]
 
 Empty and descending ranges produce empty arrays. Inclusive extrema are safe
 under existing iteration rules; this helper adds no new iteration semantics.
-See [`examples/range-types.nov`](../examples/range-types.nov) for usage and five tests.
+See [`tests/range-types.nov`](../tests/range-types.nov) for usage and five tests.
 
 ## Container mapping
 
@@ -454,8 +454,8 @@ mapped result is void. `Result.mapErr` also requires nonvoid success payloads,
 because its ordinary reconstruction uses a payload expression while void variants
 require `[]`. `Result.map` can preserve a void error using existing propagation.
 Unused methods remain demand-specialized, so other methods on containers with
-void payloads still work as documented above. See `examples/container-map.nov`
-for a runnable example and six tests, including chaining and void outputs.
+void payloads still work as documented above. See `tests/container-map.nov`
+for a runnable regression and six tests, including chaining and void outputs.
 
 ## Array helpers
 
@@ -470,11 +470,11 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   callback once; empty input invokes none, and empty callback arrays add nothing.
   Arguments remain eager, returned storage is independent recursively, and closure
   environments remain shared. Existing repeated-append costs still apply. See
-  `examples/array-flat-map.nov` and `zig build test-cli-array-flat-map`.
+  `tests/array-flat-map.nov` and `zig build test-cli-array-flat-map`.
 - `array.reverse(items: []T) -> []T` returns an independent reversed value,
   including recursive array storage. Empty input stays empty; closures retain shared
   environments. It uses ordinary Nov indexing/append, with the existing copy costs
-  and no in-place capacity reuse. See `examples/array-reverse.nov` and
+  and no in-place capacity reuse. See `tests/array-reverse.nov` and
   `zig build test-cli-array-reverse`.
 - `array.min(items: []T) -> Option(T)` and `array.max(items: []T) -> Option(T)`
   return `.none[]` for empty input, otherwise `.some[@min(items)]` or
@@ -490,7 +490,7 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   snapshot precedes comparisons, so hooks may mutate a captured source owner safely.
   Returned payloads have recursively independent array backing; copied callbacks
   retain shared capture cells. Hook failures propagate normally; `@TypeOf` does not
-  evaluate arguments or invoke hooks. See `examples/array-extrema.nov` and
+  evaluate arguments or invoke hooks. See `tests/array-extrema.nov` and
   `zig build test-cli-array-extrema` for executable coverage, including inferred
   callbacks, concrete function aliases and negative semantic/emit-C fixtures.
 - `array.filter(items: []T, predicate: (T) -> bool) -> []T` keeps matching elements
@@ -512,11 +512,11 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   their existing capture cells. Panics propagate normally; `@TypeOf` validates the
   call without evaluating arguments or invoking callbacks. This is ordinary Nov,
   not a compiler builtin; recursive value copies can add substantial overhead.
-  See `examples/array-reduce.nov` and `zig build test-cli-array-reduce`.
+  See `tests/array-reduce.nov` and `zig build test-cli-array-reduce`.
 
 - `array.count(items: []T, predicate: (T) -> bool) -> uint` counts matching elements,
   invoking the predicate exactly once per element in source order; empty input
-  returns zero without invoking it. See `examples/array-count.nov` (four tests).
+  returns zero without invoking it. See `tests/array-count.nov` (four tests).
 - `array.any(items: []T, predicate: (T) -> bool) -> bool` stops at the first true
   predicate; `array.all` has the same signature and stops at the first false one.
 - `array.find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first
@@ -532,7 +532,7 @@ Signatures here use `T`/`U` for inferred backtick type variables:
 - `array.findLastIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` visits
   elements last-to-first and stops at the first match. It returns the original
   zero-based, pointer-sized unsigned index, not a reverse offset; empty input or
-  no match returns `.none[]`. See `examples/array-find-last-index.nov` (four tests).
+  no match returns `.none[]`. See `tests/array-find-last-index.nov` (four tests).
 - `array.each(items: []T, action: (T) -> void) -> void` visits all elements without
   constructing an output array. Callbacks must return void.
 
@@ -555,14 +555,14 @@ the input snapshot is taken before comparator construction or invocation can
 mutate captured source storage. Recursive backing is independent, while copied
 closure environments remain shared. Comparator failures/panics propagate normally.
 No builtin, optimization or mutable receiver is introduced. See
-`examples/array-sort.nov` for a runnable example and nine tests. Run:
+`tests/array-sort.nov` for a runnable regression and nine tests. Run:
 
 ```sh
-nov check --semantic examples/array-sort.nov --lib-dir lib
-nov run examples/array-sort.nov --debug --lib-dir lib
-nov run examples/array-sort.nov --release --lib-dir lib
-nov test examples/array-sort.nov --debug --lib-dir lib
-nov test examples/array-sort.nov --release --lib-dir lib
+nov check --semantic tests/array-sort.nov --lib-dir lib
+nov run tests/array-sort.nov --debug --lib-dir lib
+nov run tests/array-sort.nov --release --lib-dir lib
+nov test tests/array-sort.nov --debug --lib-dir lib
+nov test tests/array-sort.nov --release --lib-dir lib
 ```
 
 `count` and `findLastIndex` accept all ordinary storable element types, including
@@ -603,11 +603,11 @@ above the input length make `take` a full independent copy and `drop` empty;
 even maximum `uint` is accepted without signed conversion or count arithmetic.
 Neither helper mutates the source. Returned arrays use ordinary recursive copy
 semantics, not shared mutable views; closure environments remain shared.
-See `examples/array-selection.nov` for a runnable example and eight tests covering
+See `tests/array-selection.nov` for a runnable regression and eight tests covering
 selection, reverse visitation/short-circuiting, typed empties, maximum counts,
 generic storable families, recursive copies and shared captures.
 
-See `examples/array-search.nov` for a runnable example and seven tests.
+See `tests/array-search.nov` for a runnable regression and seven tests.
 Ordinary functions and capturing closures are supported, as are inferred generic
 closures/local generic functions within the bounded solver. Typed inputs, seeds,
 callback signatures, expected results and supported body constraints take precedence
@@ -619,7 +619,7 @@ and inferred generic specializations are supported. Integer literals can be chec
 directly in float contexts, but already typed integers and floats require exact
 matches: no implicit widening, signedness/float-width conversion or numeric casts.
 `@as` supplies context, not conversion. Remaining ambiguity is an error. See the
-root README's [float contract](../README.md#floats) and `examples/floats.nov` for
+root README's [float contract](../README.md#floats) and `tests/floats.nov` for
 IEEE arithmetic and round-trip-safe (not shortest) formatting.
 
 ```nov
@@ -655,7 +655,7 @@ propagate normally; these helpers do not catch errors or panics.
 
 Map/filter/take/drop use repeated append and can be quadratic; by-value copies can add
 substantial overhead. Further optimization remains **PAUSED**. See
-`examples/array-helpers.nov` for the runnable example and six tests covering typed
+`tests/array-helpers.nov` for the runnable regression and six tests covering typed
 and generic callbacks, stable order, empty inputs, left folds, recursive copies,
 shared closure environments and eager argument order.
 
@@ -702,8 +702,8 @@ UTF-8 in all build modes**; arbitrary input should use the recoverable public
 wrapper instead. Allocation failures retain normal panic semantics. These narrow
 conversions do not enable general casts or arbitrary compile-time execution;
 `@as` is still only expected-type ascription. A UTF-8 editing builder and
-performance optimizations remain deferred. See `examples/string-conversions.nov`
-for a runnable example with exact stdout and nine tests.
+performance optimizations remain deferred. See `tests/string-conversions.nov`
+for a runnable regression with exact stdout and nine tests.
 
 ## Integer parsing
 
@@ -716,7 +716,7 @@ or sign-only input, separators/prefixes, non-ASCII digits and trailing character
 Errors are `.invalidInput` and `.overflow`. Support the full pointer-sized range,
 including minimum signed `int`, without silent wrapping or allocation. No radix,
 fixed-width destination or float parsing API is introduced. See
-`examples/integer-parsing.nov` and `zig build test-cli-integer-parsing`.
+`tests/integer-parsing.nov` and `zig build test-cli-integer-parsing`.
 
 ## String search
 
@@ -745,7 +745,7 @@ These are ordinary Nov functions implemented using existing scalar indexing,
 slices and zip loops. They may repeatedly scan UTF-8; no efficient-search
 complexity is promised yet, and optimization remains paused. They do not add
 mutable strings, normalization or case folding; byte conversions are separate APIs above. See
-`examples/string-search.nov` for a runnable example and five tests.
+`tests/string-search.nov` for a runnable regression and five tests.
 
 ## String splitting
 
@@ -775,7 +775,7 @@ allocates storage and follows ordinary independent array-copy semantics, while
 its string elements continue sharing immutable content. Allocation failure panics
 normally. This initial implementation uses existing scalar indexing/slicing and
 repeated append; efficient-search/growth optimization remains deferred. See
-`examples/string-split.nov` for a runnable example and five tests.
+`tests/string-split.nov` for a runnable regression and five tests.
 
 ## String joining
 
@@ -798,7 +798,7 @@ bindings are replaced or leave scope. Allocation failures panic normally.
 
 This is an ordinary Nov loop using existing string `+`, not a compiler builtin
 or optimized builder. Repeated concatenation can be quadratic; optimization stays
-paused. See `examples/string-join.nov` for a runnable example and five tests.
+paused. See `tests/string-join.nov` for a runnable regression and five tests.
 
 ## String transforms
 
@@ -837,7 +837,7 @@ and results stay valid after source rebinding or scope exit. Allocation failure
 panics normally. These are ordinary Nov helpers: `replace` reuses `split`/`join`,
 and `repeat` loops with existing string `+`. Repeated concatenation can be
 quadratic under current copying; no efficient builder/search or other optimization
-is added. Optimization remains paused. See `examples/string-transform.nov` for
+is added. Optimization remains paused. See `tests/string-transform.nov` for
 exact main stdout and seven tests covering property boundaries, exact matching,
 count boundaries, effects and scope/GC retention.
 
@@ -848,7 +848,7 @@ private-local read instead of recursively copying it. Observable value independe
 and argument evaluation order are unchanged. Borrowed/global storage, mutable
 captures, unknown caller ownership and ambiguous execution regions remain
 conservative. This is not copy-on-write; COW is a deferred, unaccepted proposal,
-and explicit `@move` is deferred. See `examples/last-use.nov`.
+and explicit `@move` is deferred. See `tests/last-use.nov`.
 
 Explicit references are local and call-scoped capabilities, not ordinary
 first-class values. Runtime handles lower to typed C pointers; unit-typed IR
@@ -910,18 +910,18 @@ Generic containers may declare `let Self = @This()` and use `&mut Self`; inferre
 method type parameters retain exact constraints. Imported calls require public
 types/aliases and public methods independently. `@TypeOf` validates receiver places
 and mutability without runtime borrows, calls, effects or captures. See
-[`examples/mutable-methods.nov`](../examples/mutable-methods.nov) for seven tests:
+[`tests/mutable-methods.nov`](../tests/mutable-methods.nov) for seven tests:
 
 ```sh
-nov check --semantic examples/mutable-methods.nov
-nov fmt --check examples/mutable-methods.nov
-nov run examples/mutable-methods.nov --debug
-nov test examples/mutable-methods.nov --debug
-nov run examples/mutable-methods.nov --release
-nov test examples/mutable-methods.nov --release
+nov check --semantic tests/mutable-methods.nov
+nov fmt --check tests/mutable-methods.nov
+nov run tests/mutable-methods.nov --debug
+nov test tests/mutable-methods.nov --debug
+nov run tests/mutable-methods.nov --release
+nov test tests/mutable-methods.nov --release
 ```
 
-The example prints:
+The regression program prints:
 
 ```text
 Counter: 9
@@ -957,8 +957,8 @@ GC retention of managed referents and static prevention or safe invalidation of 
 dangling references may be exposed. This does not change today's by-value library
 signatures or introduce manual memory management, pointer arithmetic, null or
 unsafe dereference. See the root README's [reference contract](../README.md#local-static-borrowing)
-and `examples/references.nov`, `examples/reference-rebinding.nov` /
-`examples/reference-parameters.nov`; broader pointer
+and `tests/references.nov`, `tests/reference-rebinding.nov` /
+`tests/reference-parameters.nov`; broader pointer
 proposals remain separate.
 
 ## Loading and installation
@@ -989,8 +989,8 @@ captures, boxing, specializations or callee-body demands. Results are compile-ti
 annotations, `@as`, generic type arguments and module-level aliases, not first-class
 runtime values or local type aliases. Direct print/interpolation renders their
 canonical names without calling value stringify hooks. See the root README's
-[type-query contract](../README.md#type-queries), `examples/type-of.nov` and
-`examples/type-of-expressions.nov`.
+[type-query contract](../README.md#type-queries), `tests/type-of.nov` and
+`tests/type-of-expressions.nov`.
 Canonical paths share one source and nominal identity across repeated/diamond
 imports, including cyclic module imports; actual declaration/type dependency
 cycles still diagnose. Declarations and methods are file-private by default;
@@ -1009,7 +1009,7 @@ See the root README's [converter contract](../README.md#explicit-stringify-conve
 There is no `@[private]` attribute.
 
 The actual library is tested through real imports in semantic, emit-C, build/run,
-formatter, and relocated-install checks. `examples/results.nov` and
-`examples/structured-errors.nov` use `std.Result` rather than copied definitions.
+formatter, and relocated-install checks. `tests/results.nov` and
+`tests/structured-errors.nov` use `std.Result` rather than copied definitions.
 
 Filesystem and other OS-resource APIs remain outside this first library slice.

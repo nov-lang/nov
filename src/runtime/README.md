@@ -188,8 +188,8 @@ references, never expose dangling storage. The current local owner-slot scheme
 alone does not implement escaping-reference lifetimes. Future representations,
 tracing and invalidation checks must satisfy that contract before escape is enabled.
 Broader raw-pointer and managed-FFI proposals remain separate. See
-`examples/references.nov`, `examples/reference-rebinding.nov`,
-`examples/reference-parameters.nov` and the root README
+`tests/references.nov`, `tests/reference-rebinding.nov`,
+`tests/reference-parameters.nov` and the root README
 for the source-facing contract.
 
 ## Closure environments and shared cells
@@ -264,7 +264,7 @@ This is not shortest-decimal formatting. Float formatting may allocate strings
 through the existing managed string path, but float leaves themselves are untraced.
 `f16`/`f80`/`f128` and float match subjects remain deferred; remainder, bitwise
 operations, ranges and indices remain integer-only. See the root README's
-[float contract](../../README.md#floats) and `examples/floats.nov`.
+[float contract](../../README.md#floats) and `tests/floats.nov`.
 
 ## Generated nominal value structs
 
@@ -312,8 +312,8 @@ is a struct, not an array. No tuple access/destructuring, mixed entries, anonymo
 unions/enums or new `use`/`pub` syntax are introduced. Union/enum payload grammar,
 array indexing and slicing are unchanged. Nominal debug output stays `Type[ ... ]`
 / `Empty[]`; anonymous output is `.[ a: 1 ]` / `.[1, a]`, independent of source
-constructor spelling. See `examples/constructor-shorthand.nov` and
-`examples/anonymous-structs.nov`.
+constructor spelling. See `tests/constructor-shorthand.nov` and
+`tests/anonymous-structs.nov`.
 
 The emitter predeclares instruction/slot/merge storage at function scope,
 zero-initializes it, and roots actual `void *owner` and `void *data` fields, flattened
@@ -375,7 +375,7 @@ without an intervening safepoint. Dead source root slots can still retain backin
 until function exit; early root clearing is not implemented. O0/O3 allocation-count,
 forged-alias, forced-GC and OOM tests cover these transfers. Snapshot/conservative
 fallback copies remain potentially expensive. No COW, reference counting, source
-move operator or new array API is delivered. See `examples/last-use.nov`.
+move operator or new array API is delivered. See `tests/last-use.nov`.
 
 Ordinary iteration over a direct unborrowed local array retains a rooted readonly
 backing descriptor, avoiding a recursive source clone. Per-element ordinary copies
@@ -477,7 +477,7 @@ arbitrary computed-base writes remain unsupported. Existing scoped stable-owner
 loans allow supported nested-array element updates and replacement; no new borrow
 syntax, reborrows or escaping capabilities are added.
 Managed elements and array-valued record fields use precise element maps and
-recursive generated copies as described above. `examples/storable-arrays.nov` is
+recursive generated copies as described above. `tests/storable-arrays.nov` is
 being added; parent validation gates for this expansion remain pending. Existing
 validation descriptions above do not claim that those gates have passed.
 Optimizations beyond approved last-use transfers remain paused; `defer` remains postponed. Namespace `use`
