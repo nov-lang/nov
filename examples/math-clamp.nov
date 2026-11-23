@@ -1,0 +1,177 @@
+let std = @import("std")
+let clamp = std.math.clamp
+
+let main: () = {
+    @println("Clamped:", clamp(12, 0, 10))
+}
+
+@[test]
+let exact_numeric_types_and_inclusive_bounds: () = {
+    @assert(clamp(-1, 0, 10) == 0 and clamp(11, 0, 10) == 10)
+    @assert(clamp(5, 0, 10) == 5)
+    @assert(clamp(0, 0, 10) == 0 and clamp(10, 0, 10) == 10)
+    @assert(clamp(-1, 3, 3) == 3 and clamp(7, 3, 3) == 3)
+    let small: i8 = clamp(@as(i8, -128), -127, 127)
+    let byte: u8 = clamp(@as(u8, 255), 0, 254)
+    let wide: u64 = clamp(@as(u64, 18446744073709551615), 0, 18446744073709551615)
+    let narrowed: f32 = clamp(@as(f32, 1.5), 0.0, 1.0)
+    @assert(small == @as(i8, -127) and byte == @as(u8, 254))
+    @assert(wide == @as(u64, 18446744073709551615) and narrowed == @as(f32, 1.0))
+    let callback: (u8, u8, u8) -> u8 = clamp
+    @assert(callback(7, 1, 4) == @as(u8, 4))
+}
+
+let Entry = struct {
+    key: int,
+    items: [][]int,
+
+    @[public]
+    @[operator(.less_than)]
+    let less: (a: Entry, b: Entry) -> bool = a.key < b.key
+
+    @[public]
+    @[operator(.equal)]
+    let equal: (a: Entry, b: Entry) -> bool = @panic("clamp must not use equality")
+}
+
+@[test]
+let stable_ties_and_independent_managed_results: () = {
+    let lower = Entry.[ key = 1, items = [[1]] ]
+    let value = Entry.[ key = 2, items = [[2]] ]
+    let upper = Entry.[ key = 3, items = [[3]] ]
+    let mut low = clamp(Entry.[ key = 0, items = [[0]] ], lower, upper)
+    let mut middle = clamp(value, lower, upper)
+    let mut high = clamp(Entry.[ key = 4, items = [[4]] ], lower, upper)
+    low.items = [[7]]
+    middle.items = [[8]]
+    high.items = [[9]]
+    @assert(lower.items == [[1]] and value.items == [[2]] and upper.items == [[3]])
+    @assert(low.items == [[7]] and middle.items == [[8]] and high.items == [[9]])
+    @assert(clamp(value, Entry.[ key = 2, items = [[4]] ], Entry.[ key = 2, items = [[5]] ]).items == [[2]])
+}
+
+let Ranked = enum {
+    low,
+    high,
+
+    @[public]
+    @[operator(.less_than)]
+    let less: (a: Ranked, b: Ranked) -> bool = a == .low and b == .high
+}
+let Amount = union {
+    number: int,
+    empty,
+
+    let value: (self: Amount) -> int = match self {
+        .number[n] => n
+        .empty => 0
+    }
+    @[public]
+    @[operator(.less_than)]
+    let less: (a: Amount, b: Amount) -> bool = a.value() < b.value()
+}
+let Box: (T: type) -> type = struct {
+    value: T,
+
+    @[public]
+    @[operator(.less_than)]
+    let less: (a: @This(), b: @This()) -> bool = a.value < b.value
+}
+
+@[test]
+let enum_union_and_generic_owner_ordering: () = {
+    @assert(clamp(Ranked.high, .low, .low) == Ranked.low)
+    @assert(clamp(Amount.number[-2], .empty[], .number[3]) == Amount.empty[])
+    @assert(clamp(Box(uint).[ value = 7 ], .[ value = 1 ], .[ value = 3 ]).value == 3)
+}
+
+@[test]
+let ieee_nan_signed_zero_and_infinities: () = {
+    let zero: f64 = 0.0
+    let nan = zero / zero
+    let inf = 1.0 / zero
+    let result = clamp(nan, -inf, inf)
+    @assert(result != result)
+    @assert(clamp(-inf, -inf, inf) == -inf and clamp(inf, -inf, inf) == inf)
+    @assert(clamp(inf, -inf, 1.0) == 1.0 and clamp(-inf, -1.0, inf) == -1.0)
+    @assert(clamp(1.0, inf, inf) == inf and clamp(1.0, -inf, -inf) == -inf)
+    @assert(1.0 / clamp(-zero, zero, zero) < 0.0)
+    @assert(1.0 / clamp(zero, -zero, -zero) > 0.0)
+    let smallZero: f32 = 0.0
+    let smallNaN = smallZero / smallZero
+    let small = clamp(smallNaN, @as(f32, -1.0), 1.0)
+    @assert(small != small)
+    @assert(@as(f32, 1.0) / clamp(-smallZero, smallZero, smallZero) < @as(f32, 0.0))
+}
+
+let Probe = struct {
+    key: int,
+    run: (int, int) -> bool,
+
+    @[public]
+    @[operator(.less_than)]
+    let less: (a: Probe, b: Probe) -> bool = a.run(a.key, b.key) and a.key < b.key
+}
+
+@[test]
+let eager_arguments_and_bounds_first_comparison_order: () = {
+    let mut events: []int = []
+    let compare = (a: int, b: int) -> bool {
+        events += [a, b]
+        true
+    }
+    let make = (key: int) -> Probe {
+        events += [key]
+        Probe.[ key, run = compare ]
+    }
+    @assert(clamp(make(2), make(1), make(3)).key == 2)
+    @assert(events == [2, 1, 3, 3, 1, 2, 1, 3, 2])
+    events = []
+    @assert(clamp(make(0), make(1), make(3)).key == 1)
+    @assert(events == [0, 1, 3, 3, 1, 0, 1])
+    events = []
+    @assert(clamp(make(4), make(1), make(3)).key == 3)
+    @assert(events == [4, 1, 3, 3, 1, 4, 1, 3, 4])
+    events = []
+    let stop = () -> int {
+        clamp(
+            make(2),
+            {
+                return 8
+            },
+            make(3)
+        )
+    }
+    @assert(stop() == 8 and events == [2])
+}
+
+@[test]
+let snapshots_shared_cells_and_unevaluated_queries: () = {
+    let mut source: []Probe = []
+    let mut calls = 0
+    let mutate = (a: int, b: int) -> bool {
+        calls += 1
+        @clear(source)
+        true
+    }
+    source = [Probe.[ key = 2, run = mutate ], Probe.[ key = 1, run = mutate ], Probe.[ key = 3, run = mutate ]]
+    let result = clamp(source[0], source[1], source[2])
+    @assert(result.key == 2 and calls == 3 and @len(source) == 0)
+    @assert(result.run(1, 2) and calls == 4)
+    let make = () -> Probe {
+        calls += 1
+        result
+    }
+    let query: @TypeOf(clamp(make(), make(), make())) = result
+    let invalid: @TypeOf(clamp(0, 3, 1)) = 7
+    let zero: f64 = 0.0
+    let nanQuery: @TypeOf(clamp(0.0, zero / zero, 1.0)) = 2.0
+    @assert(query.key == 2 and invalid == 7 and nanQuery == 2.0 and calls == 4)
+    let mut value = Entry.[ key = 2, items = [[2]] ]
+    let replace = () -> Entry {
+        value = Entry.[ key = 9, items = [[9]] ]
+        Entry.[ key = 1, items = [[1]] ]
+    }
+    let saved = clamp(value, replace(), Entry.[ key = 3, items = [[3]] ])
+    @assert(saved.key == 2 and saved.items == [[2]] and value.key == 9)
+}

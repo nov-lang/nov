@@ -13,12 +13,14 @@ let string = std.string
 let Operator = std.builtin.Operator
 let mem = std.mem
 let fn = std.fn
+let math = std.math
 ```
 
 `std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`,
 `Option` from `option.nov`, the `array` namespace from `array.nov`, the
 `range` namespace from `range.nov`, the `string` namespace from `string.nov`,
 the `mem` namespace from `mem.nov`, the `fn` namespace from `fn.nov`,
+the `math` namespace from `math.nov`,
 and the `builtin` namespace from
 `builtin.nov` (including its public `Operator` enum). These are
 ordinary library declarations, not compiler builtins or automatically injected
@@ -75,6 +77,27 @@ has no automatic default. See [Default values](../README.md#default-values) and
 Future direction only: compiler-recognized protocols may be replaced/generalized
 by a Rust-like trait system, including user-defined annotations. No trait syntax
 or implementation is approved; user-defined annotations are not supported now.
+
+## Math helpers
+
+``std.math.clamp(value: `T, lower: `T, upper: `T) -> `T`` is an ordinary Nov
+function requiring one exact ordered type (builtin integers/floats or accessible
+nominal less-than hooks). It first checks `lower <= upper`, otherwise panicking
+with `invalid clamp bounds`. It then returns `lower` if `value < lower`, `upper`
+if `upper < value`, and otherwise the original `value`. Bounds are inclusive;
+equal bounds and infinities are supported. Builtin float `<=` is IEEE, so either
+NaN bound panics, while a NaN input is retained with valid bounds. In-range signed
+zero retains the input's sign, including equal zero bounds. Nominal `<=` derives
+`!(upper < lower)` and requires only ordering, not an equality hook.
+
+Arguments evaluate once, eagerly left-to-right, before bounds validation or value
+comparisons. Ordinary argument snapshots and recursive independent managed-result
+storage apply; copied callbacks still share captured cells. `@TypeOf` queries
+execute neither arguments, comparisons nor panics. No new builtin or ordering rule
+is introduced; `abs` is not implemented. See
+[`examples/math-clamp.nov`](../examples/math-clamp.nov) (six tests) and
+`zig build test-cli-math-clamp` for all three modes, relocated imports, rejection
+fixtures and invalid-bound panics.
 
 ## Equality and operator metadata
 

@@ -21,3 +21,6 @@ let fn = @import("fn.nov")
 
 @[public]
 let range = @import("range.nov")
+
+@[public]
+let math = @import("math.nov")

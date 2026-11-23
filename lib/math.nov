@@ -1,0 +1,15 @@
+@[public]
+let clamp: (value: `T, lower: `T, upper: `T) -> `T = {
+    if !{
+        lower <= upper
+    } {
+        @panic("invalid clamp bounds")
+    }
+    if value < lower {
+        lower
+    } else if upper < value {
+        upper
+    } else {
+        value
+    }
+}

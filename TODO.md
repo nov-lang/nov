@@ -60,6 +60,19 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+``std.math.clamp(value: `T, lower: `T, upper: `T) -> `T`` is delivered as ordinary
+Nov with exact same-type arguments and accessible ordering. It validates
+`lower <= upper` before comparing the value, panicking `invalid clamp bounds`
+otherwise; then returns lower, upper, or the original value with inclusive bounds.
+Builtin float `<=` rejects either NaN bound (IEEE); a NaN input survives valid
+bounds, as does in-range signed zero. Nominal `<=` is `!(upper < lower)` and needs
+no equality hook. Eager left-to-right arguments, snapshots, independent managed
+results, shared closure cells and effect-free queries retain ordinary semantics.
+See `examples/math-clamp.nov` (six tests), `zig build test-cli-math-clamp`
+(all three modes, relocated imports, negative fixtures and reversed/NaN panics),
+and the actual-stdlib source-free forced-GC O0/O3 backend test. `abs` remains
+unimplemented; no new builtin or optimization work is introduced.
+
 `std.array.min(items: []T) -> Option(T)` and `std.array.max` are delivered as
 ordinary Nov wrappers: empty input returns `.none[]`, otherwise
 `.some[@min(items)]` / `.some[@max(items)]`. No new builtins or ordering rules:

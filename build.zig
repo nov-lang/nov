@@ -249,6 +249,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_flat_map_tests = b.step("test-cli-array-flat-map", "Run standard-library array flatMap CLI tests");
     addArrayValueHelperCliTests(b, exe, array_flat_map_tests, "array-flat-map.nov", @embedFile("examples/array-flat-map.nov"), "Expanded: [1, 1, 2, 2, 3, 3]\n", "PASS order_empty_results_and_callback_count\nPASS flatten_one_layer_and_recursive_independence\nPASS storable_outputs_and_shared_closures\nPASS snapshots_inference_and_queries\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_flat_map_tests);
+    const math_clamp_tests = b.step("test-cli-math-clamp", "Run standard-library math clamp CLI tests");
+    addMathClampCliTests(b, exe, math_clamp_tests);
+    test_step.dependOn(math_clamp_tests);
     const array_extrema_tests = b.step("test-cli-array-extrema", "Run standard-library optional array extrema CLI tests");
     addArrayExtremaCliTests(b, exe, array_extrema_tests);
     test_step.dependOn(array_extrema_tests);
@@ -1463,6 +1466,92 @@ fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
             reject.expectStdOutEqual("");
             reject.expectStdErrMatch("error:");
             test_step.dependOn(&reject.step);
+        }
+    }
+}
+
+fn addMathClampCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "math-clamp.nov", @embedFile("examples/math-clamp.nov"), "Clamped: 10\n", "PASS exact_numeric_types_and_inclusive_bounds\nPASS stable_ties_and_independent_managed_results\nPASS enum_union_and_generic_owner_ordering\nPASS ieee_nan_signed_zero_and_infinities\nPASS eager_arguments_and_bounds_first_comparison_order\nPASS snapshots_shared_cells_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("models.nov",
+        \\@[public]
+        \\let Private=struct{n:int,
+        \\@[operator(.less_than)]
+        \\let less:(a:Private,b:Private)->bool=a.n<b.n
+        \\}
+        \\@[public]
+        \\let Mixed=struct{n:int,
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let less:(a:Mixed,b:int)->bool=a.n<b
+        \\}
+        \\@[public]
+        \\let Unordered=struct{n:int,}
+        \\@[public]
+        \\let Plain=enum{a,b,}
+        \\@[public]
+        \\let Payload=union{some:int,none,}
+        \\
+    );
+    const fmt = b.addRunArtifact(exe);
+    fmt.setCwd(fixtures.getDirectory());
+    fmt.addArgs(&.{ "fmt", "--check", "lib/math.nov", "lib/std.nov" });
+    fmt.expectExitCode(0);
+    fmt.expectStdOutEqual("");
+    fmt.expectStdErrEqual("");
+    test_step.dependOn(&fmt.step);
+    for ([_][]const u8{
+        "",                                                                     "1,2",                                                                 "1,2,3,4",
+        "@as(i8,1),@as(i16,0),@as(i8,2)",                                       "@as(i8,1),@as(i8,0),@as(u8,2)",                                       "@as(f32,1.0),@as(f64,0.0),@as(f32,2.0)",
+        "@as(int,1),@as(f64,0.0),@as(int,2)",                                   "@as(i8,1),0,128",                                                     "true,false,true",
+        "\"b\",\"a\",\"c\"",                                                    "'b','a','c'",                                                         "[1],[0],[2]",
+        "models.Unordered.[n=1],models.Unordered.[n=0],models.Unordered.[n=2]", "models.Private.[n=1],models.Private.[n=0],models.Private.[n=2]",      "models.Mixed.[n=1],models.Mixed.[n=0],models.Mixed.[n=2]",
+        "models.Plain.a,models.Plain.a,models.Plain.b",                         "models.Payload.some[1],models.Payload.none[],models.Payload.some[2]", "models.Unordered.[n=1],models.Private.[n=0],models.Unordered.[n=2]",
+    }, 0..) |args, index| {
+        const path = b.fmt("bad-clamp-{d}.nov", .{index});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet models=@import(\"models.nov\")\nlet main:()={{let result=std.math.clamp({s})\n}}\n", .{args}));
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.step.name = b.fmt("CLI clamp: reject {s} ({s})", .{ path, if (emit) "emit-c" else "check" });
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+    for ([_][]const u8{
+        "std.math.clamp(0,3,1)",
+        "std.math.clamp(Guard.[n=0],Guard.[n=3],Guard.[n=1])",
+        "std.math.clamp(nan,3.0,1.0)",
+        "std.math.clamp(0.0,nan,1.0)",
+        "std.math.clamp(0.0,-1.0,nan)",
+        "std.math.clamp(0.0,nan,nan)",
+        "std.math.clamp(@as(f32,0.0),smallNaN,@as(f32,1.0))",
+        "std.math.clamp(@as(f32,0.0),@as(f32,-1.0),smallNaN)",
+    }, 0..) |expression, index| {
+        const path = b.fmt("panic-clamp-{d}.nov", .{index});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet Guard=struct{{n:int,\n@[public]\n@[operator(.less_than)]\nlet less:(a:Guard,b:Guard)->bool={{@assert(a.n==1 and b.n==3)\na.n<b.n}}\n}}\nlet verify:()={{let zero:f64=0.0\nlet nan=zero/zero\nlet smallZero:f32=0.0\nlet smallNaN=smallZero/smallZero\nlet result={s}\n@println(\"unreachable\",result)\n}}\nlet main:()=verify()\n@[test]\nlet invalid_bounds:()=verify()\n", .{expression}));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI clamp: {s} {s} {s}", .{ command, path, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, path, "--lib-dir" });
+                run.addDirectoryArg(library);
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "FAIL invalid_bounds (exit 1)\n0 passed; 1 failed; 1 total\n" else "");
+                run.expectStdErrEqual("panic: invalid clamp bounds\n");
+                test_step.dependOn(&run.step);
+            }
         }
     }
 }
