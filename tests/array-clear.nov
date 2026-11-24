@@ -1,10 +1,10 @@
 let Batch = struct {
     items: []str = [],
 
-    let reset: (self: &mut Batch) = { @clear(self.items) }
+    let reset: (self: &mut Batch) = @clear(self.items)
 }
 
-let reset: (items: &mut []`T) = { @clear(items.*) }
+let reset: (items: &mut []`T) = @clear(items.*)
 
 let main: () = {
     let mut batch = Batch.[ items = ["Ada", "Grace"] ]

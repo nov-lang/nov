@@ -6,8 +6,8 @@ let Counter = struct {
     let read: (self: &Counter) -> int = self.value
 }
 
-let advance: (counter: &mut Counter, amount: int) = { counter.add(amount) }
-let describe: (counter: &Counter) = { @println("Readonly count: {counter.read()}") }
+let advance: (counter: &mut Counter, amount: int) = counter.add(amount)
+let describe: (counter: &Counter) = @println("Readonly count: {counter.read()}")
 
 let main: () = {
     let mut morning = Counter.[ value = 2 ]

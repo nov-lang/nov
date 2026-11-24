@@ -1,7 +1,7 @@
 ; Clean a message for display, then encode it for transport.
 let std = @import("std")
 
-let cleanTag: (tag: str) -> str = { std.string.replace(std.string.trim(tag), "_", " ") }
+let cleanTag: (tag: str) -> str = std.string.replace(std.string.trim(tag), "_", " ")
 
 let main: () = {
     let incoming = "\u{3000}café_😀 | tea_time | bonjour\t"

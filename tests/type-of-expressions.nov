@@ -3,7 +3,7 @@
 
 let std = @import("std")
 
-let fail: () -> int = { @panic("TypeOf operand executed") }
+let fail: () -> int = @panic("TypeOf operand executed")
 let identity: (value: `T) -> `T = value
 let result: () -> @TypeOf(1 + 2) = 7
 let update: (owner: &mut int, value: int) = { owner.* += value }
@@ -12,7 +12,7 @@ let Record = struct {
     value: int = 0,
 
     @[stringify]
-    let format: (value: Record) -> str = { @panic("TypeOf converter executed") }
+    let format: (value: Record) -> str = @panic("TypeOf converter executed")
 }
 
 @[test]

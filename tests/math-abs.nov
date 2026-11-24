@@ -1,7 +1,7 @@
 let std = @import("std")
 let abs = std.math.abs
 
-let main: () = { @println("Absolute:", abs(-12)) }
+let main: () = @println("Absolute:", abs(-12))
 
 @[test]
 let exact_signed_numeric_types: () = {

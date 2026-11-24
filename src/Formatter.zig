@@ -2,6 +2,7 @@ const std = @import("std");
 const TestAllocations = @import("TestAllocations.zig");
 const Ast = @import("Ast.zig");
 const Parser = @import("Parser.zig");
+const Render = @import("Render.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const primitives = @import("primitives.zig");
 const Literal = @import("Literal.zig");
@@ -21,7 +22,8 @@ const Module = @import("Module.zig");
 /// returns UnsupportedSyntax. Allocation failures propagate as OutOfMemory.
 /// The caller owns the returned allocation (free it with allocator.free).
 /// No output is returned unless reparsing preserves
-/// the AST, every non-newline token, and every comment (apart from trailing space).
+/// the AST, every non-newline token, and every comment (apart from trailing space),
+/// allowing only eligible typed function initializer outer braces to be elided.
 /// Unsupported syntax, including any failed preservation check, is rejected.
 pub fn format(allocator: std.mem.Allocator, source: [:0]const u8) ![]u8 {
     // The tokenizer treats NUL as EOF and skips BOMs/shebangs. Do not silently
@@ -50,7 +52,7 @@ pub fn format(allocator: std.mem.Allocator, source: [:0]const u8) ![]u8 {
     defer result.deinit(allocator);
     if (result.errors.len != 0) return error.UnsupportedSyntax;
     try checkSupported(result);
-    if (!sameStructure(ast, result) or !sameTokensAndComments(source, terminated)) {
+    if (!try preservesSource(allocator, ast, result)) {
         return error.UnsupportedSyntax;
     }
     return rendered;
@@ -307,6 +309,74 @@ fn sameStructure(a: Ast, b: Ast) bool {
     return true;
 }
 
+/// Keep ordinary formatting allocation-free here. Only the documented function
+/// body rewrite may change the token stream or node sequence, and even that must
+/// pass the original strict checks after replacing exactly the removed braces.
+fn preservesSource(allocator: std.mem.Allocator, original: Ast, result: Ast) !bool {
+    if (sameStructure(original, result) and sameTokensAndComments(original.source, result.source)) return true;
+
+    const closing = try allocator.alloc(Ast.TokenIndex, original.tokens.len);
+    defer allocator.free(closing);
+    @memset(closing, 0);
+    var candidates: usize = 0;
+    for (original.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .decl) continue;
+        const decl = original.decl(@intCast(i)).ast;
+        if (original.fullFnProto(decl.type_node) == null) continue;
+        if (Render.functionBodyExpression(original, decl.init_node) == null) continue;
+        closing[original.firstToken(decl.init_node)] = original.lastToken(decl.init_node);
+        candidates += 1;
+    }
+    if (candidates == 0) return false;
+
+    const normalized = try allocator.dupeSentinel(u8, original.source, 0);
+    defer allocator.free(normalized);
+    var left: SignificantTokens = .{ .tokenizer = Tokenizer.init(original.source) };
+    var right: SignificantTokens = .{ .tokenizer = Tokenizer.init(result.source) };
+    var x = left.next().token;
+    var y = right.next().token;
+    var token_index: usize = 0;
+    var removed: usize = 0;
+    while (true) {
+        // A recorded closing brace must be skipped even when the output's next
+        // token is another closing brace belonging to an enclosing expression.
+        if (x.tag == .r_brace and normalized[x.start] == ' ') {
+            x = left.next().token;
+            continue;
+        }
+        if (sameSignificantToken(original.source, x, result.source, y)) {
+            if (x.tag == .eof) break;
+            x = left.next().token;
+            y = right.next().token;
+            continue;
+        }
+        if (x.tag != .l_brace) return false;
+        while (token_index < original.tokens.len and original.tokens.items(.start)[token_index] < x.start) : (token_index += 1) {}
+        if (token_index == original.tokens.len or original.tokens.items(.start)[token_index] != x.start) return false;
+        const close = closing[token_index];
+        if (close == 0) return false;
+        normalized[x.start] = ' ';
+        normalized[original.tokens.items(.start)[close]] = ' ';
+        removed += 1;
+        x = left.next().token;
+    }
+    if (removed == 0) return false;
+    var normalized_ast = try Parser.parse(allocator, normalized);
+    defer normalized_ast.deinit(allocator);
+    return normalized_ast.errors.len == 0 and sameStructure(normalized_ast, result) and
+        sameTokensAndComments(normalized, result.source);
+}
+
+fn sameSignificantToken(a: [:0]const u8, x: Tokenizer.Token, b: [:0]const u8, y: Tokenizer.Token) bool {
+    if (x.tag != y.tag) return false;
+    const left_token = a[x.start..x.end];
+    const right_token = b[y.start..y.end];
+    return if (x.tag == .doc_comment)
+        std.mem.eql(u8, std.mem.trimEnd(u8, left_token, &std.ascii.whitespace), std.mem.trimEnd(u8, right_token, &std.ascii.whitespace))
+    else
+        std.mem.eql(u8, left_token, right_token);
+}
+
 const SignificantTokens = struct {
     tokenizer: Tokenizer,
     previous_end: usize = 0,
@@ -328,14 +398,7 @@ fn sameTokensAndComments(a: [:0]const u8, b: [:0]const u8) bool {
     while (true) {
         const x = left.next();
         const y = right.next();
-        if (x.token.tag != y.token.tag) return false;
-        const left_token = a[x.token.start..x.token.end];
-        const right_token = b[y.token.start..y.token.end];
-        const same_token = if (x.token.tag == .doc_comment)
-            std.mem.eql(u8, std.mem.trimEnd(u8, left_token, &std.ascii.whitespace), std.mem.trimEnd(u8, right_token, &std.ascii.whitespace))
-        else
-            std.mem.eql(u8, left_token, right_token);
-        if (!same_token or !sameComments(x.gap, y.gap)) return false;
+        if (!sameSignificantToken(a, x.token, b, y.token) or !sameComments(x.gap, y.gap)) return false;
         if (x.token.tag == .eof) return true;
     }
 }
@@ -952,7 +1015,11 @@ fn testFunctionListAllocationFailures(allocator: std.mem.Allocator, source: [:0]
     try std.testing.expectEqualStrings(expected, rendered);
     const terminated = try allocator.dupeSentinel(u8, rendered, 0);
     defer allocator.free(terminated);
-    try std.testing.expect(sameTokensAndComments(source, terminated));
+    var original = try Parser.parse(allocator, source);
+    defer original.deinit(allocator);
+    var result = try Parser.parse(allocator, terminated);
+    defer result.deinit(allocator);
+    try std.testing.expect(try preservesSource(allocator, original, result));
     const again = try format(allocator, terminated);
     defer allocator.free(again);
     try std.testing.expectEqualStrings(rendered, again);
@@ -1053,7 +1120,7 @@ test "single expression blocks compact scalar comparisons and multiline wrappers
     try expectFormatted("let value={x>y}", "let value = { x > y }\n");
     try expectFormatted("let value={true}\nlet count={42}", "let value = { true }\nlet count = { 42 }\n");
     try expectFormatted("let value={\n x>y\n}\n", "let value = { x > y }\n");
-    try expectFormatted("let f:(x:int,y:int)->bool={\n x>y\n}\n", "let f: (x: int, y: int) -> bool = { x > y }\n");
+    try expectFormatted("let f:(x:int,y:int)->bool={\n x>y\n}\n", "let f: (x: int, y: int) -> bool = x > y\n");
     try expectFormatted("let f=(x){\n x>0\n}\n", "let f = (x) { x > 0 }\n");
 }
 
@@ -1066,7 +1133,7 @@ test "single statement blocks compact executable forms under allocation failures
         .{ "let f:()=loop {continue}", "let f: () = loop {\n    continue\n}\n" },
         .{ "let f:()={x=1}", "let f: () = { x = 1 }\n" },
         .{ "let f:()={a[0]+=1}", "let f: () = { a[0] += 1 }\n" },
-        .{ "let f:()={call(1,2)}", "let f: () = { call(1, 2) }\n" },
+        .{ "let f:()={call(1,2)}", "let f: () = call(1, 2)\n" },
         .{ "let value={[1,2]}", "let value = { [1, 2] }\n" },
         .{ "let value={items[-1]}", "let value = { items[-1] }\n" },
     };
@@ -1225,17 +1292,26 @@ test "function definitions expand their body before a fitting signature under OO
 }
 
 test "function body layout retains the whole line width boundary under OOM" {
-    const prefix = "let f: (x: int) -> int = { ";
-    const count = 100 - prefix.len - " }".len;
-    const exact = prefix ++ repeatedFormatText("a", count) ++ " }\n";
+    const prefix = "let f: (x: int) -> int = ";
+    const count = 100 - prefix.len;
+    const exact = prefix ++ repeatedFormatText("a", count) ++ "\n";
     try std.testing.expectEqual(@as(usize, 100), exact.len - 1);
     const source = "let f:(x:int)->int={" ++ repeatedFormatText("a", count) ++ "}";
     const longer = "let f:(x:int)->int={" ++ repeatedFormatText("a", count + 1) ++ "}";
     try expectFormatted(source, exact);
+    const shorter = "let f:(x:int)->int={" ++ repeatedFormatText("a", count - 1) ++ "}";
+    try expectFormatted(shorter, prefix ++ repeatedFormatText("a", count - 1) ++ "\n");
     try expectFormatted(longer, "let f: (x: int) -> int = {\n    " ++ repeatedFormatText("a", count + 1) ++ "\n}\n");
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{longer});
-    try expectFormatted("let f:(\nx:int, ; parameter\ny:int\n)->int={x+y}", "let f: (x: int, ; parameter\n    y: int) -> int = { x + y }\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{shorter});
+    try expectFormatted("let f:(\nx:int, ; parameter\ny:int\n)->int={x+y}", "let f: (x: int, ; parameter\n    y: int) -> int = x + y\n");
+}
+
+test "long function brace fallback does not expand child constructors under OOM" {
+    const source = "let divide:(numerator:uint,denominator:uint)->Option(uint)={if denominator==0{.none[]}else{.some[numerator/denominator]}}";
+    try expectFormatted(source, "let divide: (numerator: uint, denominator: uint) -> Option(uint) = {\n    if denominator == 0 { .none[] } else { .some[numerator / denominator] }\n}\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
 test "calls normalize bounded deep nesting exactly and survive allocation failures" {
@@ -1278,7 +1354,7 @@ test "conditional branches share width decisions without splitting long tokens u
         .{ "let x=if c {1}else if d {2}else{" ++ repeatedFormatText("a", 57) ++ "}", "let x = if c {\n    1\n} else if d {\n    2\n} else {\n    " ++ repeatedFormatText("a", 57) ++ "\n}\n" },
         .{ "let x=if c {" ++ repeatedFormatText("a", 73) ++ "}else{1}", "let x = if c {\n    " ++ repeatedFormatText("a", 73) ++ "\n} else {\n    1\n}\n" },
         .{ "let x=if c {1}else{2}; " ++ repeatedFormatText("c", 71), "let x = if c {\n    1\n} else {\n    2\n} ; " ++ repeatedFormatText("c", 71) ++ "\n" },
-        .{ "let f:()->str={\"" ++ repeatedFormatText("x", 76) ++ "\"}", "let f: () -> str = {\n    \"" ++ repeatedFormatText("x", 76) ++ "\"\n}\n" },
+        .{ "let f:()->str={\"" ++ repeatedFormatText("x", 76) ++ "\"}", "let f: () -> str = \"" ++ repeatedFormatText("x", 76) ++ "\"\n" },
         .{ "let x=if c {\"" ++ repeatedFormatText("é😀", 60) ++ "\"}else{\"short\"}", "let x = if c {\n    \"" ++ repeatedFormatText("é😀", 60) ++ "\"\n} else {\n    \"short\"\n}\n" },
         .{ "let x=\"" ++ repeatedFormatText("é😀", 60) ++ "\"", "let x = \"" ++ repeatedFormatText("é😀", 60) ++ "\"\n" },
         .{ "let x=" ++ repeatedFormatText("a", 110) ++ "+" ++ repeatedFormatText("b", 110), "let x = " ++ repeatedFormatText("a", 110) ++ " + " ++ repeatedFormatText("b", 110) ++ "\n" },
@@ -1746,6 +1822,93 @@ test "preservation checks detect code comment and structural loss" {
     var b = try Parser.parse(std.testing.allocator, "let x=1 * 2 + 3\n");
     defer b.deinit(std.testing.allocator);
     try std.testing.expect(!sameStructure(a, b));
+}
+
+fn testFunctionBodyPreservationAllocationFailures(allocator: std.mem.Allocator, source: [:0]const u8, rendered: [:0]const u8, expected: bool) !void {
+    var original = try Parser.parse(allocator, source);
+    defer original.deinit(allocator);
+    var result = try Parser.parse(allocator, rendered);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), original.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), result.errors.len);
+    try std.testing.expectEqual(expected, try preservesSource(allocator, original, result));
+}
+
+test "function body preservation permits only recorded typed declaration braces under OOM" {
+    for ([_]struct { [:0]const u8, [:0]const u8, bool }{
+        .{ "let f:()->int={1}", "let f:()->int=1", true },
+
+        .{ "let factory:()->type={struct{\nlet f:()->int={1}\n}}", "let factory:()->type={struct{\nlet f:()->int=1\n}}", true },
+        .{ "let x={1}", "let x=1", false },
+        .{ "let f:()->int={1}\nlet g:()->int={2}", "let f:()->int=1\nlet g:()->int={2}", true },
+        .{ "let f:()->int={1}\nlet g:()->int={2}", "let f:()->int=1\nlet g:()->int=2", true },
+        .{ "let f:()->int={if c {1}else{2}}", "let f:()->int=if c {1}else{2}", true },
+        .{ "let f:()->int={1} ; tail\n", "let f:()->int=1 ; tail\n", true },
+        .{ "let f:()->int={1}\nlet x={2}", "let f:()->int=1\nlet x=2", false },
+        .{ "let f:()->int={1}", "let f:()->int=2", false },
+        .{ "let f:()->int={1}", "let f:()->str=1", false },
+        .{ "let f:()->int={if c {1}else{2}}", "let f:()->int=if c {{1}}else{2}", false },
+        .{ "let f:()->int={{1}}", "let f:()->int={1}", false },
+        .{ "let f:()->int={return 1}", "let f:()->int=return 1", false },
+        .{ "let f:()={x=1}", "let f:()=1", false },
+        .{ "let f:()->int={; body\n1}", "let f:()->int=1", false },
+        .{ "let f:()->int={1 ; body\n}", "let f:()->int=1 ; body\n", false },
+        .{ "let f:()->int={1} ; tail\n", "let f:()->int=1\n", false },
+        .{ "; head\nlet f:()->int={1}", "let f:()->int=1 ; head\n", false },
+        .{ ";;; docs\nlet f:()->int={1}", "let f:()->int=1", false },
+        .{ "let f:()->int={1} ; tail\n", "let f:()->int=1 ; changed\n", false },
+        .{ "let f:()->str={\"{ text }\"}", "let f:()->str=\"text\"", false },
+        .{ "let f=(x){x}", "let f=(x){x}", true },
+        .{ "let f=()->int{1}", "let f=()->int{{1}}", false },
+    }) |case| {
+        errdefer std.debug.print("function preservation fixture: {s} => {s}\n", .{ case[0], case[1] });
+        try testFunctionBodyPreservationAllocationFailures(std.testing.allocator, case[0], case[1], case[2]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionBodyPreservationAllocationFailures, .{ case[0], case[1], case[2] });
+    }
+}
+
+test "typed function body elision preserves methods generics comments precedence and closures under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let f:(x:int)->int={x+1}", "let f: (x: int) -> int = x + 1\n" },
+        .{ "let id:(x:`T)->`T={x}", "let id: (x: `T) -> `T = x\n" },
+        .{ "let main:()->void={tick()}", "let main: () -> void = tick()\n" },
+        .{ "let f:(c:bool)->int={if c {1}else{2}}", "let f: (c: bool) -> int = if c { 1 } else { 2 }\n" },
+        .{ "let f:(x:int,y:int)->int={use(x+y,x*y,2+x*y)}", "let f: (x: int, y: int) -> int = use(x + y, x * y, 2 + x * y)\n" },
+        .{ "let f:(\nx:int\n)->int={x}", "let f: (x: int) -> int = x\n" },
+        .{ "let f:(\nx:int,\n)->int={x}", "let f: (\n    x: int,\n) -> int = x\n" },
+        .{ "let S=struct{\n@[public]\nlet f:(x:int)->int={x}\n}", "let S = struct {\n    @[public]\n    let f: (x: int) -> int = x\n}\n" },
+        .{ "let f:()->int={1}; tail", "let f: () -> int = 1 ; tail\n" },
+        .{ "let f:()->int=; equals\n{1}", "let f: () -> int = ; equals\n    1\n" },
+        .{ "let f:()->int={call(1,)}", "let f: () -> int = {\n    call(\n        1,\n    )\n}\n" },
+        .{ "let f:()->int={; body\n1}", "let f: () -> int = { ; body\n    1\n}\n" },
+        .{ "let f:()->int={1 ; body\n}", "let f: () -> int = {\n    1 ; body\n}\n" },
+        .{ "let f:()->int={let x=1\nx}", "let f: () -> int = {\n    let x = 1\n    x\n}\n" },
+        .{ "let f:()->int={{1}}", "let f: () -> int = {\n    { 1 }\n}\n" },
+        .{ "let f:()->int={tick()\n1}", "let f: () -> int = {\n    tick()\n    1\n}\n" },
+        .{ "let f=(x){x+1}", "let f = (x) { x + 1 }\n" },
+        .{ "let f=(x:int)->int{x+1}", "let f = (x: int) -> int { x + 1 }\n" },
+    }) |case| {
+        errdefer std.debug.print("typed body fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
+    }
+}
+
+test "elided function bodies count Unicode and trailing comments at 100 columns under OOM" {
+    const prefix = "let f: () -> str = ";
+    const count = 100 - prefix.len - 2;
+    const unicode = repeatedFormatText("é😀", count / 2) ++ "e";
+    try std.testing.expectEqual(@as(usize, 100), try std.unicode.utf8CountCodepoints(prefix ++ "\"" ++ unicode ++ "\""));
+    for ([_][2][:0]const u8{
+        .{ "let f:()->str={\"" ++ unicode ++ "\"}", prefix ++ "\"" ++ unicode ++ "\"\n" },
+        .{ "let f:()->str={\"" ++ unicode ++ "e\"}", prefix ++ "{\n    \"" ++ unicode ++ "e\"\n}\n" },
+        .{ "let f:()->int={1}; " ++ repeatedFormatText("c", 77), "let f: () -> int = 1 ; " ++ repeatedFormatText("c", 77) ++ "\n" },
+        .{ "let f:()->int={1}; " ++ repeatedFormatText("c", 78), "let f: () -> int = {\n    1\n} ; " ++ repeatedFormatText("c", 78) ++ "\n" },
+    }) |case| {
+        errdefer std.debug.print("elided width fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
+    }
 }
 
 test "namespace import formatting preserves literal spellings comments and idempotence" {

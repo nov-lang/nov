@@ -1,7 +1,7 @@
 let std = @import("std")
 let clamp = std.math.clamp
 
-let main: () = { @println("Clamped:", clamp(12, 0, 10)) }
+let main: () = @println("Clamped:", clamp(12, 0, 10))
 
 @[test]
 let exact_numeric_types_and_inclusive_bounds: () = {

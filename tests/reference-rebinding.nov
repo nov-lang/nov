@@ -17,7 +17,7 @@ let choose: (flag: bool) -> int = {
     p.*
 }
 
-let main: () = { @println("Chosen:", choose(false), choose(true)) }
+let main: () = @println("Chosen:", choose(false), choose(true))
 
 @[test]
 let branches_match_and_block: () = {

@@ -6474,9 +6474,9 @@ fn addPositionalFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\    let local: @TypeOf(.[ 1, "a" ]) = pair
         \\    @assert(local.0 == 8 and local.1 == "imported")
         \\}
-        \\let main: () = { exercise() }
+        \\let main: () = exercise()
         \\@[test]
-        \\let imported_projection: () = { exercise() }
+        \\let imported_projection: () = exercise()
         \\
     );
     for ([_][]const u8{ "positional-fields.nov", "imported.nov" }) |source| {

@@ -582,8 +582,20 @@ General iterators and labels remain unsupported and diagnosed.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
-Simple, comment-free single-expression blocks can format inline as `{ x > y }`,
-including function and closure bodies. Loop bodies always expand. `if`/`else`
+Simple, comment-free single-expression blocks can format inline as `{ x > y }`.
+A typed function declaration with one ordinary expression instead drops its body
+braces when the resulting physical line fits within 100 Unicode scalars:
+
+```nov
+let greater: (x: int, y: int) -> bool = x > y
+```
+
+Long bodies keep their braces. Body comments, declarations, assignments and
+control-transfer statements also keep braces, as do closures whose syntax requires
+`(x) { ... }`. Existing brace-less functions are not rewritten to add braces.
+This is the formatter's only token-changing normalization: it verifies the
+remaining syntax and comments after removing only eligible function-body braces.
+Loop bodies always expand. `if`/`else`
 branches can stay inline only in value-producing positions, such as an initializer,
 operand, argument or returned value, not as standalone statements. An `if` without
 `else` expands. This is a syntactic decision: explicit `void`/omitted function

@@ -24,7 +24,7 @@ let Box: (Element: type) -> type = struct {
     let echo: (self: &mut Self, input: `T) -> `T = input
 }
 
-let forward: (counter: &mut Counter, amount: int) = { counter.add(amount) }
+let forward: (counter: &mut Counter, amount: int) = counter.add(amount)
 let Callable = struct {
     call: (int) -> int,
 }

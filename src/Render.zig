@@ -28,7 +28,7 @@ const CompactSpan = struct {
     start: usize,
     end: usize,
     // Calls are width context for legacy lists, never expansion candidates.
-    kind: enum { block, list, call_marker } = .block,
+    kind: enum { block, function_body, list, call_marker } = .block,
 
     fn lessThan(_: void, a: CompactSpan, b: CompactSpan) bool {
         return if (a.start == b.start) a.end > b.end else a.start < b.start;
@@ -38,6 +38,7 @@ const CompactSpan = struct {
 const ExpressionContext = struct {
     value_used: bool = true,
     force_multiline: bool = false,
+    function_body: bool = false,
     // Branches of an if/else chain must make one width decision.
     compact_group: ?Ast.Node.Index = null,
 };
@@ -125,6 +126,33 @@ fn renderTreeWithWidth(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixu
         var changed = false;
         // Nested spans arrive in postorder. Consider outer spans first.
         std.mem.sort(CompactSpan, spans.items, {}, CompactSpan.lessThan);
+        // An elided body is provisional. Restore its braces before letting
+        // children or surrounding containers commit layout decisions on this
+        // pass's longer line. Retire only the first failing body so nested
+        // candidates are reconsidered with their enclosing layout restored.
+        var line_start: usize = 0;
+        var line_end: usize = 0;
+        var line_width: usize = 0;
+        for (spans.items) |span| {
+            if (span.kind != .function_body) continue;
+            const multiline = std.mem.indexOfScalar(u8, text[span.start..span.end], '\n') != null;
+            if (!multiline) {
+                while (line_end <= span.start and line_end < text.len) {
+                    line_start = line_end;
+                    line_end = if (std.mem.indexOfScalarPos(u8, text, line_start, '\n')) |end| end + 1 else text.len;
+                    line_width = 0;
+                    for (text[line_start..line_end]) |byte| {
+                        if (byte != '\n' and byte & 0xc0 != 0x80) line_width += 1;
+                    }
+                }
+            }
+            if (multiline or line_width > 100) {
+                const entry = try expanded.getOrPut(buffer.allocator, span.node);
+                changed = !entry.found_existing;
+                break;
+            }
+        }
+        if (changed) continue;
         for (spans.items) |span| {
             if (span.kind == .call_marker) continue;
             if (std.mem.indexOfScalar(u8, text[span.start..span.end], '\n') != null) {
@@ -349,6 +377,20 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
             var buffer: [2]Ast.Node.Index = undefined;
             const block = ast.fullBlock(&buffer, node).?;
             const start = self.output.written().len;
+            if (context.function_body and !self.expanded.contains(node)) {
+                if (functionBodyExpression(ast, node)) |expression| {
+                    try self.renderExpressionContext(expression, .none, .{ .value_used = context.value_used });
+                    try self.compact_spans.append(self.allocator, .{
+                        .node = node,
+                        .start = start,
+                        .end = self.output.written().len,
+                        .kind = .function_body,
+                    });
+                    // The closing brace is omitted, but comments following it
+                    // still belong to the enclosing declaration's spacing scope.
+                    return self.renderSpace(block.ast.rbrace, tokenSliceForRender(ast, block.ast.rbrace).len, space);
+                }
+            }
             const group = context.compact_group orelse node;
             const may_compact = !context.force_multiline and !self.expanded.contains(node) and !self.expanded.contains(group);
             var compact = false;
@@ -448,7 +490,9 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
             const comptime_token = main_tokens[node];
             const block = datas[node].rhs;
             try self.renderToken(comptime_token, .none);
-            return self.renderExpressionContext(block, space, context);
+            var child_context = context;
+            child_context.function_body = false;
+            return self.renderExpressionContext(block, space, child_context);
         },
 
         .field_access => {
@@ -811,6 +855,44 @@ fn functionResultUsed(self: *Render, proto: Ast.full.FnProto) bool {
         std.mem.eql(u8, self.ast.tokenSlice(self.ast.nodes.items(.main_token)[result]), "void"));
 }
 
+/// Returns the sole ordinary expression of a comment-free function body block.
+/// Callers must separately verify that the block is a typed declaration's body;
+/// anonymous function expressions require their braces even for eligible blocks.
+/// Rendered newlines and physical line width are checked by the layout pass.
+pub fn functionBodyExpression(ast: Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    var buffer: [2]Ast.Node.Index = undefined;
+    const block = ast.fullBlock(&buffer, node) orelse return null;
+    if (block.ast.statements.len != 1 or hasComment(ast, block.ast.lbrace, block.ast.rbrace)) return null;
+    const expression = block.ast.statements[0];
+    switch (ast.nodes.items(.tag)[expression]) {
+        .decl,
+        .attr_decl_one,
+        .attr_decl,
+        .attr_one,
+        .attr,
+        .assign,
+        .assign_add,
+        .assign_sub,
+        .assign_mul,
+        .assign_div,
+        .assign_mod,
+        .@"return",
+        .@"break",
+        .@"continue",
+        .@"defer",
+        .block_two,
+        .block_two_newline,
+        .block,
+        .block_newline,
+        .root,
+        .container_field,
+        .match_case_one,
+        .match_case,
+        => return null,
+        else => return expression,
+    }
+}
+
 fn inlineBlockExpression(self: *Render, node: Ast.Node.Index) bool {
     const ast = self.ast;
     if (ast.nodes.items(.tag)[node] == .decl) return false;
@@ -957,8 +1039,12 @@ fn renderDeclWithoutFixups(
             assert(token_tags[prev_token] == .newline);
             try self.renderToken(prev_token - 1, .newline); // =
         }
-        const value_used = if (ast.fullFnProto(decl.ast.type_node)) |proto| self.functionResultUsed(proto) else true;
-        try self.renderExpressionContext(decl.ast.init_node, space, .{ .value_used = value_used });
+        const proto = ast.fullFnProto(decl.ast.type_node);
+        const value_used = if (proto) |function| self.functionResultUsed(function) else true;
+        try self.renderExpressionContext(decl.ast.init_node, space, .{
+            .value_used = value_used,
+            .function_body = proto != null,
+        });
         ais.popIndent();
     }
 }

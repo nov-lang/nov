@@ -128,16 +128,16 @@ let main: () = {
 }
 
 @[test]
-let projection_and_generic_map: () = { projections() }
+let projection_and_generic_map: () = projections()
 
 @[test]
-let independent_nested_snapshots: () = { snapshots() }
+let independent_nested_snapshots: () = snapshots()
 
 @[test]
-let callable_snapshot_and_shared_environment: () = { call_order() }
+let callable_snapshot_and_shared_environment: () = call_order()
 
 @[test]
-let reusable_range_field: () = { range_reuse() }
+let reusable_range_field: () = range_reuse()
 
 @[test]
-let numeric_mutation_and_unevaluated_type: () = { mutation_and_type_queries() }
+let numeric_mutation_and_unevaluated_type: () = mutation_and_type_queries()
