@@ -433,6 +433,10 @@ fn expectFormatted(source: [:0]const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(formatted, again);
 }
 
+test "array literals format direct indexing and slicing idempotently" {
+    try expectFormatted("let x=[1,2,3][0]\nlet y=[1,2,3][1..]\nlet z=[[1,2],[3,4]][0][1]", "let x = [1, 2, 3][0]\nlet y = [1, 2, 3][1..]\nlet z = [[1, 2], [3, 4]][0][1]\n");
+}
+
 test "positional selectors preserve chains floats ranges comments interpolation writes and OOM" {
     try expectFormatted("let x=pair.0.1\nlet y=p.*.0\nlet z=make().0\nlet f=pair.0(0.1,1e-2)", "let x = pair.0.1\nlet y = p.*.0\nlet z = make().0\nlet f = pair.0(0.1, 1e-2)\n");
     for ([_][:0]const u8{

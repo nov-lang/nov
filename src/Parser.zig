@@ -766,7 +766,7 @@ fn parsePrimaryExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
         },
         .keyword_loop => return self.parseLoopExpr(),
         .l_brace => return self.parseBlock(),
-        .l_bracket => return self.parseArrayLiteral(), // TODO: move to parsePrimaryTypeExpr, make it like zig?
+        .l_bracket => return self.parseSuffixFrom(try self.parseArrayLiteral()),
         // TODO: here?
         .keyword_match => return self.parseMatchExpr(),
         else => return self.parseCurlySuffixExpr(),
@@ -1521,6 +1521,34 @@ test "positional selectors reject noncanonical digits and malformed suffixes und
         var ast = try parse(std.testing.allocator, source);
         defer ast.deinit(std.testing.allocator);
         try std.testing.expect(ast.errors.len != 0);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "array literals support direct indexing slicing and chained suffixes under OOM" {
+    const cases = [_]struct { expression: []const u8, tag: Node.Tag }{
+        .{ .expression = "[1,2,3][0]", .tag = .array_access },
+        .{ .expression = "[1,2,3][1..]", .tag = .slice },
+        .{ .expression = "[1,2,3][..2]", .tag = .slice },
+        .{ .expression = "[1,2,3][..]", .tag = .slice },
+        .{ .expression = "[1,2,3][0..=1]", .tag = .slice },
+        .{ .expression = "[1,2,3][-1]", .tag = .array_access },
+
+        .{ .expression = "[[1,2],[3,4]][0][1]", .tag = .array_access },
+        .{ .expression = "[1,2,3][1..][0]", .tag = .array_access },
+        .{ .expression = "[1,2,3,][0]", .tag = .array_access },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value={s}", .{case.expression}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(case.tag, ast.nodes.items(.tag)[node]);
+        try std.testing.expectEqualStrings(case.expression, ast.getNodeSource(node));
+        const operand = ast.nodes.items(.data)[node].lhs;
+        try std.testing.expectEqualStrings("[", ast.tokenSlice(ast.firstToken(operand)));
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
 }

@@ -10,6 +10,11 @@ let main: () = {
 
 @[test]
 let omitted_negative_inclusive_and_empty_bounds: () = {
+    @assert([1, 2, 3][0] == 1 and [1, 2, 3][-1] == 3)
+    @assert([1, 2, 3][1..] == [2, 3])
+    @assert([1, 2, 3][..2] == [1, 2] and [1, 2, 3][..] == [1, 2, 3])
+    @assert([1, 2, 3][0..=1] == [1, 2])
+    @assert([[1, 2], [3, 4]][0][1] == 2 and [1, 2, 3][1..][0] == 2)
     let values = [1, 2, 3, 4]
     @assert(values[..] == values and values[1..] == [2, 3, 4])
     @assert(values[..2] == [1, 2] and values[1..3] == [2, 3])
