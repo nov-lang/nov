@@ -1580,7 +1580,7 @@ test "TypeOf validation checks every union constructor form and supplied payload
         .{ .expression = "U.a[missing]", .tag = .unknown_name },
         .{ .expression = "U.b[1]", .tag = .invalid_union_constructor },
         .{ .expression = "U.e[.bad]", .tag = .unknown_field },
-        .{ .expression = "U.e[.one,]", .tag = .invalid_union_constructor },
+        .{ .expression = "U.e[.one,]", .tag = null },
         .{ .expression = "U.a[1]", .tag = null },
         .{ .expression = "U.b[]", .tag = null },
         .{ .expression = "U.e[.one]", .tag = null },

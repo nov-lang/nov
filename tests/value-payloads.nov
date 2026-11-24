@@ -50,11 +50,10 @@ let echoRange: (value: Ranges) -> Ranges = value
 
 let counter: () -> Option(Callback) = {
     let mut count = 0
-    .some[
-        (step: int) -> int {
-            count += step
-            count
-        }]
+    .some[(step: int) -> int {
+        count += step
+        count
+    }]
 }
 
 let callOption: (value: Option(Callback)) -> Option(int) = {
@@ -137,12 +136,10 @@ let escaping_shared_cells_and_overwritten_owner: () = {
 let creation_snapshots_and_later_copies: () = {
     let mut values: []int = [2]
     let saved = values
-    let first: Option(Callback) = .some[
-        (n: int) -> int { saved[0] + n }]
+    let first: Option(Callback) = .some[(n: int) -> int { saved[0] + n }]
     values[0] = 9
     let newer = values
-    let second: Option(Callback) = .some[
-        (n: int) -> int { newer[0] + n }]
+    let second: Option(Callback) = .some[(n: int) -> int { newer[0] + n }]
     let later = first
     values[0] = 20
     @assert(callOption(first).unwrapOr(0) == 5)
@@ -211,12 +208,13 @@ let range_copies_exact_bounds_and_inclusive_max: () = {
 
 @[test]
 let find_and_map_function_and_range_results: () = {
-    let found: Option(Callback) = std.array.find([
-        increment
-    ], (callback: Callback) -> bool { callback(2) == 3 })
+    let found: Option(Callback) = std.array.find([increment], (callback: Callback) -> bool {
+        callback(2) == 3
+    })
     @assert(callOption(found).unwrapOr(0) == 4)
-    let missing: Option(Callback) = std.array.find(@as([]Callback, [
-    ]), (callback: Callback) -> bool { true })
+    let missing: Option(Callback) = std.array.find(@as([]Callback, []), (callback: Callback) -> bool {
+        true
+    })
     @assert(missing.isNone())
     let ranges: []IntRange = [@as(int, 1)..4, @as(int, 5)..=6]
     let selected: Option(IntRange) = std.array.find(ranges, (range: IntRange) -> bool { true })

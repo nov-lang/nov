@@ -134,9 +134,7 @@ let function_and_void_results: () = {
     let query: @TypeOf(combine(deferred, 4)) = () -> int { 9 }
     @assert(query() == 9)
     let mut total = 0
-    let sink = Sink.[
-        write = (value: int) { total += value }
-    ]
+    let sink = Sink.[ write = (value: int) { total += value } ]
     sink + 2
     sink + 3
     @assert(total == 5)

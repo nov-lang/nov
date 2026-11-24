@@ -119,13 +119,10 @@ let closure_snapshots_and_shared_cells: () = {
     @assert(snapshot().unwrapOr([])[0] == 1)
     @assert(read() == 3)
     let mut count = 0
-    let functions: Option([]() -> int) = .some[
-        [
-            () -> int {
-                count += 1
-                count
-            }
-        ]]
+    let functions: Option([]() -> int) = .some[[() -> int {
+        count += 1
+        count
+    }]]
     let copied = functions
     let mut first = functions.unwrapOr([])
     let second = copied.unwrapOr([])

@@ -47,14 +47,10 @@ let make: () -> Processor = {
 }
 let counter: () -> Processor = {
     let mut count: int = 0
-    Processor.[
-        run = (step: int) -> int {
-            count += step
-            count
-        },
-        outcome = .err["counter"],
-        interval = 0..0
-    ]
+    Processor.[ run = (step: int) -> int {
+        count += step
+        count
+    }, outcome = .err["counter"], interval = 0..0 ]
 }
 let values: (report: Report) -> []int = report.outcome.unwrapOr([])
 
@@ -118,11 +114,9 @@ let escaping_closures_aliases_and_snapshots: () = {
     @assert(counter().run(1) == 1)
     let mut items: []int = [2]
     let snapshot = items
-    let captured = Processor.[
-        run = (n: int) -> int { snapshot[0] + n },
-        outcome = .ok[items],
-        interval = 0..0
-    ]
+    let captured = Processor.[ run = (n: int) -> int {
+        snapshot[0] + n
+    }, outcome = .ok[items], interval = 0..0 ]
     items[0] = 20
     let later = echo(captured)
     @assert(captured.run(3) == 5 and later.run(4) == 6)

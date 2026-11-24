@@ -35,7 +35,7 @@ let main: () = {
     let mut parcel = Parcel.[
         label = "Books",
         weight = Weight.[ grams = 800 ],
-        delivery = .queued[]
+        delivery = .queued[],
     ]
     let unpacked = parcel
     parcel.pack(Weight.[ grams = 50 ])

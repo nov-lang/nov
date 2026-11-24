@@ -71,11 +71,10 @@ let payload_arrays_keep_value_copy_semantics: () = {
 @[test]
 let function_payloads_and_unevaluated_queries: () = {
     let mut calls = 0
-    let payload: std.Option(() -> int) = .some[
-        () -> int {
-            calls += 1
-            calls
-        }]
+    let payload: std.Option(() -> int) = .some[() -> int {
+        calls += 1
+        calls
+    }]
     let query: @TypeOf(match payload {
         .some[callable] => callable()
         .none => 0

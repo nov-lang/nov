@@ -104,11 +104,10 @@ let take_managed_payloads_preserves_independence: () = {
     previous[0] = [9]
     @assert(snapshot == [[1], [2]])
     let mut calls = 0
-    let mut option: std.Option(() -> int) = .some[
-        () -> int {
-            calls += 1
-            calls
-        }]
+    let mut option: std.Option(() -> int) = .some[() -> int {
+        calls += 1
+        calls
+    }]
     let saved = std.mem.take(&option)
     @assert(option.isNone() and calls == 0)
     let value = match saved {

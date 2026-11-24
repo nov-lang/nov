@@ -23,16 +23,13 @@ let double: (n: int) -> int = n * 2
 ; funny syntax
 let counters = () -> []() -> int {
     let mut count: int = 0
-    [
-        () -> int {
-            count += 1
-            count
-        },
-        () -> int {
-            count += 2
-            count
-        }
-    ]
+    [() -> int {
+        count += 1
+        count
+    }, () -> int {
+        count += 2
+        count
+    }]
 }
 
 let main: () = {

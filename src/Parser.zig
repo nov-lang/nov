@@ -1628,9 +1628,72 @@ test "struct AST owns ordered members constructors attributes interpolation and 
     };
 }
 
+test "type constructor optional final comma preserves fields spans and OOM" {
+    for ([_][:0]const u8{
+        "let T=struct{x:int}",
+        "let T=struct{x:int,y:str}",
+        "let T=struct{x:int=1, y:int=2 ; final field\n\n}",
+        "let T=struct{let f:()->int=1\nx:int\n}",
+        "let T=struct{x:int,\nlet f:()->int=1\ny:int}",
+        "let T=union{value:int}",
+        "let T=union{value:int,none}",
+        "let T=union{none ; final variant\n\n}",
+        "let T=union{none, value:int\n}",
+        "let T=enum{red}",
+        "let T=enum{red,blue}",
+        "let T=enum{red,blue ; final variant\n\n}",
+        "let T=enum{red,blue,}",
+        "let T=struct{x:int,}",
+        "let T=union{none,}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(Node.Tag.container_decl, ast.nodes.items(.tag)[node]);
+        const members = ast.fullStruct(node).?;
+        try std.testing.expect(members.len != 0);
+        const field = members[members.len - 1];
+        try std.testing.expectEqual(Node.Tag.container_field, ast.nodes.items(.tag)[field]);
+        const data = ast.nodes.items(.data)[field];
+        const name = ast.tokenSlice(ast.nodes.items(.main_token)[field]);
+        if (std.mem.eql(u8, name, "none") or std.mem.eql(u8, name, "red") or std.mem.eql(u8, name, "blue")) {
+            try std.testing.expectEqual(@as(Node.Index, 0), data.lhs);
+            try std.testing.expectEqual(@as(Node.Index, 0), data.rhs);
+        } else {
+            try std.testing.expect(data.lhs != 0);
+        }
+        try std.testing.expectEqualStrings("}", ast.tokenSlice(ast.lastToken(node)));
+        try std.testing.expectEqualStrings(source[6..], ast.getNodeSource(node));
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "type constructor optional final comma rejects missing member separators and OOM" {
+    for ([_][:0]const u8{
+        "let T=struct{x:int y:int}",
+        "let T=struct{x:int\ny:int}",
+        "let T=struct{x:int ; not a separator\ny:int}",
+        "let T=struct{x:int\nlet f:()->int=1\n}",
+        "let T=struct{x:int\n@[public]\nlet f:()->int=1\n}",
+        "let T=union{value:int none}",
+        "let T=union{value:int\nnone}",
+        "let T=union{none\nvalue:int}",
+        "let T=union{none\nlet f:()->int=1\n}",
+        "let T=enum{red blue}",
+        "let T=enum{red ; not a separator\nblue}",
+        "let T=enum{red\nlet f:()->int=1\n}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
 test "malformed structs constructors and attributes recover without panicking" {
     for ([_][:0]const u8{
-        "let A=struct",               "let A=struct {x}",           "let A=struct {x:int}",
+        "let A=struct",               "let A=struct {x}",           "let A=struct {x:int y:int}",
         "let A=struct {x:int=,}",     "let A=struct {@[public]\n}", "let A=struct {var x:int,}",
         "let a=A.[x=,]",              "let a=A.[x=]",               "let a=A.[x=1,.x.y]",
         "let A=struct {let f:()=\n}",
@@ -1696,12 +1759,23 @@ fn parseStruct(self: *Parser) Error!Node.Index {
             .at_sign_l_bracket => try self.expectAttrDecl(),
             .identifier => blk: {
                 const name = self.nextToken();
-                const ty = if ((is_enum and self.token_tags[self.tok_i] != .colon) or (is_union and self.token_tags[self.tok_i] == .comma)) 0 else blk_type: {
+                var after_name = self.tok_i;
+                while (self.token_tags[after_name] == .newline) : (after_name += 1) {}
+                const ty = if ((is_enum and self.token_tags[self.tok_i] != .colon) or
+                    (is_union and (self.token_tags[self.tok_i] == .comma or self.token_tags[after_name] == .r_brace))) 0 else blk_type: {
                     _ = try self.expectToken(.colon);
                     break :blk_type try self.expectTypeExpr();
                 };
                 const value = if (self.eatToken(.equal) != null) try self.expectExpr() else 0;
-                _ = try self.expectToken(.comma);
+                if (self.eatToken(.comma) == null) {
+                    var next = self.tok_i;
+                    while (self.token_tags[next] == .newline) : (next += 1) {}
+                    if (self.token_tags[next] == .r_brace) {
+                        self.tok_i = next;
+                    } else {
+                        _ = try self.expectToken(.comma);
+                    }
+                }
                 break :blk try self.addNode(.{ .tag = .container_field, .main_token = name, .data = .{ .lhs = ty, .rhs = value } });
             },
             else => return self.fail(.expected_decl),
@@ -1722,14 +1796,15 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
         .l_bracket => {
             const lbracket = self.nextToken();
-            if (self.token_tags[self.tok_i] == .newline) {
-                var next = self.tok_i;
-                while (self.token_tags[next] == .newline) : (next += 1) {}
-                if (self.token_tags[next] == .period or self.token_tags[next] == .r_bracket) self.tok_i = next;
-            }
+            while (self.token_tags[self.tok_i] == .newline) self.tok_i += 1;
             if ((self.token_tags[self.tok_i] == .period and self.token_tags[self.tok_i + 1] == .identifier and
                 switch (self.token_tags[self.tok_i + 2]) {
-                    .equal, .comma, .newline, .r_bracket => true,
+                    .equal, .newline, .r_bracket => true,
+                    .comma => legacy: {
+                        var next = self.tok_i + 3;
+                        while (self.token_tags[next] == .newline) : (next += 1) {}
+                        break :legacy self.token_tags[next] != .r_bracket;
+                    },
                     else => false,
                 }) or self.token_tags[self.tok_i] == .r_bracket)
             {
@@ -1757,6 +1832,8 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                 .period_period, .period_period_equal => {
                     const range_token = self.nextToken();
                     const end_expr = try self.parseExpr();
+                    _ = self.eatToken(.comma);
+                    while (self.token_tags[self.tok_i] == .newline) self.tok_i += 1;
                     _ = try self.expectToken(.r_bracket);
                     return self.addNode(.{
                         .tag = .slice,
@@ -1775,6 +1852,8 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                     });
                 },
                 else => {
+                    _ = self.eatToken(.comma);
+                    while (self.token_tags[self.tok_i] == .newline) self.tok_i += 1;
                     _ = try self.expectToken(.r_bracket);
                     return self.addNode(.{
                         .tag = .array_access,
@@ -2320,6 +2399,32 @@ test "closures preserve function expression views delimiters comments and parser
         try std.testing.expect(recovered.errors.len != 0);
         try std.testing.expectEqual(Token.Tag.eof, recovered.tokens.items(.tag)[recovered.lastToken(0)]);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{broken});
+    }
+}
+
+test "constructor trailing comma preserves single payload nodes tokens and OOM" {
+    for ([_][:0]const u8{
+        "let x=U.tag[1,]",
+        "let x=.tag[\n1,\n]",
+        "let x=U.tag[\n.red,\n]",
+        "let x=.tag[.[x=1],]",
+        "let x=U.tag[(x:int)->int{x},]",
+        "let x=U.tag[\n1..=2,\n]",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        const tag = ast.nodes.items(.tag)[node];
+        try std.testing.expect(tag == .array_access or tag == .slice);
+        try std.testing.expect(ast.hasTrailingComma(node));
+        try std.testing.expectEqualStrings("]", ast.tokenSlice(ast.lastToken(node)));
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+    for ([_][:0]const u8{ "let x=U.tag[1,,]", "let x=U.tag[1,2]", "let x=U.tag[1..2,,]", "let x=U.tag[,]" }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
     }
 }
 

@@ -54,13 +54,10 @@ let snapshots: () = {
 let call_order: () = {
     let mut count: int = 0
     let prefix = "saved" + "!"
-    let mut r = .[
-        (suffix: str) -> str {
-            count += 1
-            prefix + suffix
-        },
-        1
-    ]
+    let mut r = .[ (suffix: str) -> str {
+        count += 1
+        prefix + suffix
+    }, 1 ]
     let copy = r
     let result = r.0({
         r.0 = (suffix: str) -> str { "replacement" + suffix }

@@ -603,7 +603,16 @@ results are statements; inferred closure tails are potential returned values.
 Function argument and parameter lists expand vertically **only when they end in
 a trailing comma**. Without one, list separators stay inline regardless of source
 newlines or line length; comments and multiline expressions retain their necessary
-internal breaks. This also applies to function types, builtins and type calls.
+internal breaks. This also applies to function types, builtins, type calls,
+array literals and struct/union constructors, including anonymous and positional
+structs. A union payload can carry a final comma: `Message.some[value,]` requests
+vertical formatting; `Message.some[value]` stays inline. Ordinary indexing and
+slicing do not accept such a comma.
+
+Field-only `struct { ... }`, `union { ... }` and `enum { ... }` type constructors
+use the same rule. Their final field comma is optional; commas between fields
+remain required. Type containers with methods or declarations retain the line
+breaks required by their member syntax. Empty constructors stay compact.
 The formatter preserves commas rather than inserting or removing them:
 
 ```nov
@@ -618,7 +627,8 @@ Compact blocks still expand when their entire physical line exceeds **100
 characters** (Unicode scalars), including indentation, surrounding code and
 trailing comments. Conditional branches share that width decision. A function
 body can therefore expand while its parameter list stays inline; the trailing
-comma rule takes precedence over width for arguments and parameters. Tokens such
+comma rule takes precedence over width for argument, parameter and constructor
+lists. Tokens such
 as long string literals are never split. Blocks with declarations, multiple
 statements, comments or multiline contents keep their expanded layout.
 Both commands accept multiple files and directories:

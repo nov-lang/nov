@@ -60,6 +60,17 @@ results. See `tests/array-fields.nov`.
 
 ## Current delivered status
 
+Trailing commas control vertical formatter layout for argument/parameter lists,
+array literals, named/anonymous/positional struct constructors, union payloads,
+and field-only struct/union/enum type constructors. Without a final comma,
+separators stay inline regardless of source newlines or width; comments and
+multiline children retain necessary breaks. Type containers with methods keep
+member line breaks. Commas are preserved, not inserted or removed. Single union
+payloads accept a final comma (`U.some[value,]`); ordinary index/slice commas
+remain invalid. Final type-field commas are optional, but internal separators
+remain required. Existing block width and short-function brace rules are unchanged.
+See `zig build test-cli-constructor-layout` and the owning formatter/parser tests.
+
 `std.fn.apply(value: T, transform: (T) -> U) -> U` and direct operator
 callbacks are delivered as ordinary public Nov helpers: `add`, `sub`, `mul`,
 `div`, `rem`, `bitAnd`, `bitOr`, `bitXor` have `(A, B) -> C` signatures;

@@ -165,6 +165,24 @@ test "positional selector AST owns numeric token indices and exact chain spans" 
     try std.testing.expectEqualStrings("pair.0.1", tree.source[span.start..span.end]);
 }
 
+test "constructor trailing comma helper ignores nested commas and newlines" {
+    for ([_]struct { source: [:0]const u8, comma: bool }{
+        .{ .source = "let x=U.tag[1,]", .comma = true },
+        .{ .source = "let x=U.tag[1,\n\n]", .comma = true },
+        .{ .source = "let x=U.tag[1..2,\n]", .comma = true },
+        .{ .source = "let x=U.tag[[1,]]", .comma = false },
+        .{ .source = "let x=U.tag[f(1,)]", .comma = false },
+        .{ .source = "let x=U.tag[.[x=1,]]", .comma = false },
+        .{ .source = "let x=U.none[]", .comma = false },
+    }) |case| {
+        var tree = try Parser.parse(std.testing.allocator, case.source);
+        defer tree.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        const node = tree.decl(tree.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(case.comma, tree.hasTrailingComma(node));
+    }
+}
+
 test "expression token boundaries follow delimiters rather than newline counts" {
     const expressions = [_][:0]const u8{
         "[]",                "[1]",             "[1, 2,]",      "[1, 2, 3,\n]",           "[[1], [2, 3],]",       "a[0]",                              "a[-1]",                         "make()[0]",               "a[call(0)]",
@@ -771,6 +789,22 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
             return lbrace - end_offset;
         },
     };
+}
+
+/// Whether a delimited node ends in a top-level comma, ignoring newlines.
+/// Nested payload delimiters do not contribute a trailing comma to their parent.
+pub fn hasTrailingComma(self: Ast, node: Node.Index) bool {
+    const tags = self.tokens.items(.tag);
+    var last = self.lastToken(node);
+    switch (tags[last]) {
+        .r_bracket, .r_paren, .r_brace => {},
+        else => return false,
+    }
+    while (last > 0) {
+        last -= 1;
+        if (tags[last] != .newline) return tags[last] == .comma;
+    }
+    return false;
 }
 
 pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {

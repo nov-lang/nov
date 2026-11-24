@@ -392,6 +392,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const constructor_shorthand_tests = b.step("test-cli-constructor-shorthand", "Run constructor field shorthand CLI tests");
     addConstructorShorthandCliTests(b, exe, constructor_shorthand_tests);
     test_step.dependOn(constructor_shorthand_tests);
+    const constructor_layout_tests = b.step("test-cli-constructor-layout", "Run trailing-comma constructor layout CLI tests");
+    addConstructorLayoutCliTests(b, exe, constructor_layout_tests);
+    test_step.dependOn(constructor_layout_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     const quoted_interpolation_tests = b.step("test-cli-quoted-interpolation", "Run quoted interpolation CLI tests");
@@ -3998,9 +4001,7 @@ fn addGenericMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\let Hidden: (T: type) -> type = struct {
         \\    value: T,
         \\    @[public]
-        \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U).[
-        \\        value = convert(self.value)
-        \\    ]
+        \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U).[ value = convert(self.value) ]
         \\    let private: (self: Hidden(T), value: `U) -> `U = value
         \\    @[public]
         \\    let read: (self: Hidden(T), value: `U) -> uint = secret
@@ -6739,6 +6740,143 @@ fn addConstructorShorthandCliTests(b: *std.Build, exe: *std.Build.Step.Compile, 
     }
 }
 
+fn addConstructorLayoutCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const source = fixtures.add("constructor-layout.nov",
+        \\let E = enum { red, blue }
+        \\let U = union { number: int, items: []int, color: E, callback: (int) -> int, bounds: ..int, none }
+        \\let global: U = U.number[7,]
+        \\let number: (u: U) -> int = match u {
+        \\    .number[n] => n
+        \\    _ => -1
+        \\}
+        \\let items: (u: U) -> []int = match u {
+        \\    .items[a] => a
+        \\    _ => []
+        \\}
+        \\let color: (u: U) -> E = match u {
+        \\    .color[c] => c
+        \\    _ => .blue
+        \\}
+        \\let call: (u: U) -> int = match u {
+        \\    .callback[f] => f(3)
+        \\    _ => -1
+        \\}
+        \\let sum: (u: U) -> int = match u {
+        \\    .bounds[r] => {
+        \\        let mut total = 0
+        \\        loop n in r { total += n }
+        \\        total
+        \\    }
+        \\    _ => -1
+        \\}
+        \\let empty: (u: U) -> bool = match u {
+        \\    .none => true
+        \\    _ => false
+        \\}
+        \\let main: () = {
+        \\    let named = U.number[7,]
+        \\    let contextual: U = .number[7,]
+        \\    let copied = named
+        \\    @assert(number(named) == number(U.number[7]))
+        \\    @assert(number(contextual) == number(copied))
+        \\    @assert(number(global) == 7)
+        \\    let mut input = [1, 2]
+        \\    let array = U.items[input,]
+        \\    let plain = U.items[input]
+        \\    let arrayCopy = array
+        \\    input[0] = 9
+        \\    let contextualArray: U = .items[[1, 2],]
+        \\    let mut extracted = items(arrayCopy)
+        \\    extracted[0] = 8
+        \\    @assert(items(array) == items(plain))
+        \\    @assert(items(arrayCopy) == items(contextualArray))
+        \\    @assert(items(array)[0] == 1)
+        \\    let namedColor = U.color[.red,]
+        \\    let contextualColor: U = .color[.red,]
+        \\    let colorCopy = namedColor
+        \\    @assert(color(namedColor) == color(U.color[.red]))
+        \\    @assert(color(contextualColor) == color(colorCopy))
+        \\    let mut calls = 0
+        \\    let callback: (int) -> int = (n) { calls += 1
+        \\        n + calls }
+        \\    let namedCallback = U.callback[callback,]
+        \\    let contextualCallback: U = .callback[callback,]
+        \\    let callbackCopy = namedCallback
+        \\    let plainCallback = U.callback[callback]
+        \\    @assert(call(namedCallback) == 4)
+        \\    @assert(call(contextualCallback) == 5)
+        \\    @assert(call(callbackCopy) == 6)
+        \\    @assert(call(plainCallback) == 7)
+        \\    let namedRange = U.bounds[1..4,]
+        \\    let contextualRange: U = .bounds[1..4,]
+        \\    let rangeCopy = namedRange
+        \\    @assert(sum(namedRange) == sum(U.bounds[1..4]))
+        \\    @assert(sum(contextualRange) == sum(rangeCopy))
+        \\    @assert(sum(rangeCopy) == 6)
+        \\    @assert(empty(U.none[]))
+        \\    let none: U = .none[]
+        \\    @assert(empty(none))
+        \\    let mut effects = 0
+        \\    let queried: @TypeOf(U.number[{ effects += 1
+        \\        7 },]) = .number[7,]
+        \\    @assert(effects == 0)
+        \\    @assert(number(queried) == 7)
+        \\    @println("constructor layout")
+        \\}
+        \\
+    );
+    const check = b.addRunArtifact(exe);
+    check.step.name = "CLI constructor layout: semantic";
+    check.addArgs(&.{ "check", "--semantic" });
+    check.addFileArg(source);
+    check.expectExitCode(0);
+    check.expectStdOutEqual("");
+    check.expectStdErrEqual("");
+    test_step.dependOn(&check.step);
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI constructor layout: run ({s})", .{mode});
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArg("run");
+        run.addFileArg(source);
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("constructor layout\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "index", .source = "let f:(a:[]int)->int=a[0,]" },
+        .{ .name = "slice", .source = "let f:(a:[]int)->[]int=a[0..1,]" },
+        .{ .name = "query-index", .source = "let f:(a:[]int)={let T=@TypeOf(a[0,])\n}" },
+        .{ .name = "query-slice", .source = "let f:(a:[]int)={let T=@TypeOf(a[0..1,])\n}" },
+        .{ .name = "named-multiple", .source = "let U=union{n:int,}\nlet f:()->U=U.n[1,2,]" },
+        .{ .name = "contextual-multiple", .source = "let U=union{n:int,}\nlet f:()->U=.n[1,2,]" },
+        .{ .name = "named-extra-comma", .source = "let U=union{n:int,}\nlet f:()->U=U.n[1,,]" },
+        .{ .name = "contextual-extra-comma", .source = "let U=union{n:int,}\nlet f:()->U=.n[1,,]" },
+        .{ .name = "empty-comma", .source = "let U=union{none,}\nlet f:()->U=.none[,]" },
+        .{ .name = "named-bad-payload", .source = "let U=union{n:int,}\nlet f:()->U=U.n[true,]" },
+        .{ .name = "contextual-bad-payload", .source = "let U=union{n:int,}\nlet f:()->U=.n[true,]" },
+        .{ .name = "payloadless-value", .source = "let U=union{none,}\nlet f:()->U=.none[1,]" },
+    }) |case| {
+        const invalid = fixtures.add(b.fmt("invalid-constructor-layout-{s}.nov", .{case.name}), case.source);
+        for ([_][]const u8{ "check", "emit-c" }) |command| {
+            const reject = b.addRunArtifact(exe);
+            reject.step.name = b.fmt("CLI constructor layout: {s} rejects {s}", .{ command, case.name });
+            reject.addArg(command);
+            if (std.mem.eql(u8, command, "check")) reject.addArg("--semantic");
+            reject.addFileArg(invalid);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+}
+
 fn addFieldMutationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
     _ = fixtures.add("field-library.nov", "@[public]\nlet K = enum { no, yes, }\n@[public]\nlet R = struct { x: int = 1, s: str = \"old\", b: bool = false, k: K = .no, len: uint = 0, }\n");
     _ = fixtures.add("field-mutation.nov",
@@ -6822,9 +6960,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    @println(O.unwrapOr(make(false), eager()))
         \\    @println(O.unwrapOrElse(make(true), lazy))
         \\    @println(make(false).unwrapOrElse(lazy))
-        \\    @println(viaAlias(viaFile(O.some[
-        \\        3])).unwrapOr(0), viaFile(alternate.Option(int).none[
-        \\    ]).unwrapOr(4))
+        \\    @println(viaAlias(viaFile(O.some[3])).unwrapOr(0), viaFile(alternate.Option(int).none[]).unwrapOr(4))
         \\    let yes: standard.Option(bool) = .some[true]
         \\    let no: direct.Option(bool) = .none[]
         \\    @println(yes.unwrapOr(false), standard.Option(bool).unwrapOr(no, false), no.unwrapOrElse(flag), standard.Option(bool).unwrapOrElse(yes, flag))
@@ -6833,11 +6969,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    @println(word.unwrapOr("bad"), standard.Option(str).unwrapOr(empty, "eager"), empty.unwrapOrElse(text), standard.Option(str).unwrapOrElse(word, text))
         \\    let item: standard.Option(Record) = .some[Record.[ value = "some record" ]]
         \\    let absent: direct.Option(Record) = .none[]
-        \\    @println(item.unwrapOr(Record.[
-        \\        value = "bad"
-        \\    ]).value, standard.Option(Record).unwrapOr(absent, Record.[
-        \\        value = "eager record"
-        \\    ]).value)
+        \\    @println(item.unwrapOr(Record.[ value = "bad" ]).value, standard.Option(Record).unwrapOr(absent, Record.[ value = "eager record" ]).value)
         \\    @println(absent.unwrapOrElse(record).value, standard.Option(Record).unwrapOrElse(item, record).value)
         \\    @println(unit(standard.Option(void).some[]), unit(direct.Option(void).none[]))
         \\    @print("some:")
@@ -6877,9 +7009,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    @println(item.isSome(), standard.Option(Record).none[].isNone())
         \\    @println(standard.Option(void).some[].isSome(), standard.Option(void).none[].isNone())
         \\    @println(standard.Result(void, void).ok[].isOk(), standard.Result(void, void).err[].isErr())
-        \\    @println(standard.Option(bool).some[
-        \\        false].isSome(), standard.Result(bool, str).ok[
-        \\        false].isOk())
+        \\    @println(standard.Option(bool).some[false].isSome(), standard.Result(bool, str).ok[false].isOk())
         \\    @println(ok.unwrapOr(Record.[ text = "fallback" ]).text, err.isErr())
         \\}
         \\

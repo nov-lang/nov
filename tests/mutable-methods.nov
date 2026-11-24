@@ -75,12 +75,11 @@ let array_element_receiver_evaluates_once: () = {
     let saved = counters
     let mut index: int = 0
     let mut events: int = 0
-    counters[
-        {
-            events = events * 10 + 1
-            index += 1
-            0
-        }].add({
+    counters[{
+        events = events * 10 + 1
+        index += 1
+        0
+    }].add({
         events = events * 10 + 2
         index = 0
         5

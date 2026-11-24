@@ -6,8 +6,7 @@ let Rectangle = struct {
     width: int,
     height: int = 4,
 }
-let Empty = struct {
-}
+let Empty = struct {}
 let identity: (value: `T) -> `T = value
 let named: () -> @TypeOf(.[ a = 1, label = "a" ]) = .[ a = 2, label = "b" ]
 let positional: (value: @TypeOf(.[ 1, "a" ])) -> @TypeOf(.[ 1, "a" ]) = value
@@ -68,7 +67,7 @@ let snapshots_and_closure_fields: () = {
         next = () -> int {
             count += 1
             count
-        }
+        },
     ]
     values[0] = 9
     let mut copy = record

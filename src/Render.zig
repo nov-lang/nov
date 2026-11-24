@@ -27,7 +27,7 @@ const CompactSpan = struct {
     node: Ast.Node.Index,
     start: usize,
     end: usize,
-    // Calls are width context for legacy lists, never expansion candidates.
+    // Calls are width context for attribute spans, never expansion candidates.
     kind: enum { block, function_body, list, call_marker } = .block,
 
     fn lessThan(_: void, a: CompactSpan, b: CompactSpan) bool {
@@ -162,7 +162,7 @@ fn renderTreeWithWidth(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixu
         }
         // Stabilize multiline children before measuring physical line widths.
         if (changed) continue;
-        // Retain legacy list expansion on overlong lines containing calls,
+        // Retain attribute expansion on overlong lines containing calls,
         // before measuring blocks at their resulting indentation. Call markers
         // supply context only: neither width nor child newlines expand them.
         for ([_]bool{ true, false }) |source_lists_first| {
@@ -304,22 +304,33 @@ fn renderMember(
         },
 
         .container_field => {
-            const data = ast.nodes.items(.data)[decl];
-            const token = ast.nodes.items(.main_token)[decl];
-            try self.renderToken(token, .none);
-            if (data.lhs != 0) {
-                try self.renderToken(token + 1, .space);
-                try self.renderExpression(data.lhs, if (data.rhs != 0) .space else .none);
-            }
-            if (data.rhs != 0) {
-                try self.renderToken(ast.lastToken(data.lhs) + 1, .space);
-                try self.renderExpression(data.rhs, .none);
-            }
-            try self.renderToken(ast.lastToken(decl) + 1, .endline);
+            try self.renderTypeField(decl, .endline);
         },
 
         else => unreachable,
     }
+}
+
+fn renderTypeField(self: *Render, field: Ast.Node.Index, space: Space) RenderError!void {
+    const ast = self.ast;
+    const data = ast.nodes.items(.data)[field];
+    const token = ast.nodes.items(.main_token)[field];
+    var next = ast.lastToken(field) + 1;
+    const tags = ast.tokens.items(.tag);
+    while (tags[next] == .newline) : (next += 1) {}
+    const comma = tags[next] == .comma;
+    const ending: Space = if (comma) .none else space;
+    try self.renderToken(token, if (data.lhs == 0 and data.rhs != 0) .space else if (data.lhs == 0) ending else .none);
+    if (data.lhs != 0) {
+        try self.renderToken(token + 1, .space);
+        try self.renderExpression(data.lhs, if (data.rhs != 0) .space else ending);
+    }
+    if (data.rhs != 0) {
+        const equal = if (data.lhs != 0) ast.lastToken(data.lhs) + 1 else token + 1;
+        try self.renderToken(equal, .space);
+        try self.renderExpression(data.rhs, ending);
+    }
+    if (comma) try self.renderToken(next, space);
 }
 
 /// Render all expressions in the slice, keeping empty lines where appropriate
@@ -603,7 +614,7 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
                 .array_init_two, .array_init_two_comma => buffer[0..@as(usize, if (buffer[1] != 0) 2 else if (buffer[0] != 0) 1 else 0)],
                 else => ast.extra_data[datas[node].lhs..datas[node].rhs],
             };
-            try self.renderList(node, main_tokens[node], ast.lastToken(node), items, false);
+            try self.renderFunctionList(main_tokens[node], ast.lastToken(node), items, false);
             return self.renderToken(ast.lastToken(node), space);
         },
 
@@ -632,16 +643,22 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
             const suffix = datas[node];
             const lbracket = main_tokens[node];
             try self.renderExpression(suffix.lhs, .none);
-            // Unlike literal/call lists, the parser requires the closing index
-            // bracket immediately after the expression (no newline token).
-            const multiline = self.expanded.contains(node) or self.listIsMultiline(lbracket, ast.lastToken(node));
-            const start = self.output.written().len;
-            if (multiline) try ais.pushIndent(.normal);
-            defer if (multiline) ais.popIndent();
+            const close = ast.lastToken(node);
+            // A trailing comma identifies the vertical single-payload form.
+            // Without it, retain closing-bracket adjacency for ordinary indexes
+            // and slices, even when the expression itself needs line breaks.
+            const multiline = ast.hasTrailingComma(node);
+            const indent = multiline or hasComment(ast, lbracket, close);
+            if (indent) try ais.pushIndent(.normal);
             try self.renderToken(lbracket, if (multiline) .newline else .none);
             try self.renderExpression(suffix.rhs, .none);
-            if (!multiline) try self.recordListSpan(node, start);
-            return self.renderToken(ast.lastToken(node), space); // ]
+            if (multiline) {
+                var comma = close - 1;
+                while (token_tags[comma] == .newline) : (comma -= 1) {}
+                try self.renderToken(comma, .newline);
+            }
+            if (indent) ais.popIndent();
+            return self.renderToken(close, space); // ]
         },
 
         .deref,
@@ -697,23 +714,41 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
         // TODO: grouped_expression (if it goes back into the language)
 
         .container_decl => {
+            const members = ast.fullStruct(node).?;
+            const open = main_tokens[node] + 1;
+            const close = ast.lastToken(node);
+            const fields_only = for (members) |member| {
+                if (node_tags[member] != .container_field) break false;
+            } else true;
             try self.renderToken(main_tokens[node], .space);
-            try ais.pushIndent(.normal);
-            try ais.pushSpace(.endline);
-            try self.renderToken(main_tokens[node] + 1, .newline);
-            try self.renderMembers(ast.fullStruct(node).?);
-            ais.popSpace();
-            ais.popIndent();
-            return self.renderToken(ast.lastToken(node), space);
+            if (fields_only) {
+                const multiline = self.trailingComma(open, close);
+                const indent = multiline or hasComment(ast, open, close);
+                if (indent) try ais.pushIndent(.normal);
+                try self.renderToken(open, if (multiline) .newline else if (members.len != 0) .space else .none);
+                for (members) |member| {
+                    try self.renderDocComments(ast.firstToken(member));
+                    try self.renderTypeField(member, if (multiline) .newline else .space);
+                }
+                if (indent) ais.popIndent();
+            } else {
+                try ais.pushIndent(.normal);
+                try ais.pushSpace(.endline);
+                try self.renderToken(open, .newline);
+                try self.renderMembers(members);
+                ais.popSpace();
+                ais.popIndent();
+            }
+            return self.renderToken(close, space);
         },
         .struct_init, .container_decl_arg => {
             const init = ast.fullStructInit(node).?;
             if (init.type_node != 0) try self.renderExpression(init.type_node, .none);
             const is_struct = node_tags[node] == .struct_init;
             if (is_struct) try self.renderToken(main_tokens[node] - 1, .none);
-            const multiline = self.expanded.contains(node) or self.listIsMultiline(main_tokens[node], ast.lastToken(node));
-            const start = self.output.written().len;
-            if (multiline) try ais.pushIndent(.normal);
+            const multiline = self.trailingComma(main_tokens[node], ast.lastToken(node));
+            const indent = multiline or hasComment(ast, main_tokens[node], ast.lastToken(node));
+            if (indent) try ais.pushIndent(.normal);
             try self.renderToken(main_tokens[node], if (multiline) .newline else if (init.fields.len != 0) .space else .none);
             for (init.fields) |field| {
                 const named = node_tags[field] == .container_field;
@@ -721,17 +756,18 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
                 const value = if (named) datas[field].rhs else field;
                 if (named and !is_struct) try self.renderToken(token - 1, .none);
                 const last = if (value == 0) token else ast.lastToken(value);
-                const comma = token_tags[last + 1] == .comma;
+                var next = last + 1;
+                while (token_tags[next] == .newline) : (next += 1) {}
+                const comma = token_tags[next] == .comma;
                 const ending: Space = if (comma) .none else if (multiline) .newline else .space;
                 if (named) {
                     try self.renderToken(token, if (value == 0) ending else .space);
                     if (value != 0) try self.renderToken(token + 1, .space);
                 }
                 if (value != 0) try self.renderExpression(value, ending);
-                if (comma) try self.renderToken(last + 1, if (multiline) .newline else .space);
+                if (comma) try self.renderToken(next, if (multiline) .newline else .space);
             }
-            if (multiline) ais.popIndent();
-            if (!multiline) try self.recordListSpan(node, start);
+            if (indent) ais.popIndent();
             return self.renderToken(ast.lastToken(node), space);
         },
         .container_decl_trailing,
@@ -909,8 +945,7 @@ fn inlineBlockExpression(self: *Render, node: Ast.Node.Index) bool {
     return true;
 }
 
-/// Preserve separators exactly, including trailing commas. Flattening all
-/// newlines can change expression continuation semantics.
+// Attribute operands retain their existing layout policy.
 fn renderList(self: *Render, node: Ast.Node.Index, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
     const multiline = self.expanded.contains(node) or self.listIsMultiline(open, close);
     const start = self.output.written().len;
@@ -918,8 +953,8 @@ fn renderList(self: *Render, node: Ast.Node.Index, open: Ast.TokenIndex, close: 
     if (!multiline) try self.recordListSpan(node, start);
 }
 
-// Legacy lists retain their source-layout policy, but must follow children
-// that acquire newlines during width passes to keep repeated formatting stable.
+// Only attributes register list spans. Constructor lists and index/slice
+// expressions never feed back into width-driven expansion.
 fn recordListSpan(self: *Render, node: Ast.Node.Index, start: usize) Error!void {
     try self.compact_spans.append(self.allocator, .{
         .node = node,
@@ -929,13 +964,17 @@ fn recordListSpan(self: *Render, node: Ast.Node.Index, start: usize) Error!void 
     });
 }
 
-// Only a trailing comma expands function arguments or parameters. Source
-// newlines, multiline children, comments and width do not change that choice.
-fn renderFunctionList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
+fn trailingComma(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex) bool {
     const tags = self.ast.tokens.items(.tag);
     var previous = close;
     while (previous > open + 1 and tags[previous - 1] == .newline) : (previous -= 1) {}
-    const multiline = items.len != 0 and tags[previous - 1] == .comma;
+    return previous > open + 1 and tags[previous - 1] == .comma;
+}
+
+// Only a trailing comma expands a list. Comments and child expressions keep
+// their necessary breaks without changing the surrounding separator policy.
+fn renderFunctionList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
+    const multiline = items.len != 0 and self.trailingComma(open, close);
     // Comments still need physical line breaks. Indent those continuations
     // without forcing unrelated arguments onto separate lines.
     const indent_comments = !multiline and hasComment(self.ast, open, close);

@@ -83,10 +83,7 @@ let retained_managed_views_and_array_copies: () = {
     @assert(snapshot == "é😀" and snapshot[1..] == "😀")
     @assert(field == "\0e\u{301}!" and @len(original[1]) == 3)
     let temporary = std.string.split("a{snapshot}b{snapshot}", snapshot)
-    @assert(@len(temporary) == 3 and temporary[
-        0] == "a" and temporary[
-        1] == "b" and temporary[
-        2] == "")
+    @assert(@len(temporary) == 3 and temporary[0] == "a" and temporary[1] == "b" and temporary[2] == "")
 }
 
 @[test]

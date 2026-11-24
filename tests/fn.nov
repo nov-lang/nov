@@ -307,9 +307,7 @@ let operator_helpers_support_mixed_nominal_hooks: () = {
     let multiply: (int, Operand) -> str = std.fn.mul
     @assert(std.fn.flip(multiply)(value, 2) == "2:12")
     let mut total = 0
-    let output = Output.[
-        write = (number: int) { total += number }
-    ]
+    let output = Output.[ write = (number: int) { total += number } ]
     std.fn.add(output, 3)
     @assert(total == 3)
 }
@@ -350,9 +348,7 @@ let operator_callbacks_evaluate_once_left_to_right_and_queries_are_pure: () = {
     }
     @assert(std.fn.add(source, replace()) == [1, 2] and source == [9])
     let mut calls = 0
-    let output = Output.[
-        write = (number: int) { calls += number }
-    ]
+    let output = Output.[ write = (number: int) { calls += number } ]
     let query: @TypeOf(std.fn.add(output, right())) = std.fn.noop()
     let voidApply: @TypeOf(std.fn.apply(3, output.write)) = std.fn.noop()
     @assert(calls == 0 and events == [2, 3, 4])

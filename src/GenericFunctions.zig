@@ -2482,6 +2482,31 @@ test "min max solver ordinary generic calls validate ordering under OOM" {
     }
 }
 
+test "constructor trailing comma readonly queries and generic inference" {
+    for ([_][:0]const u8{
+        "let U=union{ok:int,}\nlet expected:U\nlet query=U.ok[1,]",
+        "let E=enum{red,}\nlet U=union{color:E,}\nlet expected:U\nlet query=U.color[.red,]",
+        "let U=union{ok:int,}\nlet expected:U\nlet query=@as(U,.ok[1,])",
+        "let U=union{range:..int,}\nlet expected:U\nlet query=U.range[1..2,]",
+        "let wrap:(n:`T)->U=U.ok[n,]\nlet U=union{ok:uint,}\nlet expected:U\nlet query=wrap(@as(uint,1))",
+    }) |source| {
+        errdefer std.debug.print("constructor query source: {s}\n", .{source});
+        try testDefaultTypeQuery(std.testing.allocator, source, true);
+    }
+    for ([_][:0]const u8{
+        "let query=@as([]int,[1])[0,]",
+        "let query=@as([]int,[1])[0..1,]",
+        "let query=@as(str,\"abc\")[0,]",
+        "let query=@as(str,\"abc\")[0..1,]",
+        "let query={let at=(x){x[0,]}\nat([1])}",
+        "let query={let cut=(x){x[0..1,]}\ncut(\"abc\")}",
+        "let query={let mut items=[1]\nitems[0,]=2\nitems}",
+    }) |source| {
+        errdefer std.debug.print("invalid constructor query source: {s}\n", .{source});
+        try testDefaultTypeQuery(std.testing.allocator, source, false);
+    }
+}
+
 test "array slicing readonly exact types generic callbacks and query purity" {
     for ([_][:0]const u8{
         "let expected:[]u8\nlet query=@as([]u8,[])[..]",
@@ -4025,6 +4050,8 @@ const Solver = struct {
                 try self.query_places.append(self.allocator, .{ .operand = reference, .kind = .mutable_reference, .span = span });
             },
             .field_access, .array_access => {
+                if (ast.nodes.items(.tag)[node] == .array_access and ast.hasTrailingComma(node))
+                    return self.fail(.unsupported_body_expression, span, null);
                 const base_tag = ast.nodes.items(.tag)[data.lhs];
                 if (base_tag != .identifier and base_tag != .field_access and base_tag != .deref) return self.fail(.unsupported_assignment_target, span, null);
                 if (ast.nodes.items(.tag)[node] == .array_access and base_tag == .field_access) {
@@ -4395,6 +4422,10 @@ const Solver = struct {
             .array_access => {
                 if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
                     return self.unionConstructor(frame, node, ty, depth + 1);
+                if (ast.hasTrailingComma(node)) {
+                    try self.fail(.unsupported_body_expression, span, null);
+                    return self.term(.unknown, span);
+                }
                 // Context-free union syntax is still not ordinary indexing.
                 if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) {
                     self.unsupported = self.unsupported orelse span;
@@ -4422,6 +4453,10 @@ const Solver = struct {
             .slice => {
                 if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
                     return self.unionConstructor(frame, node, ty, depth + 1);
+                if (ast.hasTrailingComma(node)) {
+                    try self.fail(.unsupported_body_expression, span, null);
+                    return self.term(.unknown, span);
+                }
                 if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) {
                     self.unsupported = self.unsupported orelse span;
                     return self.term(.unknown, span);

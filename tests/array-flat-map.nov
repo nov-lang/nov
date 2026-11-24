@@ -40,12 +40,10 @@ let flatten_one_layer_and_recursive_independence: () = {
 let storable_outputs_and_shared_closures: () = {
     let words = std.array.flatMap([1, 2], (x) { ["item:{x}"] })
     @assert(words[0] == "item:1" and words[1] == "item:2")
-    let outcomes: []std.Option([]int) = std.array.flatMap([
-        1
-    ], (x) -> []std.Option([]int) {
+    let outcomes: []std.Option([]int) = std.array.flatMap([1], (x) -> []std.Option([]int) {
         [
             std.Option([]int).some[[x]],
-            std.Option([]int).none[]
+            std.Option([]int).none[],
         ]
     })
     @assert(outcomes[0].unwrapOr([])[0] == 1 and outcomes[1].isNone())

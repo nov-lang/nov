@@ -940,7 +940,7 @@ test "source range types format aliases arrays signatures casts and fields" {
 
 test "membership formatting preserves syntactic operands and range expressions" {
     try expectFormatted("let f:(a:[]i8)->bool=-1 in a\n", "let f: (a: []i8) -> bool = -1 in a\n");
-    try expectFormatted("let f:()->bool=true in [false,true,]\n", "let f: () -> bool = true in [false, true,]\n");
+    try expectFormatted("let f:()->bool=true in [false,true,]\n", "let f: () -> bool = true in [\n    false,\n    true,\n]\n");
     try expectFormatted("let f:(n:int)->bool=n in [\n; values\n1,2,]\n", "let f: (n: int) -> bool = n in [\n    ; values\n    1,\n    2,\n]\n");
     try expectFormatted("let f: (n: int) -> bool = n in 1..3\n", "let f: (n: int) -> bool = n in 1..3\n");
     try expectFormatted("let f: (n: int, a: []int) -> bool = n in a[1..3]\n", "let f: (n: int, a: []int) -> bool = n in a[1..3]\n");
@@ -994,7 +994,7 @@ test "calls without trailing commas preserve only internal expression breaks und
         .{ "let x=f(loop {})", "let x = f(loop {\n})\n" },
         .{ "let x=f(match n {0=>1\n_=>2})", "let x = f(match n {\n    0 => 1\n    _ => 2\n})\n" },
         .{ "let x=f([\n1,\n2,\n])", "let x = f([\n    1,\n    2,\n])\n" },
-        .{ "let x=outer(inner([\n1,\n2\n]),(x){x>0})", "let x = outer(inner([\n    1,\n    2\n]), (x) { x > 0 })\n" },
+        .{ "let x=outer(inner([\n1,\n2\n]),(x){x>0})", "let x = outer(inner([1, 2]), (x) { x > 0 })\n" },
         .{ "let x=f((x){x ; body\n})", "let x = f((x) {\n    x ; body\n})\n" },
         .{ "let x=f(a +\n b)", "let x = f(a +\n    b)\n" },
         .{ "let x=f(a + ; operator\nb,)", "let x = f(\n    a + ; operator\n        b,\n)\n" },
@@ -1054,6 +1054,148 @@ test "trailing commas alone control all function lists with exact idempotence to
         .{ "let F=(\n)->int\nlet f=(\n){1}\nlet x=f(\n)", "let F = () -> int\nlet f = () { 1 }\nlet x = f()\n" },
     }) |case| {
         errdefer std.debug.print("trailing comma policy fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
+    }
+}
+
+test "container lists use only trailing commas with exact preservation idempotence and OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=[1,2]", "let x = [1, 2]\n" },
+        .{ "let x=[1,2,]", "let x = [\n    1,\n    2,\n]\n" },
+        .{ "let x=[\n1,\n2\n]", "let x = [1, 2]\n" },
+        .{ "let x=[1]", "let x = [1]\n" },
+        .{ "let x=[1,]", "let x = [\n    1,\n]\n" },
+        .{ "let x=[1,2,3]", "let x = [1, 2, 3]\n" },
+        .{ "let x=[1,2,3,]", "let x = [\n    1,\n    2,\n    3,\n]\n" },
+        .{ "let x=[\n]", "let x = []\n" },
+        .{ "let x=S.[x=1,y=2]", "let x = S.[ x = 1, y = 2 ]\n" },
+        .{ "let x=S.[x=1,y=2,]", "let x = S.[\n    x = 1,\n    y = 2,\n]\n" },
+        .{ "let x=S.[\nx=1,\ny=2\n]", "let x = S.[ x = 1, y = 2 ]\n" },
+        .{ "let x=.[x=1,y=2]", "let x = .[ x = 1, y = 2 ]\n" },
+        .{ "let x=.[x=1,y=2,]", "let x = .[\n    x = 1,\n    y = 2,\n]\n" },
+        .{ "let x=.[a,b]", "let x = .[ a, b ]\n" },
+        .{ "let x=.[a,b,]", "let x = .[\n    a,\n    b,\n]\n" },
+        .{ "let x=.[1,\"x\"]", "let x = .[ 1, \"x\" ]\n" },
+        .{ "let x=.[1,\"x\",]", "let x = .[\n    1,\n    \"x\",\n]\n" },
+        .{ "let x=.[\n1,\n\"x\"\n]", "let x = .[ 1, \"x\" ]\n" },
+        .{ "let x=S.[1,2]", "let x = S.[ 1, 2 ]\n" },
+        .{ "let x=S.[1,2,]", "let x = S.[\n    1,\n    2,\n]\n" },
+        .{ "let x=S.[width,height]", "let x = S.[ width, height ]\n" },
+        .{ "let x=S.[width,height,]", "let x = S.[\n    width,\n    height,\n]\n" },
+        .{ "let x=S.[width,height=2,depth]", "let x = S.[ width, height = 2, depth ]\n" },
+        .{ "let x=S.[width,height=2,depth,]", "let x = S.[\n    width,\n    height = 2,\n    depth,\n]\n" },
+        .{ "let x=S.[\n]\nlet y=.[\n]", "let x = S.[]\nlet y = .[]\n" },
+        .{ "let x=[; open\n1,2]", "let x = [ ; open\n    1, 2]\n" },
+        .{ "let x=S.[; open\nx=1,y=2]", "let x = S.[ ; open\n    x = 1, y = 2 ]\n" },
+        .{ "let x=.[; empty\n]", "let x = .[ ; empty\n]\n" },
+        .{ "let x=[1, ; separator\n2]", "let x = [1, ; separator\n    2]\n" },
+        .{ "let x=[1 ; before close\n]", "let x = [1 ; before close\n]\n" },
+        .{ "let x=[1, ; trailing\n]", "let x = [\n    1, ; trailing\n]\n" },
+        .{ "let x=S.[x=1, ; separator\ny=2]", "let x = S.[ x = 1, ; separator\n    y = 2 ]\n" },
+        .{ "let x=S.[width ; before close\n]", "let x = S.[ width ; before close\n]\n" },
+        .{ "let x=.[a, ; separator\nb]", "let x = .[ a, ; separator\n    b ]\n" },
+        .{ "let x=S.[width, ; trailing\n]", "let x = S.[\n    width, ; trailing\n]\n" },
+        .{ "let x=[[1,2,],S.[x=1,y=2],.[a,b,]]", "let x = [[\n    1,\n    2,\n], S.[ x = 1, y = 2 ], .[\n    a,\n    b,\n]]\n" },
+        .{ "let x=S.[xs=[\n1,\n2\n],pair=.[1,2,],]", "let x = S.[\n    xs = [1, 2],\n    pair = .[\n        1,\n        2,\n    ],\n]\n" },
+        .{ "let x=[(x){tick(x)\nx},2]", "let x = [(x) {\n    tick(x)\n    x\n}, 2]\n" },
+        .{ "let x=S.[f=(x){tick(x)\nx},y=2]", "let x = S.[ f = (x) {\n    tick(x)\n    x\n}, y = 2 ]\n" },
+        .{ "let x=[f(1,),.[2,3]]", "let x = [f(\n    1,\n), .[ 2, 3 ]]\n" },
+    }) |case| {
+        errdefer std.debug.print("container comma policy fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
+    }
+}
+
+test "union payload commas alone select vertical layout with exact idempotence and OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=U.tag[1]", "let x = U.tag[1]\n" },
+        .{ "let x=U.tag[1,]", "let x = U.tag[\n    1,\n]\n" },
+        .{ "let x=U.tag[\n1\n]", "let x = U.tag[1]\n" },
+        .{ "let x=U.tag[\n1,\n]", "let x = U.tag[\n    1,\n]\n" },
+        .{ "let x=.tag[1]", "let x = .tag[1]\n" },
+        .{ "let x=.tag[1,]", "let x = .tag[\n    1,\n]\n" },
+        .{ "let x=.tag[\n1\n]", "let x = .tag[1]\n" },
+        .{ "let x=.tag[\n1,\n]", "let x = .tag[\n    1,\n]\n" },
+        .{ "let x=.e[.red]\nlet y=.red", "let x = .e[ .red ]\nlet y = .red\n" },
+        .{ "let x=.e[.red,]\nlet y=.red", "let x = .e[\n    .red,\n]\nlet y = .red\n" },
+        .{ "let x=U.tag[[1,2]]", "let x = U.tag[[1, 2]]\n" },
+        .{ "let x=U.tag[[1,2],]", "let x = U.tag[\n    [1, 2],\n]\n" },
+        .{ "let x=.tag[[1,2,]]", "let x = .tag[[\n    1,\n    2,\n]]\n" },
+        .{ "let x=.tag[.[x=1,y=2]]", "let x = .tag[.[ x = 1, y = 2 ]]\n" },
+        .{ "let x=.tag[S.[x=1,y=2],]", "let x = .tag[\n    S.[ x = 1, y = 2 ],\n]\n" },
+        .{ "let x=.tag[.[1,2,],]", "let x = .tag[\n    .[\n        1,\n        2,\n    ],\n]\n" },
+        .{ "let x=U.tag[(x){x+1}]", "let x = U.tag[(x) { x + 1 }]\n" },
+        .{ "let x=U.tag[(x){tick(x)\nx},]", "let x = U.tag[\n    (x) {\n        tick(x)\n        x\n    },\n]\n" },
+        .{ "let x=.tag[(x){tick(x)\nx}]", "let x = .tag[(x) {\n    tick(x)\n    x\n}]\n" },
+        .{ "let x=U.tag[0..3]", "let x = U.tag[0..3]\n" },
+        .{ "let x=U.tag[0..3,]", "let x = U.tag[\n    0..3,\n]\n" },
+        .{ "let x=.tag[\n0..3\n]", "let x = .tag[0..3]\n" },
+        .{ "let x=.tag[\n0..3,\n]", "let x = .tag[\n    0..3,\n]\n" },
+        .{ "let x=U.none[\n]\nlet y=.none[]", "let x = U.none[]\nlet y = .none[]\n" },
+        .{ "let x=U.tag[\n[1,2]\n]", "let x = U.tag[[1, 2]]\n" },
+        .{ "let x=.tag[\n.[x=1,y=2]\n]", "let x = .tag[.[ x = 1, y = 2 ]]\n" },
+        .{ "let x=U.tag[\n(x){x+1}\n]", "let x = U.tag[(x) { x + 1 }]\n" },
+        .{ "let x=.tag[1..=3,]", "let x = .tag[\n    1..=3,\n]\n" },
+        .{ "let x=.tag[; open\n1]", "let x = .tag[ ; open\n    1]\n" },
+        .{ "let x=.tag[1 ; no comma\n]", "let x = .tag[1 ; no comma\n]\n" },
+        .{ "let x=U.tag[1, ; trailing\n]", "let x = U.tag[\n    1, ; trailing\n]\n" },
+    }) |case| {
+        errdefer std.debug.print("union payload comma policy fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
+    }
+}
+
+test "type field final commas control layout while methods remain multiline under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let E=enum{\n}\nlet S=struct{\n}\nlet U=union{\n}", "let E = enum {}\nlet S = struct {}\nlet U = union {}\n" },
+        .{ "let S=struct{x:int,y:str}", "let S = struct { x: int, y: str }\n" },
+        .{ "let S=struct{\nx:int,\ny:str\n}", "let S = struct { x: int, y: str }\n" },
+        .{ "let S=struct{x:int,y:str,}", "let S = struct {\n    x: int,\n    y: str,\n}\n" },
+        .{ "let E=enum{red,blue}", "let E = enum { red, blue }\n" },
+        .{ "let E=enum{\nred,\nblue\n}", "let E = enum { red, blue }\n" },
+        .{ "let U=union{n:int,none}", "let U = union { n: int, none }\n" },
+        .{ "let U=union{\nn:int,\nnone\n}", "let U = union { n: int, none }\n" },
+        .{ "let U=union{n:int,none,}", "let U = union {\n    n: int,\n    none,\n}\n" },
+        .{ "let S=struct{\nx:int,\ny:str,\n}", "let S = struct {\n    x: int,\n    y: str,\n}\n" },
+        .{ "let E=enum{\nred,\nblue,\n}", "let E = enum {\n    red,\n    blue,\n}\n" },
+        .{ "let U=union{\nn:int,\nnone,\n}", "let U = union {\n    n: int,\n    none,\n}\n" },
+        .{ "let E=enum{red,blue,}", "let E = enum {\n    red,\n    blue,\n}\n" },
+        .{ "let S=struct{x:int,y:int,}", "let S = struct {\n    x: int,\n    y: int,\n}\n" },
+        .{ "let U=union{tag:int,none:void,}", "let U = union {\n    tag: int,\n    none: void,\n}\n" },
+        .{ "let S=struct{xs:[]int=[1,2],f:(int,str)->bool,}", "let S = struct {\n    xs: []int = [1, 2],\n    f: (int, str) -> bool,\n}\n" },
+        .{ "let S=struct{; empty\n}", "let S = struct { ; empty\n}\n" },
+        .{ "let E=enum{red, ; red\nblue,}", "let E = enum {\n    red, ; red\n    blue,\n}\n" },
+        .{ "let U=union{tag:[]int, ; payload\nnone:void,}", "let U = union {\n    tag: []int, ; payload\n    none: void,\n}\n" },
+        .{ "let S=struct{let f:()={}\nx:int}", "let S = struct {\n    let f: () = {}\n    x: int\n}\n" },
+        .{ "let S=struct{let f:()={}\nx:int ; last field\n}", "let S = struct {\n    let f: () = {}\n    x: int ; last field\n}\n" },
+        .{ "let E=enum{let f:()={}\nred}", "let E = enum {\n    let f: () = {}\n    red\n}\n" },
+        .{ "let E=enum{let f:()={}\nred ; last field\n}", "let E = enum {\n    let f: () = {}\n    red ; last field\n}\n" },
+        .{ "let U=union{let f:()={}\nn:int,none}", "let U = union {\n    let f: () = {}\n    n: int,\n    none\n}\n" },
+        .{ "let U=union{let f:()={}\nn:int,none ; last field\n}", "let U = union {\n    let f: () = {}\n    n: int,\n    none ; last field\n}\n" },
+        .{ "let S=struct{let f:()->int={1}\n}", "let S = struct {\n    let f: () -> int = 1\n}\n" },
+        .{ "let S=struct{x:int,let f:()->int={1}\n}", "let S = struct {\n    x: int,\n    let f: () -> int = 1\n}\n" },
+        .{ "let E=enum{red,let f:()->int=1\n}", "let E = enum {\n    red,\n    let f: () -> int = 1\n}\n" },
+        .{ "let U=union{none:void,let f:()->int=1\n}", "let U = union {\n    none: void,\n    let f: () -> int = 1\n}\n" },
+    }) |case| {
+        errdefer std.debug.print("type container comma policy fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
+    }
+}
+
+test "container lists longer than 100 columns remain inline without trailing commas under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=[" ++ repeatedFormatText("a", 110) ++ ",2]", "let x = [" ++ repeatedFormatText("a", 110) ++ ", 2]\n" },
+        .{ "let x=S.[x=" ++ repeatedFormatText("a", 110) ++ ",y=2]", "let x = S.[ x = " ++ repeatedFormatText("a", 110) ++ ", y = 2 ]\n" },
+        .{ "let x=.[" ++ repeatedFormatText("a", 110) ++ ",2]", "let x = .[ " ++ repeatedFormatText("a", 110) ++ ", 2 ]\n" },
+        .{ "let x=U.tag[" ++ repeatedFormatText("a", 110) ++ "]", "let x = U.tag[" ++ repeatedFormatText("a", 110) ++ "]\n" },
+        .{ "let x=.tag[" ++ repeatedFormatText("a", 110) ++ "]", "let x = .tag[" ++ repeatedFormatText("a", 110) ++ "]\n" },
+        .{ "let x=.tag[0.." ++ repeatedFormatText("a", 110) ++ "]", "let x = .tag[0.." ++ repeatedFormatText("a", 110) ++ "]\n" },
+    }) |case| {
+        errdefer std.debug.print("width independent container fixture: {s}\n", .{case[0]});
         try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
     }
@@ -1247,13 +1389,13 @@ test "inline calls retain independent block width expansion under OOM" {
     }
 }
 
-test "array width policy remains independent of inline function lists under OOM" {
+test "arrays and function lists both ignore width without trailing commas under OOM" {
     for ([_][2][:0]const u8{
         .{ "let x=[f(" ++ repeatedFormatText("a", 87) ++ ")]", "let x = [f(" ++ repeatedFormatText("a", 87) ++ ")]\n" },
-        .{ "let x=[f(" ++ repeatedFormatText("a", 88) ++ ")]", "let x = [\n    f(" ++ repeatedFormatText("a", 88) ++ ")\n]\n" },
-        .{ "let x=f([g(" ++ repeatedFormatText("a", 88) ++ ")])", "let x = f([\n    g(" ++ repeatedFormatText("a", 88) ++ ")\n])\n" },
+        .{ "let x=[f(" ++ repeatedFormatText("a", 88) ++ ")]", "let x = [f(" ++ repeatedFormatText("a", 88) ++ ")]\n" },
+        .{ "let x=f([g(" ++ repeatedFormatText("a", 88) ++ ")])", "let x = f([g(" ++ repeatedFormatText("a", 88) ++ ")])\n" },
     }) |case| {
-        errdefer std.debug.print("unchanged array policy fixture: {s}\n", .{case[0]});
+        errdefer std.debug.print("width independent array fixture: {s}\n", .{case[0]});
         try expectFormatted(case[0], case[1]);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
     }
@@ -1267,9 +1409,7 @@ test "Hidden signatures and sibling type calls without trailing commas stay inli
     ;
     try expectFormatted(source,
         \\let Hidden: (T: type) -> type = struct {
-        \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U).[
-        \\        value = convert(self.value)
-        \\    ]
+        \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U).[ value = convert(self.value) ]
         \\}
         \\
     );
@@ -1385,10 +1525,10 @@ test "single statement blocks retain nested blocks and control flow" {
 
 test "compact blocks nested in lists stabilize on the first pass" {
     try expectFormatted("let value=call({x>y})", "let value = call({ x > y })\n");
-    try expectFormatted("let value=[{x>y},{false}]", "let value = [\n    { x > y },\n    { false }\n]\n");
-    try expectFormatted("let value=call([{1}])", "let value = call([\n    { 1 }\n])\n");
-    try expectFormatted("let value=[call({1})]", "let value = [\n    call({ 1 })\n]\n");
-    try expectFormatted("let value=items[{1}]", "let value = items[\n    { 1 }]\n");
+    try expectFormatted("let value=[{x>y},{false}]", "let value = [{ x > y }, { false }]\n");
+    try expectFormatted("let value=call([{1}])", "let value = call([{ 1 }])\n");
+    try expectFormatted("let value=[call({1})]", "let value = [call({ 1 })]\n");
+    try expectFormatted("let value=items[{1}]", "let value = items[{ 1 }]\n");
 }
 
 test "nested list expansion and empty block comments stabilize on the first pass" {
@@ -1481,10 +1621,10 @@ test "executable formatting survives allocation failures" {
 
 test "scalar arrays render types literals indexing length and direct stores" {
     try expectFormatted("let f:()->void={a[-1]+=1\na[0]-=2\na[0]*=3\na[0]/=4\na[0]%=5}\n", "let f: () -> void = {\n    a[-1] += 1\n    a[0] -= 2\n    a[0] *= 3\n    a[0] /= 4\n    a[0] %= 5\n}\n");
-    try expectFormatted("let f:(a:[]int)->[]bool={let mut b:[]bool=[true,false,]\nb[-1]=!a[0] == 0\nb += []\nreturn b}\n", "let f: (a: []int) -> []bool = {\n    let mut b: []bool = [true, false,]\n    b[-1] = !a[0] == 0\n    b += []\n    return b\n}\n");
+    try expectFormatted("let f:(a:[]int)->[]bool={let mut b:[]bool=[true,false,]\nb[-1]=!a[0] == 0\nb += []\nreturn b}\n", "let f: (a: []int) -> []bool = {\n    let mut b: []bool = [\n        true,\n        false,\n    ]\n    b[-1] = !a[0] == 0\n    b += []\n    return b\n}\n");
     try expectFormatted("let f:()={let mut a=[1,2]\n@clear(a)}\n", "let f: () = {\n    let mut a = [1, 2]\n    @clear(a)\n}\n");
     try expectFormatted("let n=@len(\"é\\0😀\")\n", "let n = @len(\"é\\0😀\")\n");
-    try expectFormatted("let x:[]int=[]\nlet y=[1,2,3,]\nlet n=make()[0] + -a[-1] * @len(a)\n", "let x: []int = []\nlet y = [1, 2, 3,]\nlet n = make()[0] + -a[-1] * @len(a)\n");
+    try expectFormatted("let x:[]int=[]\nlet y=[1,2,3,]\nlet n=make()[0] + -a[-1] * @len(a)\n", "let x: []int = []\nlet y = [\n    1,\n    2,\n    3,\n]\nlet n = make()[0] + -a[-1] * @len(a)\n");
     for ([_][]const u8{ "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f:(a:[]{s})->[]{s}=a\n", .{ name, name }, 0);
         defer std.testing.allocator.free(source);
@@ -1496,7 +1636,7 @@ test "scalar arrays render types literals indexing length and direct stores" {
 
 test "array comments continuations and expanding lists stabilize on the first pass" {
     try expectFormatted("let x:[]int=[\n; empty\n]\n", "let x: []int = [\n    ; empty\n]\n");
-    try expectFormatted("let x=[{1}]\n", "let x = [\n    { 1 }\n]\n");
+    try expectFormatted("let x=[{1}]\n", "let x = [{ 1 }]\n");
     for ([_][:0]const u8{
         "let f:(a:[]int)->int=a[\n -1]\n",
         "let f:(a:[]int)->uint=@len(a[; index\n -1])\n",

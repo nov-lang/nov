@@ -57,7 +57,7 @@ let mixed_order_and_defaults: () = {
         label = {
             width = 99
             "mixed"
-        }
+        },
     ]
     @assert(calls == 1 and width == 99)
     @assert(value.height == 3 and value.width == 3)

@@ -25,10 +25,7 @@ let weighted_mean: (samples: []Measurement) -> f64 = {
 }
 
 let main: () = {
-    let samples = [
-        Measurement.[ value = 1.5, weight = 1 ],
-        Measurement.[ value = 3, weight = 2 ]
-    ]
+    let samples = [Measurement.[ value = 1.5, weight = 1 ], Measurement.[ value = 3, weight = 2 ]]
     @println("Weighted mean:", weighted_mean(samples))
     let values: []f32 = [1, step, add(step, 0.5)]
     @println("Values: {values}")

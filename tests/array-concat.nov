@@ -47,11 +47,7 @@ let storable_element_types: () = {
     let runes = ['é'] + ['😀']
     let entries = [Entry.[ scores = [1] ]] + [Entry.[ scores = [2] ]]
     let messages: []Message = [.entry[entries[0]]] + [.none[]]
-    let functions: []() -> int = [
-        () -> int { 1 }
-    ] + [
-        () -> int { 2 }
-    ]
+    let functions: []() -> int = [() -> int { 1 }] + [() -> int { 2 }]
     let ranges = [0..2] + [2..4]
     @assert(flags[0] and flags[1] == false)
     @assert(floats[0] + floats[1] == 4.0 and runes[1] == '😀')
@@ -87,11 +83,10 @@ let operands_snapshot_before_later_effects: () = {
         p.*
     }
     @assert(referenced[0][0] == 9 and referenced[1][0] == 8)
-    let indexed = [1] + items[
-        {
-            items = [[6]]
-            0
-        }]
+    let indexed = [1] + items[{
+        items = [[6]]
+        0
+    }]
     @assert(indexed[1] == 8 and items[0][0] == 6)
 }
 

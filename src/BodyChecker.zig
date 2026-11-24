@@ -1572,6 +1572,10 @@ const Context = struct {
             _ = try self.fail(.unsupported_borrow, decl.init_node, null);
             return null;
         }
+        if (!scalar and ast.hasTrailingComma(operand)) {
+            _ = try self.fail(.unsupported_body_expression, operand, null);
+            return null;
+        }
         const access = ast.nodes.items(.data)[operand];
         const owner_node = if (scalar) operand else access.lhs;
         if (ast.nodes.items(.tag)[owner_node] != .identifier) {
@@ -4091,6 +4095,7 @@ const Context = struct {
         // Element writes use the same detached pre-index base as assignment.
         // No fresh loan is introduced: an effectful index may replace the owner.
         if (ast.nodes.items(.tag)[operand] == .array_access) {
+            if (ast.hasTrailingComma(operand)) return self.fail(.unsupported_body_expression, operand, null);
             const access = ast.nodes.items(.data)[operand];
             const place = (try self.clearStorage(access.lhs)) orelse return null;
             const array = self.ir.getType(place.ty).?;
@@ -4215,6 +4220,7 @@ const Context = struct {
     fn elementAssignment(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
+        if (ast.hasTrailingComma(data.lhs)) return self.fail(.unsupported_body_expression, data.lhs, null);
         const target = ast.nodes.items(.data)[data.lhs];
         const tag = ast.nodes.items(.tag)[node];
         const compound = tag != .assign;
@@ -5334,6 +5340,8 @@ const Context = struct {
         if ((tag_early == .array_access or tag_early == .slice or tag_early == .container_decl_arg) and
             (ast_early.nodes.items(.tag)[base_early] == .enum_literal or try self.qualifiedUnion(base_early) != null))
             return self.unionInit(node, expected, depth);
+        if ((tag_early == .array_access or tag_early == .slice) and ast_early.hasTrailingComma(node))
+            return self.fail(.unsupported_body_expression, node, null);
         // Explicit record constructors already carry their type. Resolve it once,
         // rather than probing and then retrying a failed concrete specialization.
         if (tag_early == .struct_init) return self.recordInit(node, expected, depth);
@@ -8941,6 +8949,57 @@ test "record interpolation uses print signature diagnostics at the placeholder s
         try std.testing.expectEqual(case.related, diagnostic.related != null);
         if (diagnostic.related) |related| try std.testing.expectEqualStrings("toString", module.sourceSlice(related).?);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "constructor trailing comma lowers scalar enum aggregate closure range globals and queries" {
+    const source =
+        \\let E=enum{red,blue}
+        \\let S=struct{x:int}
+        \\let U=union{number:int,color:E,record:S,callback:(int)->int,range:..int,none}
+        \\let global:U=U.number[1,]
+        \\let query=@TypeOf(U.number[2,])
+        \\let identity:(x:`T)->`T=x
+        \\let scalar:()->U=.number[
+        \\  1,
+        \\]
+        \\let color:()->U=.color[.red,]
+        \\let record:()->U=U.record[.[x=1],]
+        \\let callback:()->U=.callback[(x:int)->int{x},]
+        \\let range:()->U=U.range[1..2,]
+        \\let generic:()->U=identity(U.number[3,])
+        \\let empty:()->U=.none[]
+    ;
+    var module = try Module.init(std.testing.allocator, "constructor-comma.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("constructor comma: {any} parse={any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "constructor trailing comma rejects ordinary indexes slices and writes" {
+    for ([_][]const u8{
+        "let f:(items:[]int)->int=items[0,]",
+        "let at:(items:[]`T)->`T=items[0,]\nlet main:()->int=at([1])",
+        "let cut:(items:`T)->`T=items[0..1,]\nlet main:()->str=cut(\"abc\")",
+        "let f:(items:[]int)->[]int=items[0..1,]",
+        "let f:(items:str)->rune=items[0,]",
+        "let f:(items:str)->str=items[0..1,]",
+        "let f:()={let mut items=[1]\nitems[0,]=2}",
+        "let f:()={let mut items=[1]\nitems[0,]+=2}",
+        "let f:()={let mut items=[1]\nlet p=&items[0,]\n}",
+    }) |source| {
+        errdefer std.debug.print("invalid index comma source: {s}\n", .{source});
+        var module = try Module.init(std.testing.allocator, "invalid-index-comma.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
     }
 }
 
