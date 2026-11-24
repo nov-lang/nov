@@ -137,10 +137,7 @@ let Probe = struct {
 
     @[public]
     @[operator(.less_than)]
-    let lessThan: (
-        left: Probe,
-        right: Probe
-    ) -> bool = left.run(left.key, right.key) and left.key < right.key
+    let lessThan: (left: Probe, right: Probe) -> bool = left.run(left.key, right.key) and left.key < right.key
 }
 
 @[test]

@@ -71,18 +71,14 @@ let match_and_success_error_propagation: () = {
         .err[items] => items
     }
     errors[0] = "changed"
-    @assert(
-        match bad {
-            .ok => false
-            .err[items] => items[0] == "bad!"
-        }
-    )
-    @assert(
-        match propagated {
-            .ok => false
-            .err[items] => items[0] == "bad!"
-        }
-    )
+    @assert(match bad {
+        .ok => false
+        .err[items] => items[0] == "bad!"
+    })
+    @assert(match propagated {
+        .ok => false
+        .err[items] => items[0] == "bad!"
+    })
 }
 
 @[test]
@@ -196,11 +192,8 @@ let main: () = {
     let present: Option([]int) = .some[[3]]
     @println("Advanced:", advance(present).unwrapOr([]))
     let bad: Result([]int, []str) = .err[["missing"]]
-    @println(
-        "Error:",
-        match forward(bad) {
-            .ok => @as([]str, [])
-            .err[items] => items
-        }
-    )
+    @println("Error:", match forward(bad) {
+        .ok => @as([]str, [])
+        .err[items] => items
+    })
 }

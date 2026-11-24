@@ -80,13 +80,11 @@ let array_element_receiver_evaluates_once: () = {
             events = events * 10 + 1
             index += 1
             0
-        }].add(
-        {
-            events = events * 10 + 2
-            index = 0
-            5
-        }
-    )
+        }].add({
+        events = events * 10 + 2
+        index = 0
+        5
+    })
     counters[-1].add(2)
     @assert(events == 12 and index == 0)
     @assert(counters[0].value == 6 and counters[1].value == 12)
@@ -98,12 +96,10 @@ let receiver_target_precedes_argument_rebinding: () = {
     let mut first = Counter.[ value = 1 ]
     let mut second = Counter.[ value = 10 ]
     let mut p = &first
-    p.add(
-        {
-            p = &second
-            5
-        }
-    )
+    p.add({
+        p = &second
+        5
+    })
     @assert(p.*.value == 10)
     p.add(2)
     @assert(first.value == 6 and second.value == 12)
@@ -123,14 +119,10 @@ let generic_self_and_method_inference: () = {
 @[test]
 let type_queries_do_not_borrow_or_execute: () = {
     let mut counter = Counter.[ value = 0 ]
-    let query: @TypeOf(
-        counter.add(
-            {
-                counter.value = 99
-                1
-            }
-        )
-    ) = {}
+    let query: @TypeOf(counter.add({
+        counter.value = 99
+        1
+    })) = {}
     let mut box = Box(u8).[ value = 1 ]
     let exact: @TypeOf(box.echo(@as(u8, 8))) = 7
     @assert(counter.value == 0 and box.value == 1 and exact == 7)
@@ -162,12 +154,10 @@ let reference_fields_read_write_and_call: () = {
     let function = &callable
     @assert(function.call(3) == 6)
     let next = (n: int) -> int { n + 1 }
-    let result = function.call(
-        {
-            function.call = next
-            3
-        }
-    )
+    let result = function.call({
+        function.call = next
+        3
+    })
     @assert(result == 6 and function.call(3) == 4)
 
     let mut nested = Box(Counter).[ value = Counter.[ value = 1 ] ]

@@ -66,10 +66,8 @@ let main: () = {
     let mut result: Value = .empty[]
     let resultView = &result
     resultView.* = .count[7]
-    @println(
-        match resultView.* {
-            .count[number] => number
-            .empty => @as(uint, 0)
-        }
-    )
+    @println(match resultView.* {
+        .count[number] => number
+        .empty => @as(uint, 0)
+    })
 }

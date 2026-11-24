@@ -14,19 +14,15 @@ let option_variants_and_inferred_results: () = {
     let mut calls = 0
     let some: Option(int) = .some[7]
     let none: Option(int) = .none[]
-    let converted: Option(str) = some.map(
-        (x) {
-            calls += 1
-            "value:{x}"
-        }
-    )
+    let converted: Option(str) = some.map((x) {
+        calls += 1
+        "value:{x}"
+    })
     @assert(converted.unwrapOr("") == "value:7" and calls == 1)
-    let missing = none.map(
-        (x) {
-            calls += 1
-            "value:{x}"
-        }
-    )
+    let missing = none.map((x) {
+        calls += 1
+        "value:{x}"
+    })
     @assert(missing.isNone() and calls == 1)
     let defaulted = some.map((x) { 42 })
     let canonicalDefault: Option(int) = defaulted
@@ -51,53 +47,39 @@ let result_variants_and_shared_captures: () = {
     @assert(good.map(convert).unwrapOr(0) == 15)
     let unchanged = bad.map(convert)
     @assert(unchanged.isErr() and calls == 2 and offset == 12)
-    @assert(
-        match unchanged {
-            .ok => false
-            .err[error] => error == "missing"
-        }
-    )
-    let converted: Result(int, uint) = bad.mapErr(
-        (error) {
-            calls += 1
-            @assert(error == "missing")
-            @as(uint, 7)
-        }
-    )
-    @assert(
-        match converted {
-            .ok => false
-            .err[error] => error == 7
-        }
-    )
-    let untouched = Result(int, str).mapErr(
-        good,
-        (error) {
-            calls += 1
-            @as(uint, 99)
-        }
-    )
+    @assert(match unchanged {
+        .ok => false
+        .err[error] => error == "missing"
+    })
+    let converted: Result(int, uint) = bad.mapErr((error) {
+        calls += 1
+        @assert(error == "missing")
+        @as(uint, 7)
+    })
+    @assert(match converted {
+        .ok => false
+        .err[error] => error == 7
+    })
+    let untouched = Result(int, str).mapErr(good, (error) {
+        calls += 1
+        @as(uint, 99)
+    })
     @assert(untouched.unwrapOr(0) == 3 and calls == 3)
     let text = Result(int, str).map(good, (x) { "ok:{x}" })
     @assert(text.unwrapOr("") == "ok:3")
     let defaulted = bad.mapErr((error) { 42 })
     let absent: Result(int, void) = .err[]
-    let skipped: Result(
-        str,
-        void
-    ) = absent.map(
-        (value) -> str { @panic("void error must skip conversion") }
-    )
+    let skipped: Result(str, void) = absent.map((value) -> str {
+        @panic("void error must skip conversion")
+    })
     @assert(skipped.isErr())
     let present: Result(int, void) = .ok[3]
     @assert(present.map((value) { value + 1 }).unwrapOr(0) == 4)
     let canonicalDefault: Result(int, int) = defaulted
-    @assert(
-        match canonicalDefault {
-            .ok => false
-            .err[error] => error == 42
-        }
-    )
+    @assert(match canonicalDefault {
+        .ok => false
+        .err[error] => error == 42
+    })
 }
 
 @[test]
@@ -155,13 +137,11 @@ let record_payloads_and_recursive_array_copies: () = {
     let good: Result(Row, Row) = .ok[row]
     let bad: Result(Row, Row) = .err[row]
     row.values[0] = [9]
-    let changed = some.map(
-        (value) {
-            let mut copy = value
-            copy.values[0] = [8]
-            copy
-        }
-    )
+    let changed = some.map((value) {
+        let mut copy = value
+        copy.values[0] = [8]
+        copy
+    })
     let fallback = Row.[ values = [] ]
     @assert(changed.unwrapOr(fallback).values[0][0] == 8)
     @assert(some.unwrapOr(fallback).values[0][0] == 1)
@@ -173,23 +153,19 @@ let record_payloads_and_recursive_array_copies: () = {
     copy.values[0] = [7]
     @assert(mapped.unwrapOr(fallback).values[0][0] == 1)
     @assert(@len(propagated.unwrapOr(fallback).values[0]) == 2)
-    @assert(
-        match mappedError {
-            .ok => false
-            .err[error] => error.values[1][0] == 3
-        }
-    )
+    @assert(match mappedError {
+        .ok => false
+        .err[error] => error.values[1][0] == 3
+    })
     let mut errorCopy = match propagatedError {
         .ok => fallback
         .err[error] => error
     }
     errorCopy.values[0] = [6]
-    @assert(
-        match propagatedError {
-            .ok => false
-            .err[error] => error.values[0][0] == 1
-        }
-    )
+    @assert(match propagatedError {
+        .ok => false
+        .err[error] => error.values[0][0] == 1
+    })
     @assert(good.unwrapOr(fallback).values[0][0] == 1)
 }
 
@@ -203,38 +179,28 @@ let inactive_callbacks_and_chained_maps: () = {
     @assert(good.mapErr((error) -> int { @panic("success callback") }).unwrapOr(0) == 5)
     let mut calls = 0
     let some: Option(int) = .some[1]
-    let first = some.map(
-        (x) {
-            calls += 1
-            x + 1
-        }
-    )
-    let second = first.map(
-        (x) {
-            calls += 1
-            "next:{x}"
-        }
-    )
+    let first = some.map((x) {
+        calls += 1
+        x + 1
+    })
+    let second = first.map((x) {
+        calls += 1
+        "next:{x}"
+    })
     @assert(second.unwrapOr("") == "next:2" and calls == 2)
-    let mapped = bad.mapErr(
-        (error) {
-            calls += 1
-            "mapped:{error}"
-        }
-    )
-    let unchanged = mapped.map(
-        (x) {
-            calls += 1
-            x + 1
-        }
-    )
+    let mapped = bad.mapErr((error) {
+        calls += 1
+        "mapped:{error}"
+    })
+    let unchanged = mapped.map((x) {
+        calls += 1
+        x + 1
+    })
     @assert(calls == 3)
-    @assert(
-        match unchanged {
-            .ok => false
-            .err[error] => error == "mapped:bad"
-        }
-    )
+    @assert(match unchanged {
+        .ok => false
+        .err[error] => error == "mapped:bad"
+    })
 }
 
 @[test]
@@ -260,43 +226,32 @@ let chained_container_operations: () = {
     @assert(good.andThen(step).unwrapOr("") == "value:2")
     let original = bad.andThen(step)
     @assert(calls == 3)
-    @assert(
-        match original {
-            .ok => false
-            .err[error] => error == "original"
-        }
-    )
+    @assert(match original {
+        .ok => false
+        .err[error] => error == "original"
+    })
     let failure: Result(int, str) = .ok[0]
     let changed = Result(int, str).andThen(failure, step)
-    @assert(
-        match changed {
-            .ok => false
-            .err[error] => error == "nonpositive"
-        }
-    )
+    @assert(match changed {
+        .ok => false
+        .err[error] => error == "nonpositive"
+    })
     @assert(calls == 4)
 
-    let checked: Option(void) = present.andThen(
-        (value) -> Option(void) {
-            @assert(value == 2)
-            .some[]
-        }
-    )
+    let checked: Option(void) = present.andThen((value) -> Option(void) {
+        @assert(value == 2)
+        .some[]
+    })
     @assert(checked.isSome())
     let voidError: Result(int, void) = .err[]
-    let skipped: Result(
-        void,
-        void
-    ) = voidError.andThen(
-        (value) -> Result(void, void) { @panic("failed result must skip next operation") }
-    )
+    let skipped: Result(void, void) = voidError.andThen((value) -> Result(void, void) {
+        @panic("failed result must skip next operation")
+    })
     @assert(skipped.isErr())
-    let finished: Result(void, str) = good.andThen(
-        (value) -> Result(void, str) {
-            @assert(value == 2)
-            .ok[]
-        }
-    )
+    let finished: Result(void, str) = good.andThen((value) -> Result(void, str) {
+        @assert(value == 2)
+        .ok[]
+    })
     @assert(finished.isOk())
 
     let mut events = 0
@@ -327,10 +282,8 @@ let main: () = {
     @println("None:", none.map((x) { x * 2 }).isNone())
     @println("Result:", good.map((x) { "value:{x}" }).unwrapOr(""))
     let error = bad.mapErr((message) { "error:{message}" })
-    @println(
-        match error {
-            .ok => "unexpected success"
-            .err[message] => message
-        }
-    )
+    @println(match error {
+        .ok => "unexpected success"
+        .err[message] => message
+    })
 }

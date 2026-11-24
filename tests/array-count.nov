@@ -37,16 +37,13 @@ let Row = struct {
 let managed_snapshot_and_callback_copies: () = {
     let mut source = [Row.[ values = [[1]] ], Row.[ values = [[2]] ]]
     let mut seen: []int = []
-    let result = count(
-        source,
-        (row) {
-            seen += [row.values[0][0]]
-            source = [Row.[ values = [[99]] ]]
-            let mut copy = row
-            copy.values[0] = [88]
-            row.values[0][0] < 3
-        }
-    )
+    let result = count(source, (row) {
+        seen += [row.values[0][0]]
+        source = [Row.[ values = [[99]] ]]
+        let mut copy = row
+        copy.values[0] = [88]
+        row.values[0][0] < 3
+    })
     @assert(result == 2 and seen == [1, 2] and source[0].values == [[99]])
     @assert(count([[[1]], [[2]]], yes) == 2)
     let payloads: []std.Option([][]int) = [.some[[[4]]], .none[]]

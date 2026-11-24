@@ -92,73 +92,57 @@ let eager_callee_and_arguments_once_left_to_right: () = {
         events = events * 10 + 1
         std.string.replace
     }
-    let replaced = getReplace()(
-        {
-            events = events * 10 + 2
-            source
-        },
-        {
-            events = events * 10 + 3
-            source = "changed"
-            "😀"
-        },
-        {
-            events = events * 10 + 4
-            "!"
-        }
-    )
+    let replaced = getReplace()({
+        events = events * 10 + 2
+        source
+    }, {
+        events = events * 10 + 3
+        source = "changed"
+        "😀"
+    }, {
+        events = events * 10 + 4
+        "!"
+    })
     @assert(events == 1234 and replaced == "a!b" and source == "changed")
     events = 0
-    let empty = std.string.replace(
-        {
-            events = events * 10 + 1
-            ""
-        },
-        {
-            events = events * 10 + 2
-            "x"
-        },
-        {
-            events = events * 10 + 3
-            "y"
-        }
-    )
+    let empty = std.string.replace({
+        events = events * 10 + 1
+        ""
+    }, {
+        events = events * 10 + 2
+        "x"
+    }, {
+        events = events * 10 + 3
+        "y"
+    })
     @assert(events == 123 and empty == "")
     events = 0
     let getRepeat = () -> (str, uint) -> str {
         events = events * 10 + 1
         std.string.repeat
     }
-    let repeated = getRepeat()(
-        {
-            events = events * 10 + 2
-            "é"
-        },
-        {
-            events = events * 10 + 3
-            0
-        }
-    )
+    let repeated = getRepeat()({
+        events = events * 10 + 2
+        "é"
+    }, {
+        events = events * 10 + 3
+        0
+    })
     @assert(events == 123 and repeated == "")
     events = 0
-    let emptyRepeated = std.string.repeat(
-        {
-            events = events * 10 + 1
-            ""
-        },
-        {
-            events = events * 10 + 2
-            3
-        }
-    )
+    let emptyRepeated = std.string.repeat({
+        events = events * 10 + 1
+        ""
+    }, {
+        events = events * 10 + 2
+        3
+    })
     @assert(events == 12 and emptyRepeated == "")
     events = 0
-    let trimmed = std.string.trim(
-        {
-            events += 1
-            " é "
-        }
-    )
+    let trimmed = std.string.trim({
+        events += 1
+        " é "
+    })
     @assert(events == 1 and trimmed == "é")
 }
 

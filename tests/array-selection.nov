@@ -22,27 +22,19 @@ let reverse_visit_order_and_shortcircuit: () = {
     let items: []int = [3, 1, 4, 2]
     let mut seen: int = 0
     let mut calls: int = 0
-    let found = std.array.findLast(
-        items,
-        (value: int) -> bool {
-            seen = seen * 10 + value
-            calls += 1
-            value > 2
-        }
-    )
+    let found = std.array.findLast(items, (value: int) -> bool {
+        seen = seen * 10 + value
+        calls += 1
+        value > 2
+    })
     @assert(found.unwrapOr(0) == 4 and seen == 24 and calls == 2)
     seen = 0
     calls = 0
-    @assert(
-        std.array.findLast(
-            items,
-            (value: int) -> bool {
-                seen = seen * 10 + value
-                calls += 1
-                false
-            }
-        ).isNone()
-    )
+    @assert(std.array.findLast(items, (value: int) -> bool {
+        seen = seen * 10 + value
+        calls += 1
+        false
+    }).isNone())
     @assert(seen == 2413 and calls == 4)
     @assert(items[0] == 3 and items[3] == 2)
     let yes = (value: int) -> bool { true }
@@ -54,15 +46,10 @@ let reverse_visit_order_and_shortcircuit: () = {
 let typed_empty_no_predicate_calls: () = {
     let empty: []str = []
     let mut calls: int = 0
-    @assert(
-        std.array.findLast(
-            empty,
-            (value: str) -> bool {
-                calls += 1
-                true
-            }
-        ).isNone()
-    )
+    @assert(std.array.findLast(empty, (value: str) -> bool {
+        calls += 1
+        true
+    }).isNone())
     @assert(calls == 0)
     @assert(@len(std.array.take(empty, 0)) == 0)
     @assert(@len(std.array.drop(empty, 0)) == 0)
@@ -145,26 +132,21 @@ let recursive_copies_in_both_directions: () = {
     let mut payloads: []Payload = [.row[Row.[ values = [[10]] ]]]
     let kept = std.array.take(payloads, 1)
     payloads[0] = .none[]
-    @assert(
-        match kept[0] {
-            .row[value] => value.values[0][0] == 10
-            .none => false
-        }
-    )
+    @assert(match kept[0] {
+        .row[value] => value.values[0][0] == 10
+        .none => false
+    })
 }
 
 @[test]
 let predicate_mutations_preserve_snapshot: () = {
     let mut source: []int = [1, 2, 3]
     let mut seen: int = 0
-    let found = std.array.findLast(
-        source,
-        (value: int) -> bool {
-            seen = seen * 10 + value
-            source[0] = 9
-            value == 1
-        }
-    )
+    let found = std.array.findLast(source, (value: int) -> bool {
+        seen = seen * 10 + value
+        source[0] = 9
+        value == 1
+    })
     @assert(seen == 321 and found.unwrapOr(0) == 1 and source[0] == 9)
 }
 
@@ -189,40 +171,33 @@ let closures_share_capture_environments: () = {
 let eager_arguments_once_left_to_right: () = {
     let mut events: int = 0
     let mut source: []int = [1, 2, 3]
-    let taken = std.array.take(
-        {
-            events = events * 10 + 1
-            source
-        },
-        {
-            events = events * 10 + 2
-            source[0] = 9
-            @as(uint, 2)
-        }
-    )
+    let taken = std.array.take({
+        events = events * 10 + 1
+        source
+    }, {
+        events = events * 10 + 2
+        source[0] = 9
+        @as(uint, 2)
+    })
     @assert(events == 12 and taken[0] == 1 and source[0] == 9)
     events = 0
-    let dropped = std.array.drop(
-        {
-            events = events * 10 + 1
-            source
-        },
-        {
-            events = events * 10 + 2
-            source[1] = 8
-            @as(uint, 1)
-        }
-    )
+    let dropped = std.array.drop({
+        events = events * 10 + 1
+        source
+    }, {
+        events = events * 10 + 2
+        source[1] = 8
+        @as(uint, 1)
+    })
     @assert(events == 12 and dropped[0] == 2 and source[1] == 8)
 }
 
 let main: () = {
     let numbers: []int = [3, 1, 4, 2]
     @println("Numbers:", numbers)
-    @println(
-        "Last above two:",
-        std.array.findLast(numbers, (value: int) -> bool { value > 2 }).unwrapOr(0)
-    )
+    @println("Last above two:", std.array.findLast(numbers, (value: int) -> bool {
+        value > 2
+    }).unwrapOr(0))
     @println("Take two:", std.array.take(numbers, 2))
     @println("Drop two:", std.array.drop(numbers, 2))
     @println("Take oversized:", std.array.take(numbers, ~@as(uint, 0)))

@@ -103,17 +103,14 @@ let callable_and_argument_source_order: () = {
         events = events * 10 + 1
         std.string.find
     }
-    let result = getFind()(
-        {
-            events = events * 10 + 2
-            source
-        },
-        {
-            events = events * 10 + 3
-            source = "replacement"
-            "😀"
-        }
-    )
+    let result = getFind()({
+        events = events * 10 + 2
+        source
+    }, {
+        events = events * 10 + 3
+        source = "replacement"
+        "😀"
+    })
     @assert(events == 123 and result.unwrapOr(99) == 1)
     @assert(source == "replacement")
     events = 0

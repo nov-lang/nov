@@ -36,19 +36,15 @@ let arrays_slices_blocks_if_and_match: () = {
     let array: @TypeOf([1, 2]) = [3, 4]
     let slice: @TypeOf(source[99..100]) = "safe"
     let text: @TypeOf("λ"[99..100]) = "safe"
-    let block: @TypeOf(
-        {
-            let unused = fail()
-            1
-        }
-    ) = 6
+    let block: @TypeOf({
+        let unused = fail()
+        1
+    }) = 6
     let branch: @TypeOf(if true { 1 } else { fail() }) = 7
-    let matched: @TypeOf(
-        match true {
-            true => 1
-            false => fail()
-        }
-    ) = 8
+    let matched: @TypeOf(match true {
+        true => 1
+        false => fail()
+    }) = 8
     @assert(array[0] == 3 and slice == "safe" and text == "safe")
     @assert(block == 6 and branch == 7 and matched == 8)
 }
@@ -58,13 +54,11 @@ let operands_do_not_execute_or_store: () = {
     let mut count = 0
     let called: @TypeOf(fail()) = 1
     let divided: @TypeOf(1 / 0) = 2
-    let mutated: @TypeOf(
-        {
-            count += 1
-            count = fail()
-            count
-        }
-    ) = 3
+    let mutated: @TypeOf({
+        count += 1
+        count = fail()
+        count
+    }) = 3
     let defaulted: @TypeOf(Record.[]) = Record.[ value = 4 ]
     let constructed: @TypeOf(Record.[ value = fail() ]) = Record.[]
     let converted: @TypeOf("{Record.[]}") = "safe"
@@ -91,20 +85,15 @@ let references_borrows_and_type_only_captures: () = {
     q.* += 1
     @assert(q.* == 6 and callback() == 6)
     let mut reserved = 10
-    update(
-        &reserved,
-        {
-            let queried: @TypeOf(reserved + 1) = 2
-            queried
-        }
-    )
+    update(&reserved, {
+        let queried: @TypeOf(reserved + 1) = 2
+        queried
+    })
     @assert(reserved == 12)
-    let no_loan: @TypeOf(
-        {
-            let borrowed = &reserved
-            borrowed.*
-        }
-    ) = 3
+    let no_loan: @TypeOf({
+        let borrowed = &reserved
+        borrowed.*
+    }) = 3
     reserved += no_loan
     @assert(reserved == 15)
 }
@@ -112,15 +101,10 @@ let references_borrows_and_type_only_captures: () = {
 @[test]
 let closures_and_inferred_generic_calls: () = {
     let mut calls = 0
-    let items: @TypeOf(
-        std.array.map(
-            [1, 2],
-            (value) {
-                calls += 1
-                "item:{value}"
-            }
-        )
-    ) = ["safe"]
+    let items: @TypeOf(std.array.map([1, 2], (value) {
+        calls += 1
+        "item:{value}"
+    })) = ["safe"]
     let generic: @TypeOf(identity(@as(u8, 1))) = 7
     let closure: @TypeOf((value: int) -> int { value + 1 }) = (value) { value + 2 }
     @assert(calls == 0 and items[0] == "safe" and generic == 7 and closure(3) == 5)

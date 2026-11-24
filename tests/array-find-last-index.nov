@@ -44,16 +44,13 @@ let Row = struct {
 let managed_snapshot_and_callback_copies: () = {
     let mut source = [Row.[ values = [[1]] ], Row.[ values = [[2]] ]]
     let mut seen: []int = []
-    let result = findLastIndex(
-        source,
-        (row) {
-            seen += [row.values[0][0]]
-            source = [Row.[ values = [[99]] ]]
-            let mut copy = row
-            copy.values[0] = [88]
-            row.values[0][0] == 1
-        }
-    )
+    let result = findLastIndex(source, (row) {
+        seen += [row.values[0][0]]
+        source = [Row.[ values = [[99]] ]]
+        let mut copy = row
+        copy.values[0] = [88]
+        row.values[0][0] == 1
+    })
     @assert(result.unwrapOr(99) == 0 and seen == [2, 1])
     @assert(source[0].values == [[99]])
     @assert(findLastIndex([[[1]], [[2]]], yes).unwrapOr(99) == 1)

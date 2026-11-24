@@ -70,16 +70,14 @@ let enum_union_and_generic_ordering: () = {
     @assert(@min([.high, Ranked.low]) == Ranked.low)
     let rankedQuery: @TypeOf(@min([.high, Ranked.low])) = .low
     @assert(rankedQuery == Ranked.low)
-    @assert(
-        @max(
-            [.[ key = 1, name = "first", values = [] ], Entry.[ key = 2, name = "second", values = [] ]]
-        ).key == 2
-    )
-    let entryQuery: @TypeOf(
-        @min(
-            [.[ key = 1, name = "first", values = [] ], Entry.[ key = 2, name = "second", values = [] ]]
-        )
-    ) = .[
+    @assert(@max([
+        .[ key = 1, name = "first", values = [] ],
+        Entry.[ key = 2, name = "second", values = [] ]
+    ]).key == 2)
+    let entryQuery: @TypeOf(@min([
+        .[ key = 1, name = "first", values = [] ],
+        Entry.[ key = 2, name = "second", values = [] ]
+    ])) = .[
         key = 0,
         name = "query",
         values = []
@@ -153,13 +151,11 @@ let arguments_are_eager_and_comparisons_run_afterwards: () = {
     @assert(stop() == 7 and events == [1])
     events = []
     let stopArray = () -> int {
-        @min(
-            [
-                make(3),
-                { return 8 },
-                make(4)
-            ]
-        )
+        @min([
+            make(3),
+            { return 8 },
+            make(4)
+        ])
     }
     @assert(stopArray() == 8 and events == [3])
 }

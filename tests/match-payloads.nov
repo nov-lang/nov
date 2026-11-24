@@ -76,12 +76,10 @@ let function_payloads_and_unevaluated_queries: () = {
             calls += 1
             calls
         }]
-    let query: @TypeOf(
-        match payload {
-            .some[callable] => callable()
-            .none => 0
-        }
-    ) = 0
+    let query: @TypeOf(match payload {
+        .some[callable] => callable()
+        .none => 0
+    }) = 0
     @assert(query == 0 and calls == 0)
     let first = match payload {
         .some[callable] => callable()

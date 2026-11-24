@@ -70,12 +70,10 @@ let contextual_constructors_and_single_layer_matches: () = {
         .inner[inner] => inner
         .none => .none[]
     }
-    @assert(
-        match bound {
-            .some[rows] => rows[0][0] == "hello" and @len(rows[1]) == 0
-            .none => false
-        }
-    )
+    @assert(match bound {
+        .some[rows] => rows[0][0] == "hello" and @len(rows[1]) == 0
+        .none => false
+    })
     let optional: Option(Result(int, str)) = .some[.ok[7]]
     let result: Result(Option(int), str) = .ok[.some[8]]
     @assert(optional.unwrapOr(.err["missing"]).unwrapOr(0) == 7)
@@ -100,18 +98,14 @@ let propagation_preserves_each_family_layer: () = {
     @assert(twoOptions(.some[.none[]]).isNone())
     @assert(twoOptions(.none[]).isNone())
     @assert(twoResults(.ok[.ok[4]]).unwrapOr(0) == 5)
-    @assert(
-        match twoResults(.ok[.err["inner"]]) {
-            .ok => false
-            .err[error] => error == "inner"
-        }
-    )
-    @assert(
-        match twoResults(.err["outer"]) {
-            .ok => false
-            .err[error] => error == "outer"
-        }
-    )
+    @assert(match twoResults(.ok[.err["inner"]]) {
+        .ok => false
+        .err[error] => error == "inner"
+    })
+    @assert(match twoResults(.err["outer"]) {
+        .ok => false
+        .err[error] => error == "outer"
+    })
 }
 
 @[test]
@@ -141,12 +135,10 @@ let recursive_array_storage_is_independent: () = {
         .err[rows] => rows
     }
     errors[0] = ["detached"]
-    @assert(
-        match wrapped.unwrapOr(.ok[[]]) {
-            .ok => false
-            .err[rows] => rows[0][0] == "changed"
-        }
-    )
+    @assert(match wrapped.unwrapOr(.ok[[]]) {
+        .ok => false
+        .err[rows] => rows[0][0] == "changed"
+    })
 }
 
 @[test]
@@ -176,18 +168,14 @@ let closure_snapshots_and_shared_cells: () = {
 @[test]
 let mapping_and_search_produce_nested_unions: () = {
     let bad: Result(int, str) = .err["bad"]
-    let mapped: Result(int, Option(int)) = bad.mapErr(
-        (error) {
-            @assert(error == "bad")
-            Option(int).some[3]
-        }
-    )
-    @assert(
-        match mapped {
-            .ok => false
-            .err[inner] => inner.unwrapOr(0) == 3
-        }
-    )
+    let mapped: Result(int, Option(int)) = bad.mapErr((error) {
+        @assert(error == "bad")
+        Option(int).some[3]
+    })
+    @assert(match mapped {
+        .ok => false
+        .err[inner] => inner.unwrapOr(0) == 3
+    })
     let present: Option(int) = .some[4]
     let nested: Option(Result(int, str)) = present.map((value) { Result(int, str).ok[value] })
     @assert(nested.unwrapOr(.err["missing"]).unwrapOr(0) == 4)

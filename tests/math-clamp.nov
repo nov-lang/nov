@@ -45,11 +45,15 @@ let stable_ties_and_independent_managed_results: () = {
     high.items = [[9]]
     @assert(lower.items == [[1]] and value.items == [[2]] and upper.items == [[3]])
     @assert(low.items == [[7]] and middle.items == [[8]] and high.items == [[9]])
-    @assert(
-        clamp(value, Entry.[ key = 2, items = [[4]] ], Entry.[ key = 2, items = [[5]] ]).items == [
-            [2]
-        ]
-    )
+    @assert(clamp(value, Entry.[
+        key = 2,
+        items = [[4]]
+    ], Entry.[
+        key = 2,
+        items = [[5]]
+    ]).items == [
+        [2]
+    ])
 }
 
 let Ranked = enum {

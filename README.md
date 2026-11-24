@@ -588,22 +588,27 @@ branches can stay inline only in value-producing positions, such as an initializ
 operand, argument or returned value, not as standalone statements. An `if` without
 `else` expands. This is a syntactic decision: explicit `void`/omitted function
 results are statements; inferred closure tails are potential returned values.
-Calls stay on one line when their rendered arguments are compact and the entire
-physical line fits within **100 characters** (Unicode scalars), including
-indentation, surrounding code and trailing comments. Existing argument-list
-newlines or a compact closure alone do not force expansion:
+Function argument and parameter lists expand vertically **only when they end in
+a trailing comma**. Without one, list separators stay inline regardless of source
+newlines or line length; comments and multiline expressions retain their necessary
+internal breaks. This also applies to function types, builtins and type calls.
+The formatter preserves commas rather than inserting or removing them:
 
 ```nov
 let valid = std.array.filter(raw, (score) { score >= 0 })
+let explicit = std.array.filter(
+    raw,
+    (score) { score >= 0 },
+)
 ```
 
-Multiline arguments, comments requiring line breaks, or excess width expand the
-call's argument list. The call expands before its compact closure bodies, allowing
-those bodies to remain inline at their new indentation. Compact blocks also expand
-when their whole line exceeds the limit, and conditional branches share that
-width decision. Tokens such as long string literals are never split; unrelated
-long expressions are not wrapped by this call/block-layout rule. Blocks with declarations, multiple statements, comments or
-multiline contents keep their expanded layout.
+Compact blocks still expand when their entire physical line exceeds **100
+characters** (Unicode scalars), including indentation, surrounding code and
+trailing comments. Conditional branches share that width decision. A function
+body can therefore expand while its parameter list stays inline; the trailing
+comma rule takes precedence over width for arguments and parameters. Tokens such
+as long string literals are never split. Blocks with declarations, multiple
+statements, comments or multiline contents keep their expanded layout.
 Both commands accept multiple files and directories:
 
 ```sh

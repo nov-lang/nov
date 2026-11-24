@@ -88,31 +88,25 @@ let callable_constructors_match_and_propagation: () = {
     let bad: Result(Callback, str) = .err["missing"]
     let plain: PlainFnUnion = .function[increment]
     let copy = echo(plain)
-    @assert(
-        match copy {
-            .function[callback] => callback(5) == 6
-            .none => false
-        }
-    )
+    @assert(match copy {
+        .function[callback] => callback(5) == 6
+        .none => false
+    })
     @assert(callOption(some).unwrapOr(0) == 4)
     @assert(callOption(.none[]).isNone())
     @assert(callResult(good).unwrapOr(0) == 5)
-    @assert(
-        match callResult(bad) {
-            .ok => false
-            .err[message] => message == "missing"
-        }
-    )
+    @assert(match callResult(bad) {
+        .ok => false
+        .err[message] => message == "missing"
+    })
     let nested = nestedLayer(.some[good])
-    @assert(
-        match nested {
-            .some[inner] => match inner {
-                .ok[callback] => callback(8) == 9
-                .err => false
-            }
-            .none => false
+    @assert(match nested {
+        .some[inner] => match inner {
+            .ok[callback] => callback(8) == 9
+            .err => false
         }
-    )
+        .none => false
+    })
 }
 
 @[test]
@@ -156,12 +150,10 @@ let creation_snapshots_and_later_copies: () = {
     @assert(callOption(second).unwrapOr(0) == 12)
     let rows: [][]PlainFnUnion = [[.function[increment]], [.none[]]]
     let copied = rows
-    @assert(
-        match copied[0][0] {
-            .function[callback] => callback(2) == 3
-            .none => false
-        }
-    )
+    @assert(match copied[0][0] {
+        .function[callback] => callback(2) == 3
+        .none => false
+    })
 }
 
 @[test]
@@ -219,62 +211,44 @@ let range_copies_exact_bounds_and_inclusive_max: () = {
 
 @[test]
 let find_and_map_function_and_range_results: () = {
-    let found: Option(
-        Callback
-    ) = std.array.find(
-        [increment],
-        (callback: Callback) -> bool { callback(2) == 3 }
-    )
+    let found: Option(Callback) = std.array.find([
+        increment
+    ], (callback: Callback) -> bool { callback(2) == 3 })
     @assert(callOption(found).unwrapOr(0) == 4)
-    let missing: Option(
-        Callback
-    ) = std.array.find(
-        @as([]Callback, []),
-        (callback: Callback) -> bool { true }
-    )
+    let missing: Option(Callback) = std.array.find(@as([]Callback, [
+    ]), (callback: Callback) -> bool { true })
     @assert(missing.isNone())
     let ranges: []IntRange = [@as(int, 1)..4, @as(int, 5)..=6]
     let selected: Option(IntRange) = std.array.find(ranges, (range: IntRange) -> bool { true })
     @assert(sumOption(selected).unwrapOr(0) == 6)
     let plain: []PlainFnUnion = [.none[], .function[increment]]
-    let nested = std.array.find(
-        plain,
-        (value: PlainFnUnion) -> bool {
-            match value {
-                .function => true
-                .none => false
-            }
+    let nested = std.array.find(plain, (value: PlainFnUnion) -> bool {
+        match value {
+            .function => true
+            .none => false
         }
-    )
+    })
     @assert(nested.isSome())
     let source: Option(int) = .some[7]
-    let mapped: Option(Callback) = source.map(
-        (base) {
-            (n: int) -> int { base + n }
-        }
-    )
+    let mapped: Option(Callback) = source.map((base) {
+        (n: int) -> int { base + n }
+    })
     @assert(callOption(mapped).unwrapOr(0) == 10)
     let mappedRange: Option(IntRange) = source.map((base) { base..=base })
     @assert(sumOption(mappedRange).unwrapOr(0) == 7)
     let result: Result(int, str) = .ok[8]
-    let resultFunction = result.map(
-        (base) {
-            (n: int) -> int { base + n }
-        }
-    )
+    let resultFunction = result.map((base) {
+        (n: int) -> int { base + n }
+    })
     @assert(callResult(resultFunction).unwrapOr(0) == 12)
     let error: Result(int, str) = .err["saved"]
-    let errorFunction = error.mapErr(
-        (message) {
-            () -> str { message }
-        }
-    )
-    @assert(
-        match errorFunction {
-            .ok => false
-            .err[callback] => callback() == "saved"
-        }
-    )
+    let errorFunction = error.mapErr((message) {
+        () -> str { message }
+    })
+    @assert(match errorFunction {
+        .ok => false
+        .err[callback] => callback() == "saved"
+    })
     let none: Option(int) = .none[]
     let skipped: Option(Callback) = none.map((base) -> Callback { @panic("inactive map") })
     @assert(skipped.isNone())
@@ -289,9 +263,7 @@ let custom_hooks_nested_helpers_and_inactive_values: () = {
     @assert("{range}" == "range:3")
     @assert("{inactive}" == "empty")
     let nested: []Envelope = [.value[function], .value[range], .value[inactive], .none[]]
-    @assert(
-        "{nested}" == "[Envelope.value[callback:5], Envelope.value[range:3], Envelope.value[empty], Envelope.none]"
-    )
+    @assert("{nested}" == "[Envelope.value[callback:5], Envelope.value[range:3], Envelope.value[empty], Envelope.none]")
 }
 
 let main: () = {

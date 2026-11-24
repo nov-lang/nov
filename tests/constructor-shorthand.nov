@@ -101,10 +101,8 @@ let aliases_and_payloads: () = {
     let ready: int = 42
     let payload: Payload = .item[ .ready ]
     @assert(ready == 42)
-    @assert(
-        match payload {
-            .item[kind] => kind == Kind.ready
-            .none => false
-        }
-    )
+    @assert(match payload {
+        .item[kind] => kind == Kind.ready
+        .none => false
+    })
 }

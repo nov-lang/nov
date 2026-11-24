@@ -54,14 +54,7 @@ let main: () = {
     same.count += 2
     shared.counter.value = 11
     shared.counter.samples[0] = 12
-    @println(
-        "Imported:",
-        shared.count,
-        same.count,
-        shared.counter.value,
-        shared.counter.samples,
-        shared.readSecret()
-    )
+    @println("Imported:", shared.count, same.count, shared.counter.value, shared.counter.samples, shared.readSecret())
 
     let mut total: uint = 0
     loop n in interval {

@@ -73,30 +73,27 @@ let valid_four_byte_boundaries_and_state_reset: () = {
     expectValid([0xF3, 0xBF, 0xBF, 0xBF], "\u{FFFFF}")
     expectValid([0xF4, 0x80, 0x80, 0x80], "\u{100000}")
     expectValid([0xF4, 0x8F, 0xBF, 0xBF], "\u{10FFFF}")
-    expectValid(
-        [
-            0xE0,
-            0xA0,
-            0x80,
-            0xC2,
-            0x80,
-            0xED,
-            0x9F,
-            0xBF,
-            0xDF,
-            0xBF,
-            0xF0,
-            0x90,
-            0x80,
-            0xBF,
-            0xF4,
-            0x8F,
-            0xBF,
-            0x80,
-            0
-        ],
-        "\u{800}\u{80}\u{D7FF}\u{7FF}\u{1003F}\u{10FFC0}\0"
-    )
+    expectValid([
+        0xE0,
+        0xA0,
+        0x80,
+        0xC2,
+        0x80,
+        0xED,
+        0x9F,
+        0xBF,
+        0xDF,
+        0xBF,
+        0xF0,
+        0x90,
+        0x80,
+        0xBF,
+        0xF4,
+        0x8F,
+        0xBF,
+        0x80,
+        0
+    ], "\u{800}\u{80}\u{D7FF}\u{7FF}\u{1003F}\u{10FFC0}\0")
 }
 
 @[test]

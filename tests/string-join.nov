@@ -61,17 +61,14 @@ let retained_result_and_source_unaffected: () = {
 let eager_arguments_once_left_to_right: () = {
     let mut events: int = 0
     let mut parts = ["a", "b"]
-    let joined = std.string.join(
-        {
-            events = events * 10 + 1
-            parts
-        },
-        {
-            events = events * 10 + 2
-            parts[0] = "changed"
-            ":"
-        }
-    )
+    let joined = std.string.join({
+        events = events * 10 + 1
+        parts
+    }, {
+        events = events * 10 + 2
+        parts[0] = "changed"
+        ":"
+    })
     @assert(events == 12 and joined == "a:b" and parts[0] == "changed")
 }
 

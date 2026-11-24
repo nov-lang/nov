@@ -27,7 +27,8 @@ const CompactSpan = struct {
     node: Ast.Node.Index,
     start: usize,
     end: usize,
-    kind: enum { block, call_list, list } = .block,
+    // Calls are width context for legacy lists, never expansion candidates.
+    kind: enum { block, list, call_marker } = .block,
 
     fn lessThan(_: void, a: CompactSpan, b: CompactSpan) bool {
         return if (a.start == b.start) a.end > b.end else a.start < b.start;
@@ -122,22 +123,20 @@ fn renderTreeWithWidth(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixu
         try renderTreeInner(&output, ast, fixups, &expanded, &spans);
         const text = output.written();
         var changed = false;
-        // Calls are recorded after their arguments, so nested spans arrive in
-        // postorder. Sort outer spans first rather than assuming disjointness.
+        // Nested spans arrive in postorder. Consider outer spans first.
         std.mem.sort(CompactSpan, spans.items, {}, CompactSpan.lessThan);
         for (spans.items) |span| {
+            if (span.kind == .call_marker) continue;
             if (std.mem.indexOfScalar(u8, text[span.start..span.end], '\n') != null) {
                 const entry = try expanded.getOrPut(buffer.allocator, span.node);
                 changed = changed or !entry.found_existing;
             }
         }
-        // Stabilize actual multiline arguments before measuring width. Their
-        // enclosing calls may give compact lambdas enough room on a new line.
+        // Stabilize multiline children before measuring physical line widths.
         if (changed) continue;
-        // A source-preserving list can relieve the entire physical line,
-        // including calls outside its span (prototype results and constructor
-        // types, for example). Stabilize those lists before committing any call
-        // width decisions. Lists inside a compact call wait for that call first.
+        // Retain legacy list expansion on overlong lines containing calls,
+        // before measuring blocks at their resulting indentation. Call markers
+        // supply context only: neither width nor child newlines expand them.
         for ([_]bool{ true, false }) |source_lists_first| {
             var lines = std.mem.splitScalar(u8, text, '\n');
             var start: usize = 0;
@@ -155,7 +154,7 @@ fn renderTreeWithWidth(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixu
                     var has_call = false;
                     for (spans.items[first_span..]) |span| {
                         if (span.start >= end) break;
-                        if (span.end > start and span.kind == .call_list) {
+                        if (span.end > start and span.kind == .call_marker) {
                             has_call = true;
                             break;
                         }
@@ -164,17 +163,13 @@ fn renderTreeWithWidth(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixu
                     for (spans.items[first_span..]) |span| {
                         if (span.start >= end) break;
                         if (span.end <= start or span.start < containing_end) continue;
+                        if (span.kind == .call_marker) continue;
                         if (source_lists_first) {
-                            if (!has_call or span.kind == .block) continue;
-                            containing_end = span.end;
-                            if (span.kind == .call_list) continue;
-                        } else {
-                            if (span.kind == .list) continue;
-                            if (has_call and span.kind != .call_list) continue;
-                            // Reconsider nested arguments at their new
-                            // indentation on the next whole-tree pass.
-                            containing_end = span.end;
-                        }
+                            if (!has_call or span.kind != .list) continue;
+                        } else if (span.kind != .block) continue;
+                        // Reconsider nested candidates at their new indentation
+                        // on the next whole-tree pass.
+                        containing_end = span.end;
                         const entry = try expanded.getOrPut(buffer.allocator, span.node);
                         changed = changed or !entry.found_existing;
                     }
@@ -573,19 +568,18 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
             try self.renderExpression(call.ast.fn_expr, .none);
             const open = call.ast.lparen;
             const close = ast.lastToken(node);
-            const multiline = self.expanded.contains(node) or hasComment(ast, open, close);
             const start = self.output.written().len;
-            try self.renderListLayout(open, close, call.ast.args, false, multiline);
-            // Exclude closing-token spacing/comments: an outer statement's
-            // newline is not a multiline argument of this call.
-            try ais.writer().writeAll(tokenSliceForRender(ast, close));
-            if (!multiline and call.ast.args.len != 0) try self.compact_spans.append(self.allocator, .{
+            try self.renderFunctionList(open, close, call.ast.args, false);
+            // Exclude statement spacing/comments from the call's width context.
+            const lexeme = tokenSliceForRender(ast, close);
+            try ais.writer().writeAll(lexeme);
+            try self.compact_spans.append(self.allocator, .{
                 .node = node,
                 .start = start,
                 .end = self.output.written().len,
-                .kind = .call_list,
+                .kind = .call_marker,
             });
-            return self.renderSpace(close, tokenSliceForRender(ast, close).len, space);
+            return self.renderSpace(close, lexeme.len, space);
         },
 
         .array_access,
@@ -723,7 +717,7 @@ fn renderExpressionContext(self: *Render, node: Ast.Node.Index, space: Space, co
                 }
             }
             close -= 1;
-            try self.renderList(node, proto.lparen, close, proto.ast.params, true);
+            try self.renderFunctionList(proto.lparen, close, proto.ast.params, true);
             if (proto.ast.return_type) |result| {
                 try self.renderToken(close, .space);
                 try self.renderToken(close + 1, .space);
@@ -851,6 +845,21 @@ fn recordListSpan(self: *Render, node: Ast.Node.Index, start: usize) Error!void 
         .end = self.output.written().len,
         .kind = .list,
     });
+}
+
+// Only a trailing comma expands function arguments or parameters. Source
+// newlines, multiline children, comments and width do not change that choice.
+fn renderFunctionList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
+    const tags = self.ast.tokens.items(.tag);
+    var previous = close;
+    while (previous > open + 1 and tags[previous - 1] == .newline) : (previous -= 1) {}
+    const multiline = items.len != 0 and tags[previous - 1] == .comma;
+    // Comments still need physical line breaks. Indent those continuations
+    // without forcing unrelated arguments onto separate lines.
+    const indent_comments = !multiline and hasComment(self.ast, open, close);
+    if (indent_comments) try self.ais.pushIndent(.normal);
+    defer if (indent_comments) self.ais.popIndent();
+    try self.renderListLayout(open, close, items, named, multiline);
 }
 
 fn renderListLayout(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool, multiline: bool) RenderError!void {

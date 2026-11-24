@@ -162,11 +162,9 @@ let functions_ranges_and_unions: () = {
     let mut result: Value = .empty[]
     let payload = &result
     payload.* = .count[7]
-    @assert(
-        match payload.* {
-            .count[n] => n == 7
-            .empty => false
-        }
-    )
+    @assert(match payload.* {
+        .count[n] => n == 7
+        .empty => false
+    })
     @assert("{@TypeOf(payload)}" == "&mut Value")
 }

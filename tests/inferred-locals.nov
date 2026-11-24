@@ -16,11 +16,9 @@ let main: () -> void = {
     let original = values
     values[0] += 1
     values += [result]
-    @println(
-        1 + {
-            let inner = result
-            inner
-        }
-    )
+    @println(1 + {
+        let inner = result
+        inner
+    })
     @println(saved, value, original[0], values[0], @len(values), ready)
 }

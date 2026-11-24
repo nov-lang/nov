@@ -9,23 +9,17 @@ let main: () = {
 let order_empty_results_and_callback_count: () = {
     let mut calls = 0
     let mut seen = 0
-    let result = std.array.flatMap(
-        [1, 2, 3],
-        (x) {
-            calls += 1
-            seen = seen * 10 + x
-            if x == 2 { [] } else { [x, x] }
-        }
-    )
+    let result = std.array.flatMap([1, 2, 3], (x) {
+        calls += 1
+        seen = seen * 10 + x
+        if x == 2 { [] } else { [x, x] }
+    })
     @assert(calls == 3 and seen == 123)
     @assert(@len(result) == 4 and result[0] == 1 and result[2] == 3)
-    let empty = std.array.flatMap(
-        @as([]int, []),
-        (x) {
-            calls += 1
-            [x]
-        }
-    )
+    let empty = std.array.flatMap(@as([]int, []), (x) {
+        calls += 1
+        [x]
+    })
     @assert(@len(empty) == 0 and calls == 3)
 }
 
@@ -46,12 +40,14 @@ let flatten_one_layer_and_recursive_independence: () = {
 let storable_outputs_and_shared_closures: () = {
     let words = std.array.flatMap([1, 2], (x) { ["item:{x}"] })
     @assert(words[0] == "item:1" and words[1] == "item:2")
-    let outcomes: []std.Option(
-        []int
-    ) = std.array.flatMap(
-        [1],
-        (x) -> []std.Option([]int) { [std.Option([]int).some[[x]], std.Option([]int).none[]] }
-    )
+    let outcomes: []std.Option([]int) = std.array.flatMap([
+        1
+    ], (x) -> []std.Option([]int) {
+        [
+            std.Option([]int).some[[x]],
+            std.Option([]int).none[]
+        ]
+    })
     @assert(outcomes[0].unwrapOr([])[0] == 1 and outcomes[1].isNone())
     let ranges = std.array.flatMap([1, 2], (x) { [x..x + 2] })
     @assert(@len(ranges[0]) == 2 and @len(ranges[1]) == 2)
@@ -67,13 +63,10 @@ let storable_outputs_and_shared_closures: () = {
 @[test]
 let snapshots_inference_and_queries: () = {
     let mut source = [1, 2]
-    let result = std.array.flatMap(
-        source,
-        (x) {
-            source = [9]
-            [x]
-        }
-    )
+    let result = std.array.flatMap(source, (x) {
+        source = [9]
+        [x]
+    })
     @assert(result[0] == 1 and result[1] == 2 and source[0] == 9)
     let empty: []str = std.array.flatMap([1, 2], (x) { [] })
     @assert(@len(empty) == 0)

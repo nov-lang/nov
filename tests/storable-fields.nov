@@ -139,19 +139,15 @@ let direct_computed_pipe_and_callee_order: () = {
     @assert(select().run(3) == 4 and evaluations == 1)
     let piped = 3 |> processor.run
     @assert(piped == 4)
-    let result = processor.run(
-        {
-            processor.run = double
-            3
-        }
-    )
+    let result = processor.run({
+        processor.run = double
+        3
+    })
     @assert(result == 4 and processor.run(3) == 6)
-    let computed = select().run(
-        {
-            processor.run = increment
-            4
-        }
-    )
+    let computed = select().run({
+        processor.run = increment
+        4
+    })
     @assert(computed == 8 and evaluations == 2)
     @assert(processor.apply(4) == 5)
 

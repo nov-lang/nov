@@ -891,32 +891,32 @@ test "whitespace and additional supported operators are idempotent" {
 }
 
 test "function signatures calls and delimiters are idempotent" {
-    try expectFormatted("let f:(x:int,y:int)->int=x + y\nlet main:()->void=@println(f(1,2,),)\n", "let f: (x: int, y: int) -> int = x + y\nlet main: () -> void = @println(f(1, 2,),)\n");
+    try expectFormatted("let f:(x:int,y:int)->int=x + y\nlet main:()->void=@println(f(1,2,),)\n", "let f: (x: int, y: int) -> int = x + y\nlet main: () -> void = @println(\n    f(\n        1,\n        2,\n    ),\n)\n");
     try expectFormatted("let f:(cb:(int)->int,x:int)->int=cb(x)\n", "let f: (cb: (int) -> int, x: int) -> int = cb(x)\n");
     try expectFormatted("let f:(\n x:int, ; param\n y:int,\n)->int=add(\n x, ; arg\n y,\n)\n", "let f: (\n    x: int, ; param\n    y: int,\n) -> int = add(\n    x, ; arg\n    y,\n)\n");
     try expectFormatted("let f:()->void=@println(\n; empty\n)\n", "let f: () -> void = @println(\n    ; empty\n)\n");
 }
 
-test "calls use actual compact arguments regardless of source newlines under OOM" {
+test "calls normalize source newlines and expand only trailing comma lists under OOM" {
     for ([_][2][:0]const u8{
         .{ "let x=filter(raw,(score){score>=0})", "let x = filter(raw, (score) { score >= 0 })\n" },
         .{ "let valid=filter(raw,(score){score>=0})", "let valid = filter(raw, (score) { score >= 0 })\n" },
         .{ "let valid=filter(\nraw,\n(score){\nscore>=0\n}\n)", "let valid = filter(raw, (score) { score >= 0 })\n" },
-        .{ "let valid=raw.filter(\n(score){\nscore>=0\n},\n)", "let valid = raw.filter((score) { score >= 0 },)\n" },
-        .{ "let x=outer(\ninner(\n1,\n2,\n),\nmap(xs,(x){x+1}),\n)", "let x = outer(inner(1, 2,), map(xs, (x) { x + 1 }),)\n" },
+        .{ "let valid=raw.filter(\n(score){\nscore>=0\n},\n)", "let valid = raw.filter(\n    (score) { score >= 0 },\n)\n" },
+        .{ "let x=outer(\ninner(\n1,\n2,\n),\nmap(xs,(x){x+1}),\n)", "let x = outer(\n    inner(\n        1,\n        2,\n    ),\n    map(xs, (x) { x + 1 }),\n)\n" },
         .{ "let x=f(\n)", "let x = f()\n" },
         .{ "let x=f(g(\n),(){\n})", "let x = f(g(), () {})\n" },
-        .{ "let x=f(1,2,)", "let x = f(1, 2,)\n" },
+        .{ "let x=f(1,2,)", "let x = f(\n    1,\n    2,\n)\n" },
         .{ "let x=f((x:int)->int{x+1})", "let x = f((x: int) -> int { x + 1 })\n" },
-        .{ "let x=f(1 ; before close\n)", "let x = f(\n    1 ; before close\n)\n" },
-        .{ "let x=f(1,) ; tail", "let x = f(1,) ; tail\n" },
+        .{ "let x=f(1 ; before close\n)", "let x = f(1 ; before close\n)\n" },
+        .{ "let x=f(1,) ; tail", "let x = f(\n    1,\n) ; tail\n" },
         .{ "let x=f({x>0},if c {1}else{2},[1,2])", "let x = f({ x > 0 }, if c { 1 } else { 2 }, [1, 2])\n" },
         .{ "let x=f(1) ; trailing\nlet y=g(2)", "let x = f(1) ; trailing\nlet y = g(2)\n" },
         .{ "let x=outer(inner(1),2) ; trailing", "let x = outer(inner(1), 2) ; trailing\n" },
         .{ "let x=f(1, ; argument\n2,)", "let x = f(\n    1, ; argument\n    2,\n)\n" },
-        .{ "let x=f(\n; argument\n1\n)", "let x = f(\n    ; argument\n    1\n)\n" },
+        .{ "let x=f(\n; argument\n1\n)", "let x = f(\n    ; argument\n    1)\n" },
         .{ "let x=f(; empty\n)", "let x = f( ; empty\n)\n" },
-        .{ "let x=outer(inner(1) ; inner tail\n,2)", "let x = outer(\n    inner(1) ; inner tail\n    ,\n    2\n)\n" },
+        .{ "let x=outer(inner(1) ; inner tail\n,2)", "let x = outer(inner(1) ; inner tail\n    , 2)\n" },
     }) |case| {
         errdefer std.debug.print("compact call fixture: {s}\n", .{case[0]});
         try expectFormatted(case[0], case[1]);
@@ -924,25 +924,121 @@ test "calls use actual compact arguments regardless of source newlines under OOM
     }
 }
 
-test "calls expand for actual multiline arguments and preserve expression contexts under OOM" {
+test "calls without trailing commas preserve only internal expression breaks under OOM" {
     for ([_][2][:0]const u8{
-        .{ "let x=f((x){tick(x)\nx})", "let x = f(\n    (x) {\n        tick(x)\n        x\n    }\n)\n" },
-        .{ "let x=f(loop {break 1})", "let x = f(\n    loop {\n        break 1\n    }\n)\n" },
-        .{ "let x=f(loop {})", "let x = f(\n    loop {\n    }\n)\n" },
-        .{ "let x=f(match n {0=>1\n_=>2})", "let x = f(\n    match n {\n        0 => 1\n        _ => 2\n    }\n)\n" },
-        .{ "let x=f([\n1,\n2,\n])", "let x = f(\n    [\n        1,\n        2,\n    ]\n)\n" },
-        .{ "let x=outer(inner([\n1,\n2\n]),(x){x>0})", "let x = outer(\n    inner(\n        [\n            1,\n            2\n        ]\n    ),\n    (x) { x > 0 }\n)\n" },
-        .{ "let x=f((x){x ; body\n})", "let x = f(\n    (x) {\n        x ; body\n    }\n)\n" },
-        .{ "let x=f(a +\n b)", "let x = f(\n    a +\n        b\n)\n" },
+        .{ "let x=f((x){tick(x)\nx})", "let x = f((x) {\n    tick(x)\n    x\n})\n" },
+        .{ "let x=f(loop {break 1})", "let x = f(loop {\n    break 1\n})\n" },
+        .{ "let x=f(loop {})", "let x = f(loop {\n})\n" },
+        .{ "let x=f(match n {0=>1\n_=>2})", "let x = f(match n {\n    0 => 1\n    _ => 2\n})\n" },
+        .{ "let x=f([\n1,\n2,\n])", "let x = f([\n    1,\n    2,\n])\n" },
+        .{ "let x=outer(inner([\n1,\n2\n]),(x){x>0})", "let x = outer(inner([\n    1,\n    2\n]), (x) { x > 0 })\n" },
+        .{ "let x=f((x){x ; body\n})", "let x = f((x) {\n    x ; body\n})\n" },
+        .{ "let x=f(a +\n b)", "let x = f(a +\n    b)\n" },
         .{ "let x=f(a + ; operator\nb,)", "let x = f(\n    a + ; operator\n        b,\n)\n" },
-        .{ "let x=f((x){x +\n 1})", "let x = f(\n    (x) {\n        x +\n            1\n    }\n)\n" },
-        .{ "let x=f((){if c {tick()}})", "let x = f(\n    () {\n        if c {\n            tick()\n        }\n    }\n)\n" },
-        .{ "let x=f(()->void{if c {a()}else{b()}})", "let x = f(\n    () -> void {\n        if c {\n            a()\n        } else {\n            b()\n        }\n    }\n)\n" },
-        .{ "let x=f((c){if c {1}else{2}})", "let x = f(\n    (c) {\n        if c { 1 } else { 2 }\n    }\n)\n" },
+        .{ "let x=f((x){x +\n 1})", "let x = f((x) {\n    x +\n        1\n})\n" },
+        .{ "let x=f((){if c {tick()}})", "let x = f(() {\n    if c {\n        tick()\n    }\n})\n" },
+        .{ "let x=f(()->void{if c {a()}else{b()}})", "let x = f(() -> void {\n    if c {\n        a()\n    } else {\n        b()\n    }\n})\n" },
+        .{ "let x=f((c){if c {1}else{2}})", "let x = f((c) {\n    if c { 1 } else { 2 }\n})\n" },
     }) |case| {
         errdefer std.debug.print("multiline call fixture: {s}\n", .{case[0]});
         try expectFormatted(case[0], case[1]);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
+    }
+}
+
+fn testFunctionListAllocationFailures(allocator: std.mem.Allocator, source: [:0]const u8, expected: []const u8) !void {
+    const rendered = try format(allocator, source);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings(expected, rendered);
+    const terminated = try allocator.dupeSentinel(u8, rendered, 0);
+    defer allocator.free(terminated);
+    try std.testing.expect(sameTokensAndComments(source, terminated));
+    const again = try format(allocator, terminated);
+    defer allocator.free(again);
+    try std.testing.expectEqualStrings(rendered, again);
+}
+
+test "trailing commas alone control all function lists with exact idempotence tokens and OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=f(\n1,\n2\n)", "let x = f(1, 2)\n" },
+        .{ "let x=f(1,)", "let x = f(\n    1,\n)\n" },
+        .{ "let x=@max(1,2,)", "let x = @max(\n    1,\n    2,\n)\n" },
+        .{ "let x=@as(\n[]int,\nxs\n)", "let x = @as([]int, xs)\n" },
+        .{ "let T=Option(\n[]int\n)", "let T = Option([]int)\n" },
+        .{ "let T=Option([]int,)", "let T = Option(\n    []int,\n)\n" },
+        .{ "let x=f(1, ; trailing comma\n; before close\n)", "let x = f(\n    1, ; trailing comma\n    ; before close\n)\n" },
+        .{ "let x=f(1 ; no trailing comma\n; before close\n)", "let x = f(1 ; no trailing comma\n    ; before close\n)\n" },
+        .{ "let x=f(1, ; separator only\n2)", "let x = f(1, ; separator only\n    2)\n" },
+        .{ "let f:(\nx:int,\ny:int\n)->int=x+y", "let f: (x: int, y: int) -> int = x + y\n" },
+        .{ "let f:(x:int,)->int=x", "let f: (\n    x: int,\n) -> int = x\n" },
+        .{ "let F=(\nint,\nstr\n)->bool", "let F = (int, str) -> bool\n" },
+        .{ "let F=(int,)->int", "let F = (\n    int,\n) -> int\n" },
+        .{ "let F=(int, ; trailing type\n)->int", "let F = (\n    int, ; trailing type\n) -> int\n" },
+        .{ "let f=(\nx,\ny:int\n){x+y}", "let f = (x, y: int) { x + y }\n" },
+        .{ "let f=(x,){x}", "let f = (\n    x,\n) { x }\n" },
+        .{ "let f=(x:int,)->int{x}", "let f = (\n    x: int,\n) -> int { x }\n" },
+        .{ "let f=(x, ; trailing inferred\n){x}", "let f = (\n    x, ; trailing inferred\n) { x }\n" },
+        .{ "let f:(x:int, ; separator only\ny:int)->int=x+y", "let f: (x: int, ; separator only\n    y: int) -> int = x + y\n" },
+        .{ "let f:(x:int, ; trailing named\n)->int=x", "let f: (\n    x: int, ; trailing named\n) -> int = x\n" },
+        .{ "let x=f((x){tick(x)\nx},2)", "let x = f((x) {\n    tick(x)\n    x\n}, 2)\n" },
+        .{ "let x=outer(inner(1,),flat(\n2,\n3\n))", "let x = outer(inner(\n    1,\n), flat(2, 3))\n" },
+        .{ "let x=outer(inner(\n1,\n2\n),flat(3,),)", "let x = outer(\n    inner(1, 2),\n    flat(\n        3,\n    ),\n)\n" },
+        .{ "let f:(cb:(int,)->int,)->Option([]int)=make((x,){x},)", "let f: (\n    cb: (\n        int,\n    ) -> int,\n) -> Option([]int) = make(\n    (\n        x,\n    ) { x },\n)\n" },
+        .{ "let F=(\n)->int\nlet f=(\n){1}\nlet x=f(\n)", "let F = () -> int\nlet f = () { 1 }\nlet x = f()\n" },
+    }) |case| {
+        errdefer std.debug.print("trailing comma policy fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
+    }
+}
+
+test "Probe method and Option array type application normalize without trailing commas under OOM" {
+    const source =
+        \\let Probe = struct {
+        \\    key: int,
+        \\    run: (int, int) -> bool,
+        \\
+        \\    @[public]
+        \\    @[operator(.less_than)]
+        \\    let lessThan: (
+        \\        left: Probe,
+        \\        right: Probe
+        \\    ) -> bool = left.run(left.key, right.key) and left.key < right.key
+        \\}
+        \\let outcomes: []std.Option(
+        \\    []int
+        \\) = items
+    ;
+    const expected =
+        \\let Probe = struct {
+        \\    key: int,
+        \\    run: (int, int) -> bool,
+        \\
+        \\    @[public]
+        \\    @[operator(.less_than)]
+        \\    let lessThan: (left: Probe, right: Probe) -> bool = left.run(left.key, right.key) and left.key < right.key
+        \\}
+        \\let outcomes: []std.Option([]int) = items
+        \\
+    ;
+    try testFunctionListAllocationFailures(std.testing.allocator, source, expected);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ source, expected });
+    const comma_method = "let Probe=struct{\nlet lessThan:(left:Probe,right:Probe,)->bool=left.key<right.key\n}";
+    const comma_expected = "let Probe = struct {\n    let lessThan: (\n        left: Probe,\n        right: Probe,\n    ) -> bool = left.key < right.key\n}\n";
+    try testFunctionListAllocationFailures(std.testing.allocator, comma_method, comma_expected);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ comma_method, comma_expected });
+}
+
+test "long function signatures and calls remain inline without trailing commas under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=f(\n" ++ repeatedFormatText("a", 120) ++ ",\n2\n)", "let x = f(" ++ repeatedFormatText("a", 120) ++ ", 2)\n" },
+        .{ "let f:(\n" ++ repeatedFormatText("a", 100) ++ ":int,\ny:int\n)->int=y", "let f: (" ++ repeatedFormatText("a", 100) ++ ": int, y: int) -> int = y\n" },
+        .{ "let f=(\n" ++ repeatedFormatText("a", 100) ++ ":int,\ny:int\n)->int{y}", "let f = (" ++ repeatedFormatText("a", 100) ++ ": int, y: int) -> int {\n    y\n}\n" },
+        .{ "let F=(\n" ++ repeatedFormatText("A", 110) ++ ",\nint\n)->int", "let F = (" ++ repeatedFormatText("A", 110) ++ ", int) -> int\n" },
+    }) |case| {
+        errdefer std.debug.print("long inline list fixture: {s}\n", .{case[0]});
+        try testFunctionListAllocationFailures(std.testing.allocator, case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFunctionListAllocationFailures, .{ case[0], case[1] });
     }
 }
 
@@ -1043,41 +1139,39 @@ fn repeatedFormatText(comptime text: []const u8, comptime count: usize) [text.le
     return bytes;
 }
 
-test "calls measure 100 Unicode scalars including prefix indent suffix and punctuation under OOM" {
+test "call lists ignore width including Unicode prefix indent suffix and punctuation under OOM" {
     for ([_][2][:0]const u8{
         .{ "let x=f(" ++ repeatedFormatText("a", 89) ++ ")", "let x = f(" ++ repeatedFormatText("a", 89) ++ ")\n" },
-        .{ "let x=f(" ++ repeatedFormatText("a", 90) ++ ")", "let x = f(\n    " ++ repeatedFormatText("a", 90) ++ "\n)\n" },
-        .{ "let x=f(" ++ repeatedFormatText("a", 88) ++ ",)", "let x = f(" ++ repeatedFormatText("a", 88) ++ ",)\n" },
+        .{ "let x=f(" ++ repeatedFormatText("a", 90) ++ ")", "let x = f(" ++ repeatedFormatText("a", 90) ++ ")\n" },
+        .{ "let x=f(" ++ repeatedFormatText("a", 88) ++ ",)", "let x = f(\n    " ++ repeatedFormatText("a", 88) ++ ",\n)\n" },
         .{ "let x=f(" ++ repeatedFormatText("a", 89) ++ ",)", "let x = f(\n    " ++ repeatedFormatText("a", 89) ++ ",\n)\n" },
         .{ "let x=f(1)+" ++ repeatedFormatText("a", 85), "let x = f(1) + " ++ repeatedFormatText("a", 85) ++ "\n" },
-        .{ "let x=f(1)+" ++ repeatedFormatText("a", 86), "let x = f(\n    1\n) + " ++ repeatedFormatText("a", 86) ++ "\n" },
+        .{ "let x=f(1)+" ++ repeatedFormatText("a", 86), "let x = f(1) + " ++ repeatedFormatText("a", 86) ++ "\n" },
         .{ "let x=f(1); " ++ repeatedFormatText("c", 85), "let x = f(1) ; " ++ repeatedFormatText("c", 85) ++ "\n" },
-        .{ "let x=f(1); " ++ repeatedFormatText("c", 86), "let x = f(\n    1\n) ; " ++ repeatedFormatText("c", 86) ++ "\n" },
+        .{ "let x=f(1); " ++ repeatedFormatText("c", 86), "let x = f(1) ; " ++ repeatedFormatText("c", 86) ++ "\n" },
         .{ "let f:()={let x=f(" ++ repeatedFormatText("a", 85) ++ ")\nuse(x)}", "let f: () = {\n    let x = f(" ++ repeatedFormatText("a", 85) ++ ")\n    use(x)\n}\n" },
-        .{ "let f:()={let x=f(" ++ repeatedFormatText("a", 86) ++ ")\nuse(x)}", "let f: () = {\n    let x = f(\n        " ++ repeatedFormatText("a", 86) ++ "\n    )\n    use(x)\n}\n" },
+        .{ "let f:()={let x=f(" ++ repeatedFormatText("a", 86) ++ ")\nuse(x)}", "let f: () = {\n    let x = f(" ++ repeatedFormatText("a", 86) ++ ")\n    use(x)\n}\n" },
         .{ "let x=f(\"" ++ repeatedFormatText("é😀", 43) ++ "e\")", "let x = f(\"" ++ repeatedFormatText("é😀", 43) ++ "e\")\n" },
-        .{ "let x=f(\"" ++ repeatedFormatText("é😀", 44) ++ "\")", "let x = f(\n    \"" ++ repeatedFormatText("é😀", 44) ++ "\"\n)\n" },
+        .{ "let x=f(\"" ++ repeatedFormatText("é😀", 44) ++ "\")", "let x = f(\"" ++ repeatedFormatText("é😀", 44) ++ "\")\n" },
         .{ "let x=f(1); " ++ repeatedFormatText("é😀", 42) ++ "e", "let x = f(1) ; " ++ repeatedFormatText("é😀", 42) ++ "e\n" },
-        .{ "let x=f(1); " ++ repeatedFormatText("é😀", 43), "let x = f(\n    1\n) ; " ++ repeatedFormatText("é😀", 43) ++ "\n" },
+        .{ "let x=f(1); " ++ repeatedFormatText("é😀", 43), "let x = f(1) ; " ++ repeatedFormatText("é😀", 43) ++ "\n" },
     }) |case| {
-        errdefer std.debug.print("call physical line width fixture: {s}\n", .{case[0]});
+        errdefer std.debug.print("width independent call fixture: {s}\n", .{case[0]});
         try expectFormatted(case[0], case[1]);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
     }
 }
 
-test "calls expand outer containers before compact lambdas and nested calls under OOM" {
+test "inline calls retain independent block width expansion under OOM" {
     for ([_][2][:0]const u8{
         .{ "let " ++ repeatedFormatText("a", 81) ++ "=f((x){x})", "let " ++ repeatedFormatText("a", 81) ++ " = f((x) { x })\n" },
-        .{ "let " ++ repeatedFormatText("a", 82) ++ "=f((x){x})", "let " ++ repeatedFormatText("a", 82) ++ " = f(\n    (x) { x }\n)\n" },
+        .{ "let " ++ repeatedFormatText("a", 82) ++ "=f((x){x})", "let " ++ repeatedFormatText("a", 82) ++ " = f((x) {\n    x\n})\n" },
         .{ "let x=f(g(" ++ repeatedFormatText("a", 86) ++ "))", "let x = f(g(" ++ repeatedFormatText("a", 86) ++ "))\n" },
-        .{ "let x=f(g(" ++ repeatedFormatText("a", 87) ++ "))", "let x = f(\n    g(" ++ repeatedFormatText("a", 87) ++ ")\n)\n" },
-        .{ "let x=f(g(" ++ repeatedFormatText("a", 94) ++ "))", "let x = f(\n    g(\n        " ++ repeatedFormatText("a", 94) ++ "\n    )\n)\n" },
-        .{ "let x=[f(" ++ repeatedFormatText("a", 87) ++ ")]", "let x = [f(" ++ repeatedFormatText("a", 87) ++ ")]\n" },
-        .{ "let x=[f(" ++ repeatedFormatText("a", 88) ++ ")]", "let x = [\n    f(" ++ repeatedFormatText("a", 88) ++ ")\n]\n" },
-        .{ "let x=f([g(" ++ repeatedFormatText("a", 88) ++ ")])", "let x = f(\n    [g(" ++ repeatedFormatText("a", 88) ++ ")]\n)\n" },
-        .{ "let x=f({g(" ++ repeatedFormatText("a", 86) ++ ")})", "let x = f(\n    { g(" ++ repeatedFormatText("a", 86) ++ ") }\n)\n" },
-        .{ "let x=f((x){" ++ repeatedFormatText("a", 90) ++ "})", "let x = f(\n    (x) {\n        " ++ repeatedFormatText("a", 90) ++ "\n    }\n)\n" },
+        .{ "let x=f(g(" ++ repeatedFormatText("a", 87) ++ "))", "let x = f(g(" ++ repeatedFormatText("a", 87) ++ "))\n" },
+        .{ "let x=f(g(" ++ repeatedFormatText("a", 94) ++ "))", "let x = f(g(" ++ repeatedFormatText("a", 94) ++ "))\n" },
+
+        .{ "let x=f({g(" ++ repeatedFormatText("a", 86) ++ ")})", "let x = f({\n    g(" ++ repeatedFormatText("a", 86) ++ ")\n})\n" },
+        .{ "let x=f((x){" ++ repeatedFormatText("a", 90) ++ "})", "let x = f((x) {\n    " ++ repeatedFormatText("a", 90) ++ "\n})\n" },
         .{ "let x=f(1,g((x){x}),2) ; tail", "let x = f(1, g((x) { x }), 2) ; tail\n" },
     }) |case| {
         errdefer std.debug.print("call containment fixture: {s}\n", .{case[0]});
@@ -1086,7 +1180,19 @@ test "calls expand outer containers before compact lambdas and nested calls unde
     }
 }
 
-test "prototype and constructor width decisions preserve compact sibling type calls under OOM" {
+test "array width policy remains independent of inline function lists under OOM" {
+    for ([_][2][:0]const u8{
+        .{ "let x=[f(" ++ repeatedFormatText("a", 87) ++ ")]", "let x = [f(" ++ repeatedFormatText("a", 87) ++ ")]\n" },
+        .{ "let x=[f(" ++ repeatedFormatText("a", 88) ++ ")]", "let x = [\n    f(" ++ repeatedFormatText("a", 88) ++ ")\n]\n" },
+        .{ "let x=f([g(" ++ repeatedFormatText("a", 88) ++ ")])", "let x = f([\n    g(" ++ repeatedFormatText("a", 88) ++ ")\n])\n" },
+    }) |case| {
+        errdefer std.debug.print("unchanged array policy fixture: {s}\n", .{case[0]});
+        try expectFormatted(case[0], case[1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{case[0]});
+    }
+}
+
+test "Hidden signatures and sibling type calls without trailing commas stay inline under OOM" {
     const source =
         \\let Hidden: (T: type) -> type = struct {
         \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U).[ value = convert(self.value) ]
@@ -1094,10 +1200,7 @@ test "prototype and constructor width decisions preserve compact sibling type ca
     ;
     try expectFormatted(source,
         \\let Hidden: (T: type) -> type = struct {
-        \\    let map: (
-        \\        self: Hidden(T),
-        \\        convert: (T) -> `U
-        \\    ) -> Hidden(`U) = Hidden(`U).[
+        \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U).[
         \\        value = convert(self.value)
         \\    ]
         \\}
@@ -1106,10 +1209,39 @@ test "prototype and constructor width decisions preserve compact sibling type ca
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
+test "function definitions expand their body before a fitting signature under OOM" {
+    const expected = "let replace: (text: str, pattern: str, replacement: str) -> str = {\n    join(split(text, pattern), replacement)\n}\n";
+    for ([_][:0]const u8{
+        "let replace:(text:str,pattern:str,replacement:str)->str={join(split(text,pattern),replacement)}",
+        "let replace:(\ntext:str,\npattern:str,\nreplacement:str\n)->str={join(split(text,pattern),replacement)}",
+        "let replace:(text:str,pattern:str,replacement:str)->str={\njoin(split(text,pattern),replacement)\n}",
+    }) |source| {
+        try expectFormatted(source, expected);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+    const closure = "let replace=(text:str,pattern:str,replacement:str)->str{join(split(text,pattern),replacement)}";
+    try expectFormatted(closure, "let replace = (text: str, pattern: str, replacement: str) -> str {\n    join(split(text, pattern), replacement)\n}\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{closure});
+}
+
+test "function body layout retains the whole line width boundary under OOM" {
+    const prefix = "let f: (x: int) -> int = { ";
+    const count = 100 - prefix.len - " }".len;
+    const exact = prefix ++ repeatedFormatText("a", count) ++ " }\n";
+    try std.testing.expectEqual(@as(usize, 100), exact.len - 1);
+    const source = "let f:(x:int)->int={" ++ repeatedFormatText("a", count) ++ "}";
+    const longer = "let f:(x:int)->int={" ++ repeatedFormatText("a", count + 1) ++ "}";
+    try expectFormatted(source, exact);
+    try expectFormatted(longer, "let f: (x: int) -> int = {\n    " ++ repeatedFormatText("a", count + 1) ++ "\n}\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{longer});
+    try expectFormatted("let f:(\nx:int, ; parameter\ny:int\n)->int={x+y}", "let f: (x: int, ; parameter\n    y: int) -> int = { x + y }\n");
+}
+
 test "calls normalize bounded deep nesting exactly and survive allocation failures" {
     for ([_][2][:0]const u8{
         .{ "let x=" ++ repeatedFormatText("f(\n", 30) ++ "1" ++ repeatedFormatText("\n)", 30), "let x = " ++ repeatedFormatText("f(", 30) ++ "1" ++ repeatedFormatText(")", 30) ++ "\n" },
-        .{ "let x=" ++ repeatedFormatText("f(", 31) ++ "1" ++ repeatedFormatText(")", 31), "let x = f(\n    " ++ repeatedFormatText("f(", 30) ++ "1" ++ repeatedFormatText(")", 30) ++ "\n)\n" },
+        .{ "let x=" ++ repeatedFormatText("f(", 31) ++ "1" ++ repeatedFormatText(")", 31), "let x = " ++ repeatedFormatText("f(", 31) ++ "1" ++ repeatedFormatText(")", 31) ++ "\n" },
     }) |case| {
         errdefer std.debug.print("nested call stress fixture: {s}\n", .{case[0]});
         try expectFormatted(case[0], case[1]);
@@ -1178,13 +1310,13 @@ test "single statement blocks retain nested blocks and control flow" {
 test "compact blocks nested in lists stabilize on the first pass" {
     try expectFormatted("let value=call({x>y})", "let value = call({ x > y })\n");
     try expectFormatted("let value=[{x>y},{false}]", "let value = [\n    { x > y },\n    { false }\n]\n");
-    try expectFormatted("let value=call([{1}])", "let value = call(\n    [\n        { 1 }\n    ]\n)\n");
+    try expectFormatted("let value=call([{1}])", "let value = call([\n    { 1 }\n])\n");
     try expectFormatted("let value=[call({1})]", "let value = [\n    call({ 1 })\n]\n");
     try expectFormatted("let value=items[{1}]", "let value = items[\n    { 1 }]\n");
 }
 
 test "nested list expansion and empty block comments stabilize on the first pass" {
-    try expectFormatted("let f:()->void=@println({let x:int=1\nx})\n", "let f: () -> void = @println(\n    {\n        let x: int = 1\n        x\n    }\n)\n");
+    try expectFormatted("let f:()->void=@println({let x:int=1\nx})\n", "let f: () -> void = @println({\n    let x: int = 1\n    x\n})\n");
     try expectFormatted("let f:()->void={\n; empty body\n}\n", "let f: () -> void = {\n    ; empty body\n}\n");
     try expectFormatted("let f:()->void={}\nlet g:(int,int)->int=call(1,2)\n", "let f: () -> void = {}\nlet g: (int, int) -> int = call(1, 2)\n");
     for ([_][:0]const u8{

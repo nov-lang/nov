@@ -70,12 +70,10 @@ let plain_nominal_and_static: () = {
 @[test]
 let byvalue_receiver_snapshot: () = {
     let mut box = Box([]str).[ value = ["before"] ]
-    let saved: Box([]str) = box.map(
-        {
-            box.value[0] = "after"
-            identity
-        }
-    )
+    let saved: Box([]str) = box.map({
+        box.value[0] = "after"
+        identity
+    })
     @assert(saved.value[0] == "before")
     @assert(box.value[0] == "after")
 }

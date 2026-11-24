@@ -62,13 +62,11 @@ let call_order: () = {
         1
     ]
     let copy = r
-    let result = r.0(
-        {
-            r.0 = (suffix: str) -> str { "replacement" + suffix }
-            r.1 = 9
-            "?" + "!"
-        }
-    )
+    let result = r.0({
+        r.0 = (suffix: str) -> str { "replacement" + suffix }
+        r.1 = 9
+        "?" + "!"
+    })
     @assert(result == "saved!?!" and count == 1 and r.1 == 9)
     @assert(copy.0("x") == "saved!x" and count == 2)
     @assert(r.0("y") == "replacementy" and count == 2)
@@ -107,12 +105,10 @@ let mutation_and_type_queries: () = {
     @assert(pair.0 == 15 and pair.1 == 88)
     let mut effects: int = 0
     let readonly = pair
-    let queried: @TypeOf(
-        {
-            effects += 1
-            readonly.0
-        }
-    ) = 7
+    let queried: @TypeOf({
+        effects += 1
+        readonly.0
+    }) = 7
     @assert(queried == 7 and effects == 0 and readonly.0 == 15)
     let mut arrays = .[ [1, 2], 3 ]
     arrays.0[0] += {

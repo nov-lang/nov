@@ -105,15 +105,12 @@ let find_payload_types_and_recursive_copies: () = {
     let colors: []Color = [.blue, .red]
     @assert(std.array.find(colors, yes).unwrapOr(.red) == .blue)
     let mut source = [Row.[ values = [[1, 2], [3]] ]]
-    let found = std.array.find(
-        source,
-        (value: Row) -> bool {
-            let mut copy = value
-            copy.values = [[8]]
-            source[0] = Row.[ values = [[9]] ]
-            true
-        }
-    )
+    let found = std.array.find(source, (value: Row) -> bool {
+        let mut copy = value
+        copy.values = [[8]]
+        source[0] = Row.[ values = [[9]] ]
+        true
+    })
     let mut row = found.unwrapOr(Row.[ values = [] ])
     @assert(row.values[0][0] == 1 and @len(row.values[0]) == 2)
     row.values = [[7]]
@@ -131,12 +128,9 @@ let function_elements_and_other_index_types: () = {
     let functions: []() -> int = [next, next, next]
     let index = std.array.findIndex(functions, (value: () -> int) -> bool { value() == 2 })
     @assert(index.unwrapOr(99) == 1 and count == 2)
-    std.array.each(
-        functions,
-        (value: () -> int) -> void {
-            let result = value()
-        }
-    )
+    std.array.each(functions, (value: () -> int) -> void {
+        let result = value()
+    })
     @assert(count == 5 and next() == 6)
     let yes = (value: `T) -> bool { true }
     @assert(std.array.findIndex(@as([][]int, [[1], [2]]), yes).unwrapOr(99) == 0)
@@ -153,38 +147,32 @@ let eager_arguments_and_mutation_snapshots: () = {
         events = events * 10 + 1
         std.array.findIndex
     }
-    let index = getIndex()(
-        {
-            events = events * 10 + 2
-            source
-        },
-        {
-            events = events * 10 + 3
-            source[0] = 9
-            (value: int) -> bool {
-                events = events * 10 + value
-                source[1] = 8
-                value == 2
-            }
+    let index = getIndex()({
+        events = events * 10 + 2
+        source
+    }, {
+        events = events * 10 + 3
+        source[0] = 9
+        (value: int) -> bool {
+            events = events * 10 + value
+            source[1] = 8
+            value == 2
         }
-    )
+    })
     @assert(events == 12312 and index.unwrapOr(99) == 1)
     @assert(source[0] == 9 and source[1] == 8)
     events = 0
-    std.array.each(
-        {
-            events = events * 10 + 1
-            source
-        },
-        {
-            events = events * 10 + 2
-            source[0] = 7
-            (value: int) -> void {
-                events = events * 10 + value
-                source[1] = 6
-            }
+    std.array.each({
+        events = events * 10 + 1
+        source
+    }, {
+        events = events * 10 + 2
+        source[0] = 7
+        (value: int) -> void {
+            events = events * 10 + value
+            source[1] = 6
         }
-    )
+    })
     @assert(events == 1298 and source[0] == 7 and source[1] == 6)
 }
 
@@ -207,13 +195,10 @@ let empty_arguments_are_still_eager: () = {
     events = 0
     @assert(std.array.findIndex(items(), predicate()).isNone() and events == 12)
     events = 0
-    std.array.each(
-        items(),
-        {
-            events = events * 10 + 2
-            (value: int) -> void { @panic("empty callback") }
-        }
-    )
+    std.array.each(items(), {
+        events = events * 10 + 2
+        (value: int) -> void { @panic("empty callback") }
+    })
     @assert(events == 12)
 }
 
