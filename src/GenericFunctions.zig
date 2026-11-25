@@ -14,6 +14,8 @@ pub const max_terms = 8192;
 pub const max_depth = 128;
 pub const max_specialization_depth = 64;
 pub const max_specializations = 1024;
+/// Frozen globals carry declaration identity; a null identity always denotes a lexical value.
+pub const ValueBinding = struct { name: []const u8, ty: Ir.TypeId, global: ?Module.DeclId = null, mutable: bool = false, template: ?Ref = null };
 pub const Capture = struct { name: []const u8, ty: Ir.TypeId, template: ?Ref = null, mutable: bool = false };
 pub const LocalTemplate = struct {
     proto: Ast.Node.Index,
@@ -143,12 +145,13 @@ const Structural = struct { names: []const []const u8, fields: []const *Term, po
 const Nominal = struct { module: *Module, id: Module.DeclId, args: []const *Term };
 const Function = struct { params: []const *Term, result: *Term };
 const Variable = struct { name: []const u8, term: *Term };
-const Local = struct { name: []const u8, term: *Term, template: ?Ref = null, mutable: bool = false, query_global: bool = false };
+const Local = struct { name: []const u8, term: *Term, template: ?Ref = null, mutable: bool = false, global: ?Module.DeclId = null };
 const Loop = struct { result: *Term, has_break: bool = false, has_continue: bool = false, allows_value: bool };
 const Frame = struct {
     ref: Ref,
     variables: []const Variable,
     locals: std.ArrayList(Local) = .empty,
+
     result: *Term,
     container: ?Nominal = null,
     loop: ?*Loop = null,
@@ -1192,11 +1195,11 @@ test "backtick generic function specialization allocation failures" {
 
 /// Check an expression using only a snapshot of lexical type metadata. No
 /// semantic demands, runtime captures, loans, stores, or specializations occur.
-pub fn queryExpression(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Module.TypeBinding, values: []const Module.TypeBinding, captures: []const Capture) Ir.BuildError!?Ir.TypeId {
+pub fn queryExpression(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Module.TypeBinding, values: []const ValueBinding, captures: []const Capture) Ir.BuildError!?Ir.TypeId {
     return queryExpressionInScope(module, ir, node, bindings, values, captures, null);
 }
 
-pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Module.TypeBinding, values: []const Module.TypeBinding, captures: []const Capture, scope: ?Ref) Ir.BuildError!?Ir.TypeId {
+pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Module.TypeBinding, values: []const ValueBinding, captures: []const Capture, scope: ?Ref) Ir.BuildError!?Ir.TypeId {
     const span = module.tokenSpan(module.source.ast.firstToken(node));
     if (module.expression_query_depth == max_depth) {
         try module.diagnostics.append(module.allocator, .{ .tag = .type_query_limit, .span = span });
@@ -1223,11 +1226,11 @@ pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bi
         frame.variables = variables;
     }
     for (values) |value| {
-        const declaration = if (module.lookup(value.name)) |id| module.getDeclaration(id) else null;
+        const declaration = if (value.global) |id| module.getDeclaration(id) else null;
         // A published specialization is not the type of its generic template.
         // Keep resolving that name through callTarget with fresh variables.
         if (declaration) |decl| if (decl.is_generic_function) continue;
-        try frame.locals.append(solver.allocator, .{ .name = value.name, .term = try solver.fromType(value.ty, span, 0), .query_global = declaration != null, .mutable = if (declaration) |decl| module.source.ast.decl(decl.node).ast.is_mutable else false });
+        try frame.locals.append(solver.allocator, .{ .name = value.name, .term = try solver.fromType(value.ty, span, 0), .global = value.global, .template = value.template, .mutable = if (declaration) |decl| module.source.ast.decl(decl.node).ast.is_mutable else value.mutable });
     }
     for (captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, span, 0), .template = capture.template, .mutable = capture.mutable });
     const result = try solver.expression(&frame, node, 0);
@@ -1239,6 +1242,85 @@ pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bi
         return null;
     }
     return solver.materialize(result, 0);
+}
+
+fn testQueryShadowingIdentity(allocator: std.mem.Allocator) !void {
+    const cases = [_]struct { expression: []const u8, global: bool = false, mutable: bool = false, expected: ?Module.Diagnostic.Tag = null, boolean: bool = false }{
+        .{ .expression = "id", .boolean = true },
+        .{ .expression = "id(true)", .expected = .not_callable },
+        .{ .expression = "id(true)", .global = true, .boolean = true },
+        .{ .expression = "{g=2}", .expected = .immutable_assignment },
+        .{ .expression = "{g=2}", .mutable = true },
+        .{ .expression = "{g=2}", .global = true },
+        .{ .expression = "{let g=true\ng}", .global = true, .boolean = true },
+        .{ .expression = "{let g=1\nlet g=2\ng}", .expected = .duplicate_name },
+        .{ .expression = "{let int=1\nint}", .expected = .unsupported_shadowing },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(allocator, "let mut g:int=1\nlet id:(x:`T)->`T=x\nlet query={s}", .{case.expression});
+        defer allocator.free(source);
+        var module = try Module.init(allocator, "query-identity.nov", source);
+        defer module.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var ir = Ir.init(allocator);
+        defer ir.deinit();
+        ir.source_len = @intCast(source.len);
+        const integer = try BodyChecker.defaultIntegerType(&ir);
+        const boolean = try ir.internType(.boolean);
+        const id = module.lookup("id").?;
+        const g = module.lookup("g").?;
+        const values = [_]ValueBinding{
+            .{ .name = "g", .ty = integer, .global = if (case.global) g else null, .mutable = case.mutable },
+            .{ .name = "id", .ty = boolean, .global = if (case.global) id else null },
+        };
+        const node = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast.init_node;
+        const result = try queryExpression(&module, &ir, node, &.{}, &values, &.{});
+        errdefer std.debug.print("query identity {s}: {any}\n", .{ case.expression, module.diagnostics.items });
+        if (case.expected) |tag| {
+            try std.testing.expectEqual(@as(?Ir.TypeId, null), result);
+            try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+        } else {
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expectEqual(if (case.boolean) boolean else try ir.internType(.void), result.?);
+        }
+    }
+}
+
+test "query shadowing uses explicit global identity and lexical capabilities under OOM" {
+    try testQueryShadowingIdentity(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testQueryShadowingIdentity, .{});
+}
+
+fn testQueryNamespaceShadowing(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root_source = try comp.addSource("/query-shadow/main.nov", "let api=@import(\"api.nov\")\nlet query={let api=.[nested=.[id=(x:bool)->bool{!x}]]\napi.nested.id(true)}");
+    const middle = try comp.addSource("/query-shadow/api.nov", "@[public]\nlet nested=@import(\"leaf.nov\")");
+    const leaf = try comp.addSource("/query-shadow/leaf.nov", "@[public]\nlet id:(x:bool)->int=1");
+    const module = comp.getModule(root_source).?;
+    for ([_]struct { source: @import("Source.zig").Id, name: []const u8, target: @import("Source.zig").Id }{
+        .{ .source = root_source, .name = "api", .target = middle },
+        .{ .source = middle, .name = "nested", .target = leaf },
+    }) |edge| {
+        const owner = comp.getModule(edge.source).?;
+        const id = owner.lookup(edge.name).?;
+        try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = edge.source, .local = id }).?, .target = edge.target, .named = false, .span = owner.getDeclaration(id).?.name_span });
+    }
+    for (comp.modules.items) |owner| try owner.classifyAliases();
+    const node = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast.init_node;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = module.source.ast.fullBlock(&buffer, node).?.ast.statements;
+    const callee = module.source.ast.fullCall(statements[statements.len - 1]).?.ast.fn_expr;
+    try std.testing.expect(comp.reference(module, callee) != null);
+    const result = try queryExpression(module, &comp.ir, node, &.{}, &.{}, &.{});
+    if (result == null) std.debug.print("namespace shadowing: {any}\n", .{module.diagnostics.items});
+    try std.testing.expectEqual(@as(?Ir.TypeId, try comp.ir.internType(.boolean)), result);
+    try std.testing.expect(!comp.hasErrors());
+}
+
+test "query shadowing resolves nested lexical fields instead of imported functions under OOM" {
+    try testQueryNamespaceShadowing(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testQueryNamespaceShadowing, .{});
 }
 
 fn testReferenceFieldQueries(allocator: std.mem.Allocator) !void {
@@ -2665,7 +2747,15 @@ const Solver = struct {
         while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
         if (ast.nodes.items(.tag)[base] != .identifier) return null;
         const name = ast.tokenSlice(ast.firstToken(base));
-        for (frame.locals.items) |local| if (!local.query_global and std.mem.eql(u8, local.name, name)) return null;
+        var i = frame.locals.items.len;
+        while (i != 0) {
+            i -= 1;
+            const local = frame.locals.items[i];
+            if (!std.mem.eql(u8, local.name, name)) continue;
+            const id = local.global orelse return null;
+            if (base == node) return .{ .module = module, .id = id };
+            break;
+        }
         if (module.compilation) |comp| {
             const ref = comp.reference(module, node) orelse return null;
             return .{ .module = comp.getModule(ref.source).?, .id = ref.local };
@@ -3368,12 +3458,63 @@ const Solver = struct {
         return true;
     }
 
+    fn lexicalRoot(frame: *Frame, node: Ast.Node.Index) bool {
+        const ast = &frame.ref.module.source.ast;
+        var base = node;
+        while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+        if (ast.nodes.items(.tag)[base] != .identifier) return false;
+        const name = ast.tokenSlice(ast.firstToken(base));
+        if (primitives.isPrimitive(name)) return false;
+        var i = frame.locals.items.len;
+        while (i != 0) {
+            i -= 1;
+            const local = frame.locals.items[i];
+            if (std.mem.eql(u8, local.name, name)) return local.global == null;
+        }
+        return false;
+    }
+
+    fn containerTypeRoot(frame: *Frame, node: Ast.Node.Index) bool {
+        const container = frame.container orelse return false;
+        const ast = &frame.ref.module.source.ast;
+        var base = node;
+        while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+        if (ast.nodes.items(.tag)[base] != .identifier) return false;
+        const name = ast.tokenSlice(ast.firstToken(base));
+        const owner_ast = &container.module.source.ast;
+        const declaration = container.module.getDeclaration(container.id).?;
+        const full = owner_ast.decl(declaration.node).ast;
+        if (declaration.is_generic) {
+            var params = owner_ast.fullFnProto(full.type_node).?.iterate(owner_ast);
+            while (params.next()) |param| if (std.mem.eql(u8, owner_ast.tokenSlice(param.name_token.?), name)) return true;
+        }
+        for (owner_ast.fullStruct(full.init_node).?) |member| {
+            if (TypeResolver.isThisAlias(owner_ast, member) and std.mem.eql(u8, owner_ast.tokenSlice(owner_ast.decl(member).ast.let_token + 1), name)) return true;
+        }
+        return false;
+    }
+
+    fn validateBindingName(self: *Solver, frame: *Frame, token: Ast.TokenIndex, scope: usize) Ir.BuildError!void {
+        const module = frame.ref.module;
+        const name = module.source.ast.tokenSlice(token);
+        const span = module.tokenSpan(token);
+        if (primitives.isPrimitive(name)) return self.fail(.unsupported_shadowing, span, null);
+        if (std.mem.startsWith(u8, name, "@\"")) return self.fail(.unsupported_name, span, null);
+        for (frame.locals.items[scope..]) |local| if (std.mem.eql(u8, local.name, name)) return self.fail(.duplicate_name, span, local.term.span);
+    }
+
     fn typeNode(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
         const module = frame.ref.module;
         const ast = &module.source.ast;
         const span = module.tokenSpan(ast.firstToken(node));
         if (depth >= max_depth) {
             try self.fail(.generic_function_limit, self.call_span, span);
+            return self.term(.unknown, span);
+        }
+        if (((ast.nodes.items(.tag)[node] == .identifier or ast.nodes.items(.tag)[node] == .field_access) and lexicalRoot(frame, node)) or
+            (ast.nodes.items(.tag)[node] == .field_access and containerTypeRoot(frame, node)))
+        {
+            try self.fail(.not_a_type, span, null);
             return self.term(.unknown, span);
         }
         switch (ast.nodes.items(.tag)[node]) {
@@ -3383,16 +3524,16 @@ const Solver = struct {
                 const owner_ast = &container.module.source.ast;
                 const owner_decl = container.module.getDeclaration(container.id).?;
                 const full = owner_ast.decl(owner_decl.node).ast;
+                for (owner_ast.fullStruct(full.init_node).?) |member| {
+                    if (!TypeResolver.isThisAlias(owner_ast, member)) continue;
+                    if (std.mem.eql(u8, owner_ast.tokenSlice(owner_ast.decl(member).ast.let_token + 1), name)) return self.term(.{ .nominal = container }, span);
+                }
                 if (owner_decl.is_generic) {
                     var iterator = owner_ast.fullFnProto(full.type_node).?.iterate(owner_ast);
                     for (container.args) |arg| {
                         const param = iterator.next().?;
                         if (std.mem.eql(u8, owner_ast.tokenSlice(param.name_token.?), name)) return arg;
                     }
-                }
-                for (owner_ast.fullStruct(full.init_node).?) |member| {
-                    if (!TypeResolver.isThisAlias(owner_ast, member)) continue;
-                    if (std.mem.eql(u8, owner_ast.tokenSlice(owner_ast.decl(member).ast.let_token + 1), name)) return self.term(.{ .nominal = container }, span);
                 }
             },
             .type_variable => {
@@ -3464,6 +3605,10 @@ const Solver = struct {
                     return self.expression(frame, operand, depth + 1);
                 }
                 if (frame.container != null and call.ast.args.len == 0 and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return self.term(.{ .nominal = frame.container.? }, span);
+                if (lexicalRoot(frame, call.ast.fn_expr) or containerTypeRoot(frame, call.ast.fn_expr)) {
+                    try self.fail(.not_a_generic, span, null);
+                    return self.term(.unknown, span);
+                }
                 if (TypeResolver.genericReference(module, call.ast.fn_expr)) |ref| {
                     const owner = if (module.compilation) |comp| comp.getModule(ref.source).? else module;
                     const declaration = owner.getDeclaration(ref.local).?;
@@ -3597,13 +3742,7 @@ const Solver = struct {
                 return .{ .ref = .{ .module = module, .id = id }, .container = frame.container };
             };
         }
-        if (ast.nodes.items(.tag)[node] == .field_access) {
-            const base = ast.nodes.items(.data)[node].lhs;
-            if (ast.nodes.items(.tag)[base] == .identifier) {
-                const name = ast.tokenSlice(ast.firstToken(base));
-                for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) return null;
-            }
-        }
+        if (ast.nodes.items(.tag)[node] == .field_access and (lexicalRoot(frame, node) or containerTypeRoot(frame, node))) return null;
         if (targetWith(module, node, false)) |ref| return .{ .ref = ref };
         if (ast.nodes.items(.tag)[node] == .field_access) {
             const data = ast.nodes.items(.data)[node];
@@ -3721,7 +3860,9 @@ const Solver = struct {
                     type_qualifier = false;
                 };
             } else if (module.compilation) |comp| {
-                if (comp.reference(module, data.lhs)) |ref| type_qualifier = comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias;
+                if (!lexicalRoot(frame, data.lhs) and !containerTypeRoot(frame, data.lhs)) {
+                    if (comp.reference(module, data.lhs)) |ref| type_qualifier = comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias;
+                }
             }
             if (type_qualifier) {
                 const qualifier = try self.typeNode(frame, data.lhs, depth + 1);
@@ -3874,11 +4015,14 @@ const Solver = struct {
                     if (std.mem.eql(u8, local.name, name)) mutable = local.mutable;
                 }
             }
+            const token = ast.firstToken(capture);
+            const name = ast.tokenSlice(token);
+            if (!std.mem.eql(u8, name, "_")) try self.validateBindingName(frame, token, scope);
             const term_value = if (by_ref)
                 try self.term(.{ .reference = .{ .child = element, .mutable = mutable } }, span)
             else
                 element;
-            try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(ast.firstToken(capture)), .term = term_value });
+            if (!std.mem.eql(u8, name, "_")) try frame.locals.append(self.allocator, .{ .name = name, .term = term_value });
         }
         try self.unify(try self.expression(frame, loop.body, depth + 1), unit, span, 0);
         if (loop.continuation != 0)
@@ -3942,7 +4086,9 @@ const Solver = struct {
         if (ast.nodes.items(.tag)[base] == .enum_literal) return expected;
         if (ast.nodes.items(.tag)[base] != .field_access) return null;
         const qualifier = ast.nodes.items(.data)[base].lhs;
+        if (lexicalRoot(frame, qualifier)) return null;
         if (ast.fullCall(qualifier)) |call| {
+            if (lexicalRoot(frame, call.ast.fn_expr)) return null;
             if (TypeResolver.genericReference(module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
         } else {
             if (ast.nodes.items(.tag)[qualifier] == .identifier) {
@@ -4306,7 +4452,7 @@ const Solver = struct {
                     for (frame.locals.items) |local| {
                         if (!std.mem.eql(u8, local.name, name)) continue;
                         mutable = local.mutable;
-                        lexical = !local.query_global and local.template == null;
+                        lexical = local.global == null and local.template == null;
                     }
                 }
                 if (self.querying) {
@@ -4613,9 +4759,7 @@ const Solver = struct {
                             try self.fail(.invalid_match_capture, module.tokenSpan(token), null);
                             return result;
                         }
-                        for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) {
-                            try self.fail(.unsupported_shadowing, module.tokenSpan(token), null);
-                        };
+                        try self.validateBindingName(frame, token, scope);
                         const payload = try self.fieldType(subjects[0], ast.tokenSlice(ast.nodes.items(.main_token)[prong.values[0]]), span, depth + 1);
                         try frame.locals.append(self.allocator, .{ .name = name, .term = payload });
                     }
@@ -4663,14 +4807,10 @@ const Solver = struct {
                 const statements = ast.fullBlock(&buffer, node).?.ast.statements;
                 for (statements, 0..) |statement, statement_index| {
                     if (ast.fullDecl(statement)) |decl| {
+                        try self.validateBindingName(frame, decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable), scope);
+                        if (self.failed) return self.term(.unknown, span);
                         if (self.querying) {
-                            const name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable));
-                            var related: ?Module.Span = null;
-                            if (module.lookup(name)) |id| related = module.getDeclaration(id).?.name_span;
-                            for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) {
-                                related = local.term.span;
-                            };
-                            if (!try BodyChecker.validateLocalSyntax(module, statement, related)) {
+                            if (!try BodyChecker.validateLocalSyntax(module, statement, null)) {
                                 self.failed = true;
                                 return self.term(.unknown, span);
                             }
@@ -5922,8 +6062,7 @@ test "generic closures review imported aliases retain transitive static generic 
 test "generic closures block probes restore names and retain lexical errors under OOM" {
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .source = "let id:(x:`A)->`A=x\nlet main:()={@print(id({let f=(x:`T)->`T{x}\nf(true)}))\n@print(f)}", .tag = .unknown_name },
-        .{ .source = "let id:(x:`A)->`A=x\nlet main:()={let a:int=7\n@print(id({let f=(x:`T)->`T{let a:int=9\nx}\nf(true)}))}", .tag = .unsupported_shadowing },
-        .{ .source = "let id:(x:`A)->`A=x\nlet main:()={let a:int=7\n@print(id({let f=(a:`T)->`T{a}\nf(true)}))}", .tag = .unsupported_shadowing },
+
         .{ .source = "let id:(x:`A)->`A=x\nlet main:()=@print(id({let f=(x:`T)->`T{f(x)}\nf(true)}))", .tag = .unknown_name },
     }) |case| {
         try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
@@ -5931,8 +6070,22 @@ test "generic closures block probes restore names and retain lexical errors unde
     }
 }
 
-test "generic closures review no shadowing is independent of captures and demand order under OOM" {
+fn testShadowingInference(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "shadowing.nov", source);
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("shadowing inference {s}: {any}\n", .{ source, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "generic closures shadow outer names independently of captures and demand order under OOM" {
     for ([_][]const u8{
+        "let id:(x:`A)->`A=x\nlet main:()={let a:int=7\n@print(id({let f=(x:`T)->`T{let a:int=9\nx}\nf(true)}))}",
+        "let id:(x:`A)->`A=x\nlet main:()={let a:int=7\n@print(id({let f=(a:`T)->`T{a}\nf(true)}))}",
+        "let main:()={let x:int=1\nlet f=(x:`T)->`T{x}\n@print(f(true))}",
         "let main:()={let a:int=7\nlet f=(x:`T)->`T{let a:int=9\nx}\n@print(f(true))}",
         "let main:()={let a:int=7\nlet f=(x:`T)->`T{@print(a)\nlet a:int=9\nx}\n@print(f(true))}",
         "let main:()={let a:int=7\nlet f=(x:`T)->`T{let a:int=9\nx}\n@print(f(@as(int,1)),f(true))}",
@@ -5944,8 +6097,8 @@ test "generic closures review no shadowing is independent of captures and demand
         "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Element:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool).[].method(true))",
         "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Self:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool).[].method(true))",
     }) |source| {
-        try testInferenceFailureAllocations(std.testing.allocator, source, .unsupported_shadowing);
-        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ source, Module.Diagnostic.Tag.unsupported_shadowing });
+        try testShadowingInference(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testShadowingInference, .{source});
     }
 }
 
@@ -5956,7 +6109,7 @@ test "generic closures diagnose exact constraints ambiguity locals and capture s
         .{ .source = "let main:()={let f:(x:`T)->`T=x\nf([])\n@print()}", .tag = .generic_function_ambiguous },
         .{ .source = "let main:()={let f:(x:`T)->`T=unknown\n@print(f(true))}", .tag = .unknown_name },
         .{ .source = "let main:()={let f:(x:`T)->`T=f(x)\n@print(f(true))}", .tag = .unknown_name },
-        .{ .source = "let main:()={let x:int=1\nlet f=(x:`T)->`T{x}\nf(true)}", .tag = .unsupported_shadowing },
+        .{ .source = "let main:()={let f=(x:`T)->`T{let a=1\nlet a=2\nx}\n@print(f(true))}", .tag = .duplicate_name },
         .{ .source = "let main:()={let f=(x:`T)->`T{{let hidden:int=1\n}\nx}\n@print(f(true))\n@print(hidden)}", .tag = .unknown_name },
         .{ .source = "let main:()={let mut n:int=1\nlet loan=&n\nlet f=(x:`T)->`T{@print(loan.*)\nx}\nf(true)}", .tag = .unsupported_borrow },
     }) |case| {

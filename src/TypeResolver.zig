@@ -57,27 +57,26 @@ pub fn resolveInScopeReadOnly(module: *Module, ir: *Ir, node: Ast.Node.Index, ow
 }
 
 /// Value bindings are visible only to @TypeOf, never as ordinary type aliases.
-pub fn resolveInScopeWithValues(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, type_bindings: []const Binding, value_bindings: []const Binding) Error!?Ir.TypeId {
+pub fn resolveInScopeWithValues(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, type_bindings: []const Binding, value_bindings: []const ValueBinding) Error!?Ir.TypeId {
     return resolveScope(module, ir, node, owner, concrete, type_bindings, value_bindings, true);
 }
 
-pub fn resolveInScopeWithValuesReadOnly(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, type_bindings: []const Binding, value_bindings: []const Binding) Error!?Ir.TypeId {
+pub fn resolveInScopeWithValuesReadOnly(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, type_bindings: []const Binding, value_bindings: []const ValueBinding) Error!?Ir.TypeId {
     return resolveScope(module, ir, node, owner, concrete, type_bindings, value_bindings, false);
 }
 
-pub fn resolveInScopeWithCaptures(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, type_bindings: []const Binding, values: []const Binding, captures: []const GenericFunctions.Capture, publish_methods: bool) Error!?Ir.TypeId {
+pub fn resolveInScopeWithCaptures(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, type_bindings: []const Binding, values: []const ValueBinding, captures: []const GenericFunctions.Capture, publish_methods: bool) Error!?Ir.TypeId {
     return resolveScopeCaptures(module, ir, node, owner, concrete, type_bindings, values, captures, publish_methods);
 }
 
-fn resolveScope(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, function_bindings: []const Binding, value_bindings: []const Binding, publish_methods: bool) Error!?Ir.TypeId {
+fn resolveScope(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, function_bindings: []const Binding, value_bindings: []const ValueBinding, publish_methods: bool) Error!?Ir.TypeId {
     return resolveScopeCaptures(module, ir, node, owner, concrete, function_bindings, value_bindings, &.{}, publish_methods);
 }
 
-fn resolveScopeCaptures(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, function_bindings: []const Binding, value_bindings: []const Binding, captures: []const GenericFunctions.Capture, publish_methods: bool) Error!?Ir.TypeId {
+fn resolveScopeCaptures(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, function_bindings: []const Binding, value_bindings: []const ValueBinding, captures: []const GenericFunctions.Capture, publish_methods: bool) Error!?Ir.TypeId {
     const container = owner orelse return resolveEnvironment(module, ir, node, .{ .bindings = function_bindings, .values = value_bindings, .captures = captures, .expansions = 0, .publish_methods = publish_methods });
     var bindings: std.ArrayList(Binding) = .empty;
     defer bindings.deinit(module.allocator);
-    try bindings.appendSlice(module.allocator, function_bindings);
     const declaration = module.getDeclaration(container).?;
     const full = module.source.ast.decl(declaration.node).ast;
     const this_type = if (concrete) |id| @as(Ir.TypeId, @fromBackingInt(@intCast(id))) else (try resolveWithMode(module, ir, full.init_node, &.{}, 0, publish_methods)) orelse return null;
@@ -92,6 +91,7 @@ fn resolveScopeCaptures(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?
         if (!isThisAlias(&module.source.ast, member)) continue;
         try bindings.append(module.allocator, .{ .name = module.source.ast.tokenSlice(alias.ast.let_token + 1), .ty = this_type });
     }
+    try bindings.appendSlice(module.allocator, function_bindings);
     var expansions: usize = 0;
     if (concrete) |id| {
         for (module.declarations.items) |method| if (method.concrete_type == id) {
@@ -110,8 +110,9 @@ pub fn isThisAlias(ast: *const Ast, node: Ast.Node.Index) bool {
 }
 
 pub const Binding = Module.TypeBinding;
+pub const ValueBinding = GenericFunctions.ValueBinding;
 const ValueQueryMap = std.AutoHashMapUnmanaged(Compilation.DeclRef, union(enum) { visiting, complete: ?Ir.TypeId });
-const Environment = struct { bindings: []const Binding, values: []const Binding = &.{}, captures: []const GenericFunctions.Capture = &.{}, expansions: usize, publish_methods: bool = true, query_depth: usize = 0, value_queries: ?*ValueQueryMap = null };
+const Environment = struct { bindings: []const Binding, values: []const ValueBinding = &.{}, captures: []const GenericFunctions.Capture = &.{}, expansions: usize, publish_methods: bool = true, query_depth: usize = 0, value_queries: ?*ValueQueryMap = null };
 pub const max_instantiation_depth = 64;
 
 fn resolveWith(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Binding, expansions: usize) Error!?Ir.TypeId {
@@ -123,10 +124,18 @@ fn resolveWithMode(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []c
 }
 
 fn resolveEnvironment(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environment) Error!?Ir.TypeId {
-    if (env.value_queries != null) return resolveEnvironmentInner(module, ir, node, env);
+    var values: std.ArrayList(ValueBinding) = .empty;
+    defer values.deinit(module.allocator);
+    var shared = env;
+    if (env.captures.len != 0) {
+        try values.appendSlice(module.allocator, env.values);
+        for (env.captures) |capture| try values.append(module.allocator, .{ .name = capture.name, .ty = capture.ty, .template = capture.template, .mutable = capture.mutable });
+        shared.values = values.items;
+        shared.captures = &.{};
+    }
+    if (env.value_queries != null) return resolveEnvironmentInner(module, ir, node, shared);
     var queries: ValueQueryMap = .empty;
     defer queries.deinit(module.allocator);
-    var shared = env;
     shared.value_queries = &queries;
     return resolveEnvironmentInner(module, ir, node, shared);
 }
@@ -167,7 +176,7 @@ fn resolveEnvironmentInner(module: *Module, ir: *Ir, node: Ast.Node.Index, env: 
                 for (call.ast.args) |arg| try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = arg, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.nodes.items(.tag)[visit.node] == .identifier or ast.nodes.items(.tag)[visit.node] == .field_access) {
                 const name = ast.tokenSlice(ast.firstToken(visit.node));
-                if (visit.local and ast.nodes.items(.tag)[visit.node] == .identifier and lookupBinding(env.bindings, name) != null) continue;
+                if (visit.local and (hiddenValue(env, name) != null or lookupBinding(env.bindings, name) != null)) continue;
                 // Resolve each edge in its defining scope, retaining namespace visibility.
                 const ref: Compilation.DeclRef = if (owner.compilation) |comp| comp.reference(owner, visit.node) orelse continue else .{
                     .source = owner.source.id,
@@ -224,7 +233,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         defer params.deinit(module.allocator);
         var names: std.StringHashMapUnmanaged(Module.Span) = .empty;
         defer names.deinit(module.allocator);
-        var values: std.ArrayList(Binding) = .empty;
+        var values: std.ArrayList(ValueBinding) = .empty;
         defer values.deinit(module.allocator);
         try values.appendSlice(module.allocator, env.values);
         var signature_env = env;
@@ -315,6 +324,8 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         return diagnose(module, node, .unsupported_type);
     }
     if (ast.nodes.items(.tag)[node] == .field_access) {
+        if (hiddenValue(env, rootName(ast, node))) |_| return diagnose(module, node, .not_a_type);
+        if (lookupBinding(env.bindings, rootName(ast, node)) != null) return diagnose(module, node, .not_a_type);
         const comp = module.compilation orelse return diagnose(module, node, .unsupported_type);
         const ref = comp.reference(module, node) orelse return diagnose(module, node, .unknown_type);
         const owner = comp.getModule(ref.source).?;
@@ -325,6 +336,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
     }
     if (ast.nodes.items(.tag)[node] != .identifier) return diagnose(module, node, .unsupported_type);
     const name = ast.tokenSlice(ast.firstToken(node));
+    if (hiddenValue(env, name) != null) return diagnose(module, node, .not_a_type);
     if (lookupBinding(env.bindings, name)) |ty| return ty;
     if (module.lookup(name)) |id| {
         if (primitives.isPrimitive(name)) return diagnose(module, node, .unsupported_type);
@@ -385,7 +397,12 @@ fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environ
             var i = env.values.len;
             while (i > 0) {
                 i -= 1;
-                if (std.mem.eql(u8, env.values[i].name, name)) return env.values[i].ty;
+                const value = env.values[i];
+                if (std.mem.eql(u8, value.name, name)) {
+                    if (value.template != null) return diagnose(module, node, .not_a_value);
+                    if (value.global) |global| if (module.getDeclaration(global).?.is_generic_function) return diagnose(module, node, .not_a_value);
+                    return value.ty;
+                }
             }
             if (lookupBinding(env.bindings, name) != null) return diagnose(module, node, .not_a_value);
             break :blk module.lookup(name) orelse return diagnose(module, node, if (primitives.isPrimitive(name)) .invalid_type_query_operand else .unknown_name);
@@ -526,8 +543,31 @@ fn resolveEnum(module: *Module, ir: *Ir, identity: u32, node: Ast.Node.Index) Er
 }
 
 fn lookupBinding(bindings: []const Binding, name: []const u8) ?Ir.TypeId {
-    for (bindings) |binding| if (std.mem.eql(u8, binding.name, name)) return binding.ty;
+    var i = bindings.len;
+    while (i != 0) {
+        i -= 1;
+        if (std.mem.eql(u8, bindings[i].name, name)) return bindings[i].ty;
+    }
     return null;
+}
+
+fn hiddenValue(env: Environment, name: []const u8) ?ValueBinding {
+    // Primitive names are reserved; signature-only queries may still see
+    // parameter metadata from a declaration whose body has not been checked.
+    if (primitives.isPrimitive(name)) return null;
+    var i = env.values.len;
+    while (i != 0) {
+        i -= 1;
+        const value = env.values[i];
+        if (std.mem.eql(u8, value.name, name)) return if (value.global == null) value else null;
+    }
+    return null;
+}
+
+fn rootName(ast: *const Ast, node: Ast.Node.Index) []const u8 {
+    var base = node;
+    while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+    return ast.tokenSlice(ast.firstToken(base));
 }
 
 /// Only ordinary named container templates and aliases to them are callable here.
@@ -588,7 +628,7 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
         }
         const name = ast.tokenSlice(token);
         const span = module.tokenSpan(token);
-        if (primitives.isPrimitive(name) or module.lookup(name) != null or std.mem.startsWith(u8, name, "@\"")) {
+        if (primitives.isPrimitive(name) or std.mem.startsWith(u8, name, "@\"")) {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = span });
             continue;
         }
@@ -599,11 +639,6 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
     defer fields.deinit(module.allocator);
     for (ast.fullStruct(full.init_node).?) |member| {
         if (ast.nodes.items(.tag)[member] != .container_field) {
-            const member_decl = ast.fullDecl(member);
-            if (member_decl) |decl| {
-                const member_name = ast.tokenSlice(decl.ast.let_token + 1 + @as(u32, @intFromBool(decl.ast.is_mutable)));
-                if (names.contains(member_name)) _ = try diagnose(module, member, .unsupported_shadowing);
-            }
             if (isThisAlias(ast, member)) continue;
             const method = ast.fullDecl(member);
             if (method == null or method.?.ast.is_mutable or ast.declFunction(member) == null)
@@ -613,7 +648,7 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
         const token = ast.nodes.items(.main_token)[member];
         const name = ast.tokenSlice(token);
         const span = module.tokenSpan(token);
-        if (module.lookupMethod(id, name) != null or names.contains(name)) _ = try diagnose(module, member, .duplicate_field);
+        if (module.lookupMethod(id, name) != null) _ = try diagnose(module, member, .duplicate_field);
         const entry = try fields.getOrPut(module.allocator, name);
         if (entry.found_existing) try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_field, .span = span, .related = entry.value_ptr.* }) else entry.value_ptr.* = span;
         const data = ast.nodes.items(.data)[member];
@@ -624,6 +659,8 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
 }
 
 fn instantiate(module: *Module, ir: *Ir, call: Ast.full.Call, node: Ast.Node.Index, depth: usize, aliases: *const AliasMap, env: Environment) Error!?Ir.TypeId {
+    const name = rootName(&module.source.ast, call.ast.fn_expr);
+    if (hiddenValue(env, name) != null or lookupBinding(env.bindings, name) != null) return diagnose(module, node, .not_a_generic);
     const ref = genericReference(module, call.ast.fn_expr) orelse {
         const ast = &module.source.ast;
         if (ast.nodes.items(.tag)[call.ast.fn_expr] == .identifier) {
@@ -1490,6 +1527,61 @@ test "TypeOf expressions reject invalid operators names arguments and bounded cy
     }
 }
 
+fn testHiddenTypeNames(allocator: std.mem.Allocator) !void {
+    for ([_]struct { expression: []const u8, name: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .expression = "T", .name = "T", .tag = .not_a_type },
+        .{ .expression = "Box(int)", .name = "Box", .tag = .not_a_generic },
+        .{ .expression = "api.T", .name = "api", .tag = .not_a_type },
+    }) |case| {
+        const source = try std.fmt.allocPrint(allocator, "let T=int\nlet Box:(T:type)->type=struct{{value:T,}}\nlet api=int\nlet query:{s}", .{case.expression});
+        defer allocator.free(source);
+        var module = try Module.init(allocator, "hidden-types.nov", source);
+        defer module.deinit();
+        try module.classifyAliases();
+        var ir = Ir.init(allocator);
+        defer ir.deinit();
+        const boolean = try ir.internType(.boolean);
+        const node = testTypeNode(&module, "query");
+        const values = [_]ValueBinding{.{ .name = case.name, .ty = boolean }};
+        try std.testing.expectEqual(@as(?Ir.TypeId, null), try resolveInScopeWithValues(&module, &ir, node, null, null, &.{}, &values));
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    }
+    const source = "let T=bool\nlet Box:(T:type)->type=struct{value:T,}\nlet query:Box(int)\nlet binding:T\nlet signature:(T:int)->@TypeOf(T)";
+    var module = try Module.init(allocator, "binding-precedence.nov", source);
+    defer module.deinit();
+    try module.classifyAliases();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const integer = try BodyChecker.defaultIntegerType(&ir);
+    const boolean = try ir.internType(.boolean);
+    ir.source_len = @intCast(source.len);
+    const record = (try resolve(&module, &ir, testTypeNode(&module, "query"))).?;
+    try std.testing.expectEqual(integer, ir.getType(record).?.record.fields[0].ty);
+    const bindings = [_]Binding{ .{ .name = "T", .ty = boolean }, .{ .name = "T", .ty = integer } };
+    try std.testing.expectEqual(integer, (try resolveInScope(&module, &ir, testTypeNode(&module, "binding"), null, null, &bindings)).?);
+    const captures = [_]GenericFunctions.Capture{.{ .name = "T", .ty = boolean }};
+    const signature = (try resolveInScopeWithCaptures(&module, &ir, testTypeNode(&module, "signature"), null, null, &.{}, &.{}, &captures, false)).?;
+    try std.testing.expectEqual(integer, ir.getType(signature).?.function.result);
+    try std.testing.expect(!module.hasErrors());
+    for ([_]struct { params: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .params = "T:type,T:type", .tag = .duplicate_parameter },
+        .{ .params = "int:type", .tag = .unsupported_shadowing },
+    }) |case| {
+        const invalid_source = try std.fmt.allocPrint(allocator, "let T=bool\nlet Box:({s})->type=struct{{}}", .{case.params});
+        defer allocator.free(invalid_source);
+        var invalid = try Module.init(allocator, "invalid-parameters.nov", invalid_source);
+        defer invalid.deinit();
+        try std.testing.expect(!try validateGeneric(&invalid, invalid.lookup("Box").?));
+        try std.testing.expectEqual(case.tag, invalid.diagnostics.items[0].tag);
+    }
+}
+
+test "shadowing hides type module and generic fallback and preserves binding precedence under OOM" {
+    try testHiddenTypeNames(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testHiddenTypeNames, .{});
+}
+
 fn testTypeOfValidationCase(allocator: std.mem.Allocator, expression: []const u8, expected: ?Module.Diagnostic.Tag) !void {
     const source = try std.fmt.allocPrint(allocator, "let g:int=1\nlet E=enum{{one,two,}}\nlet U=union{{a:int,b,e:E,}}\nlet fn_value:()->int=missing\nlet take_ref:(r:&int)->int=missing\nlet no_body:(int:int)->int=missing\nlet R=struct{{let toString:(r:R)->str=missing\n}}\nlet query_result:@TypeOf({s})", .{expression});
     defer allocator.free(source);
@@ -1592,13 +1684,14 @@ test "TypeOf validation checks every union constructor form and supplied payload
 
 test "TypeOf validation shares ordinary local declaration restrictions under OOM" {
     for ([_]struct { expression: []const u8, tag: ?Module.Diagnostic.Tag }{
-        .{ .expression = "{let x=1\nlet x=true\nx}", .tag = .unsupported_shadowing },
+        .{ .expression = "{let x=1\nlet x=true\nx}", .tag = .duplicate_name },
         .{ .expression = "{let x:int\nx}", .tag = .missing_initializer },
         .{ .expression = "{let mut x:void={}\nx}", .tag = .unsupported_local_declaration },
         .{ .expression = "{let x={}\n1}", .tag = .unsupported_local_declaration },
         .{ .expression = "{let _=1\n2}", .tag = .unsupported_local_declaration },
         .{ .expression = "{let int=1\nint}", .tag = .unsupported_shadowing },
-        .{ .expression = "{let g=1\ng}", .tag = .unsupported_shadowing },
+        .{ .expression = "{let g=1\ng}", .tag = null },
+        .{ .expression = "{let x=1\n{let x=x+1\n@print(x)}\nx}", .tag = null },
         .{ .expression = "{let x:void={}\n1}", .tag = null },
         .{ .expression = "{let x=1\nlet y=x+1\ny}", .tag = null },
     }) |case| {
@@ -1660,9 +1753,9 @@ test "TypeOf validation shares closure and template parameter scopes under OOM" 
         .{ .expression = "(int:int)->int{int}", .tag = .unsupported_shadowing },
         .{ .expression = "{let id:(x:`T,x:`T)->`T=x\nid(1,2)}", .tag = .duplicate_parameter },
         .{ .expression = "{let id:(x:`T,x:`T)->`T=x\n1}", .tag = .duplicate_parameter },
-        .{ .expression = "{let x=1\nlet f=(x:int)->int{x}\nf(1)}", .tag = .unsupported_shadowing },
-        .{ .expression = "{let x=1\nlet id:(x:`T)->`T=x\nid(1)}", .tag = .unsupported_shadowing },
-        .{ .expression = "(x:int)->int{let f=(x:int)->int{x}\nf(1)}", .tag = .unsupported_shadowing },
+        .{ .expression = "{let x=1\nlet f=(x:int)->int{x}\nf(1)}", .tag = null },
+        .{ .expression = "{let x=1\nlet id:(x:`T)->`T=x\nid(1)}", .tag = null },
+        .{ .expression = "(x:int)->int{let f=(x:int)->int{x}\nf(1)}", .tag = null },
         .{ .expression = "{let id:(int:`T)->`T=int\nid(1)}", .tag = .unsupported_shadowing },
         .{ .expression = "{let first=(v:int)->int{v}\nlet second=(v:int)->int{v}\nsecond(first(1))}", .tag = null },
         .{ .expression = "{let id:(v:`T)->`T=v\nid(1)}", .tag = null },
@@ -1795,7 +1888,7 @@ fn testLocalReferenceTypes(allocator: std.mem.Allocator) !void {
         try std.testing.expect(ir.getType(ty).? == .reference);
     }
     try std.testing.expectEqual(readonly, (try resolve(&module, &ir, testTypeNode(&module, "alias_ref"))).?);
-    const values = &[_]Binding{.{ .name = "p", .ty = writable }};
+    const values = &[_]ValueBinding{.{ .name = "p", .ty = writable }};
     try std.testing.expectEqual(writable, (try resolveInScopeWithValuesReadOnly(&module, &ir, testTypeNode(&module, "query"), null, null, &.{}, values)).?);
     const signature = (try resolve(&module, &ir, testTypeNode(&module, "signature"))).?;
     try std.testing.expectEqualSlices(Ir.TypeId, &.{ writable, writable }, ir.getType(signature).?.function.params);
@@ -1848,7 +1941,7 @@ test "local reference TypeOf descriptors cannot escape indirectly into results a
         defer ir.deinit();
         const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
         const reference = try ir.internType(.{ .reference = .{ .child = integer, .mutable = false } });
-        const values = &[_]Binding{.{ .name = "p", .ty = reference }};
+        const values = &[_]ValueBinding{.{ .name = "p", .ty = reference }};
         try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expectEqual(@as(?Ir.TypeId, null), try resolveInScopeWithValues(&module, &ir, testTypeNode(&module, "value"), null, null, &.{}, values));
         try std.testing.expectEqual(Module.Diagnostic.Tag.borrow_escape, module.diagnostics.items[0].tag);
@@ -1861,8 +1954,8 @@ test "TypeOf value bindings are separate from type aliases in readonly resolutio
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const boolean = try ir.internType(.boolean);
-    const values = &[_]Binding{.{ .name = "x", .ty = boolean }};
+    const values = &[_]ValueBinding{.{ .name = "x", .ty = boolean }};
     try std.testing.expectEqual(boolean, (try resolveInScopeWithValuesReadOnly(&module, &ir, testTypeNode(&module, "a"), null, null, &.{}, values)).?);
     try std.testing.expectEqual(@as(?Ir.TypeId, null), try resolveInScopeWithValues(&module, &ir, testTypeNode(&module, "b"), null, null, &.{}, values));
-    try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_type, module.diagnostics.items[0].tag);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.not_a_type, module.diagnostics.items[0].tag);
 }

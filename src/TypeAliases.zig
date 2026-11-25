@@ -68,13 +68,13 @@ const failures = [_]Failure{
     .{ .source = "let A = (Missing) -> int", .tag = .unknown_type },
     .{ .source = "let A = [][]void", .tag = .unsupported_type },
     .{ .source = "let mut Count = uint\nlet x: Count = 1", .tag = .not_a_type },
-    .{ .source = "let Count = uint\nlet f: (Count: int) -> int = Count", .tag = .unsupported_shadowing },
-    .{ .source = "let Count = uint\nlet main: () = {let Count: int = 1\n}", .tag = .unsupported_shadowing },
+    .{ .source = "let Count = uint\nlet main: () = {let Count: int = 1\nlet value: Count = 2\n}", .tag = .not_a_type },
+    .{ .source = "let Count = uint\nlet f: (Count: int) = {let value: Count = 2\n}", .tag = .not_a_type },
     .{ .source = "let main: () = {let Local = int\n@println(@as(Local, 1))}", .tag = .unsupported_body_expression },
     .{ .source = "let uint = int", .tag = .unsupported_shadowing },
 };
 
-test "type aliases reject runtime uses value aliases shadowing and invalid types" {
+test "type aliases reject runtime uses value aliases hidden types and invalid types" {
     for (failures) |case| {
         var module = try Module.init(std.testing.allocator, "bad-alias.nov", case.source);
         defer module.deinit();
@@ -92,6 +92,22 @@ test "type aliases reject runtime uses value aliases shadowing and invalid types
         };
         if (!found) std.debug.print("missing {t} in {s}\n", .{ case.tag, case.source });
         try std.testing.expect(found);
+    }
+}
+
+test "type aliases can be hidden by parameters and locals" {
+    for ([_][]const u8{
+        "let Count = uint\nlet f: (Count: int) -> int = Count",
+        "let Count = uint\nlet main: () = {let Count: int = 1\n}",
+        "let Count = uint\nlet main: () = {{let Count: int = 1\n}\nlet value: Count = 2\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "shadowed-alias.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
     }
 }
 

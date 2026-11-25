@@ -72,7 +72,7 @@ locals (explicitly typed or inferred from their initializer) and blocks
 with final-expression results are supported in function bodies. Immutable module-level
 [type aliases](#type-aliases) name existing canonical types. Unconstrained integer
 literals default to signed pointer-sized `int` after contextual inference;
-shadowing remains unsupported. Mutable globals support ordinary storable types. Direct range
+lexical shadowing is supported. Mutable globals support ordinary storable types. Direct range
 literal bounds retain their dedicated native `uint`/`int` rule (see [Range](#range)).
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
@@ -360,11 +360,16 @@ conversion is introduced; the count argument has its own `int` context.
 Function blocks use their final expression as the result, including with a newline
 before `}`. Empty blocks and blocks ending in a declaration produce `void`.
 Statements and initializers execute left to right; a local becomes visible only
-**after** its initializer, so self/forward local references are errors. Nested
-blocks have lexical scopes; names do not escape them, and separate sibling blocks
-may reuse a name. Shadowing any visible local, parameter, global or primitive
-name remains unsupported. Non-final expressions must return `void`; explicit
-value-discard syntax is not implemented yet.
+**after** its initializer: `let x = x + 1` reads an outer `x`, or diagnoses
+an unknown name if none exists. Inner block locals, function parameters, and
+loop/match bindings may hide outer user names, including globals, types and import
+namespaces. Lookup selects the nearest binding; scope exit restores the outer one.
+Same-block declarations and function parameters must be unique; primitive type
+names remain reserved. Types and values share name lookup: a value hiding a type
+causes `expected a type, found a value` in type positions. Shadowing does not relax
+reference lifetime/escape restrictions or change existing borrow identities.
+Non-final expressions must return `void`; explicit value-discard syntax is not
+implemented yet. See `tests/shadowing.nov` and `zig build test-cli-shadowing`.
 
 ```nov
 let twice: (value: int) -> int = {
@@ -2704,7 +2709,7 @@ let main: () = {
   endpoints. Typed bounds always win first; neither rule involves constant folding.
 - The index is immutable and fresh each iteration, and is visible in the body
   and optional continuation. `_` discards it and creates no binding. Existing
-  no-shadowing rules apply.
+  lexical shadowing rules apply.
 - Without `else`, range loops yield `void` and reject value breaks. Continuing
   bodies always yield `void`. Body-side `continue` advances (or exhausts at an
   inclusive endpoint); `break` and `return` skip the increment.
@@ -3171,8 +3176,8 @@ no runtime global, function or initialization code. As with direct type spelling
 128-bit values.
 
 Only plain immutable module declarations `let Name = typeExpression` define
-aliases. They share the existing module namespace: duplicates and implicit
-shadowing are rejected. An identifier RHS names a type only when its target is a
+aliases. They share the existing module namespace: duplicate module declarations
+are rejected, but inner value bindings may hide aliases. An identifier RHS names a type only when its target is a
 type (or a type position demands resolution and reports a type error); aliases
 of runtime values do not become types. Value globals infer independently;
 immutable data dependencies can initialize other globals, but mutable-global reads cannot. Unknown identifier RHSs without type context are diagnosed as
@@ -3988,7 +3993,7 @@ Placeholders use the normal expression parser and checker: identifiers, calls
 (including nested calls), scalar operators, array access and `@len(value)` work with the
 usual type contexts. For example, `"{describe(1, 5, 5)}\n{describe(5, 1, 3)}"`
 uses the callee's parameter types for the numeric arguments. Existing lexical
-scope, no-shadowing and declaration-before-use rules apply; spaces are allowed.
+scope, shadowing and declaration-before-use rules apply; spaces are allowed.
 Bare integer placeholders use `int` fallback (`"{1}"` works); float placeholders
 use late native `float` fallback and the [float formatting contract](#floats).
 

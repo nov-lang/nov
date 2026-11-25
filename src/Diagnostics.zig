@@ -244,7 +244,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .conditional_value_break => try writer.writeAll("conditional loops cannot break with a value without an else branch"),
             .loop_missing_value_break => try writer.writeAll("nonvoid loop result requires a reachable value-carrying break"),
             .unused_block_value => try writer.writeAll("non-final block expression must return void; discarding values is not supported yet"),
-            .unsupported_shadowing => try writer.writeAll("shadowing is not supported in body analysis yet"),
+            .unsupported_shadowing => try writer.writeAll("primitive type names are reserved"),
             .expression_type_mismatch => try writer.writeAll("expression does not match the expected type"),
             .operator_not_supported => try writer.writeAll("operator is not supported for this operand type"),
             .literal_needs_type => try writer.writeAll("integer expression needs a concrete type"),
@@ -504,7 +504,7 @@ test "module body diagnostics render messages and optional related notes" {
 
         .{ .tag = .array_literal_needs_type, .message = "array literal needs an expected []T type" },
         .{ .tag = .unused_block_value, .message = "non-final block expression must return void; discarding values is not supported yet" },
-        .{ .tag = .unsupported_shadowing, .message = "shadowing is not supported in body analysis yet", .note = "conflicting declaration here" },
+        .{ .tag = .unsupported_shadowing, .message = "primitive type names are reserved", .note = "conflicting declaration here" },
         .{ .tag = .operator_not_supported, .message = "operator is not supported for this operand type", .note = "operand type specified here" },
         .{ .tag = .literal_needs_type, .message = "integer expression needs a concrete type", .note = "expected type required here" },
         .{ .tag = .not_callable, .message = "expression is not callable", .note = "type specified here" },

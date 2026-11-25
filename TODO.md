@@ -60,6 +60,13 @@ results. See `tests/array-fields.nov`.
 
 ## Current delivered status
 
+Lexical shadowing selects the nearest local/parameter/loop/match binding and
+restores outer user names on scope exit, including types and import namespaces.
+Initializers resolve before their new binding; same-block duplicates, duplicate
+parameters and reserved primitive names still reject. Unified type/value lookup
+and existing reference/borrow restrictions remain enforced. See
+`tests/shadowing.nov` and `zig build test-cli-shadowing`.
+
 Trailing commas control vertical formatter layout for argument/parameter lists,
 array literals, named/anonymous/positional struct constructors, union payloads,
 and field-only struct/union/enum type constructors. Without a final comma,
@@ -1300,7 +1307,7 @@ use std.{Option, Result}
 ```
 This is explicit binding shorthand, not a new import mechanism: equivalent to
 `let Option = std.Option` and `let Result = std.Result`. Preserve visibility and
-no-shadowing rules; do not make bindings public implicitly. Initially limit it to
+lexical name rules; do not make bindings public implicitly. Initially limit it to
 top-level namespace member bindings supported by ordinary declarations, not runtime
 destructuring. No wildcard imports. Braces allow multiline lists; optional renaming
 such as `Result as Outcome` is a syntax candidate, not a settled grammar. Public

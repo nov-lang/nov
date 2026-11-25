@@ -35,7 +35,7 @@ const Template = struct {
     info: GenericFunctions.LocalTemplate,
     captures: []const TemplateCapture,
 
-    // No-shadowing depends on the whole definition scope, not just free values.
+    // Definition-site names are retained for signature validation.
     lexical_names: []const LexicalName = &.{},
     layout: ?Ir.FunctionId = null,
     specializations: std.ArrayList(LocalSpecialization) = .empty,
@@ -219,7 +219,11 @@ pub fn inferClosureType(module: *Module, ir: *Ir, ref: GenericFunctions.Ref, exp
             try params.append(module.allocator, ty);
             if (param.name_token) |token| try context.bindParameter(ast.tokenSlice(token), @intCast(params.items.len - 1), .{ .ty = ty }, module.tokenSpan(token));
         }
-        for (descriptor.captures) |capture| {
+        var capture_index = descriptor.captures.len;
+        while (capture_index != 0) {
+            capture_index -= 1;
+            const capture = descriptor.captures[capture_index];
+            if (context.bindings.contains(capture.name)) continue;
             var template: ?*Template = null;
             if (capture.template) |captured| if (captured.local) |local| {
                 const copy = try arena.allocator().create(Template);
@@ -299,7 +303,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         if (param.name_token) |token| {
             const name = module.source.ast.tokenSlice(token);
             const span = module.tokenSpan(token);
-            if (context.conflict(name) != null or isPrimitive(name)) {
+            if (context.bindings.contains(name) or isPrimitive(name)) {
                 const related = context.conflict(name);
                 try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = span, .related = related });
                 valid = false;
@@ -358,9 +362,9 @@ pub fn validateLocalSyntax(module: *Module, node: Ast.Node.Index, related: ?Modu
     const decl = ast.decl(node).ast;
     const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
     const name = ast.tokenSlice(token);
-    const tag: ?Module.Diagnostic.Tag = if (std.mem.startsWith(u8, name, "@\"")) .unsupported_name else if (related != null or isPrimitive(name)) .unsupported_shadowing else if (std.mem.eql(u8, name, "_")) .unsupported_local_declaration else if (decl.init_node == 0) .missing_initializer else null;
+    const tag: ?Module.Diagnostic.Tag = if (std.mem.startsWith(u8, name, "@\"")) .unsupported_name else if (related != null) .duplicate_name else if (isPrimitive(name)) .unsupported_shadowing else if (std.mem.eql(u8, name, "_")) .unsupported_local_declaration else if (decl.init_node == 0) .missing_initializer else null;
     if (tag) |failure| {
-        try module.diagnostics.append(module.allocator, .{ .tag = failure, .span = if (failure == .unsupported_shadowing) module.tokenSpan(token) else module.tokenSpan(ast.nodes.items(.main_token)[node]), .related = related });
+        try module.diagnostics.append(module.allocator, .{ .tag = failure, .span = if (failure == .unsupported_shadowing or failure == .duplicate_name) module.tokenSpan(token) else module.tokenSpan(ast.nodes.items(.main_token)[node]), .related = related });
         return false;
     }
     return true;
@@ -386,7 +390,7 @@ pub fn isReferenceRebind(ast: *const Ast, node: Ast.Node.Index) bool {
 
 /// Closure/template parameter names inhabit the definition's lexical scope.
 /// This checks names only, without resolving types or inspecting the body.
-pub fn validateClosureParameterNames(module: *Module, proto_node: Ast.Node.Index, lexical_names: []const LexicalName) Error!bool {
+pub fn validateClosureParameterNames(module: *Module, proto_node: Ast.Node.Index, _: []const LexicalName) Error!bool {
     const ast = &module.source.ast;
     var names: std.StringHashMapUnmanaged(Module.Span) = .empty;
     defer names.deinit(module.allocator);
@@ -404,15 +408,9 @@ pub fn validateClosureParameterNames(module: *Module, proto_node: Ast.Node.Index
             return false;
         }
         entry.value_ptr.* = span;
-        var related: ?Module.Span = null;
-        if (module.lookup(name)) |id| related = module.getDeclaration(id).?.name_span;
-        for (lexical_names) |binding| if (std.mem.eql(u8, binding.name, name)) {
-            related = binding.span;
-            break;
-        };
-        const issue: ?Module.Diagnostic.Tag = if (std.mem.startsWith(u8, name, "@\"")) .unsupported_name else if (related != null or isPrimitive(name)) .unsupported_shadowing else null;
+        const issue: ?Module.Diagnostic.Tag = if (std.mem.startsWith(u8, name, "@\"")) .unsupported_name else if (isPrimitive(name)) .unsupported_shadowing else null;
         if (issue) |tag| {
-            try module.diagnostics.append(module.allocator, .{ .tag = tag, .span = span, .related = related });
+            try module.diagnostics.append(module.allocator, .{ .tag = tag, .span = span });
             return false;
         }
     }
@@ -609,7 +607,8 @@ const Context = struct {
     terminal: ?Ir.ValueId = null,
     loop_context: ?*LoopContext = null,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
-    locals: std.ArrayList([]const u8) = .empty,
+    locals: std.ArrayList(struct { name: []const u8, previous: ?Binding }) = .empty,
+    scope_start: usize = 0,
     region: Ast.Node.Index = 0,
     borrow_base: ?Ast.Node.Index = null,
     projection_base: ?Ast.Node.Index = null,
@@ -622,10 +621,17 @@ const Context = struct {
     captures: std.ArrayList(Ir.Capture) = .empty,
     capture_names: std.ArrayList([]const u8) = .empty,
     capture_values: std.ArrayList(Ir.ValueId) = .empty,
+    captured_bindings: std.ArrayList(Binding) = .empty,
 
     fn appendTypeCaptures(self: *Context, captures: *std.ArrayList(GenericFunctions.Capture), allocator: std.mem.Allocator) Error!void {
         if (self.parent) |parent| try parent.appendTypeCaptures(captures, allocator);
         try captures.appendSlice(allocator, self.type_captures);
+        for (self.capture_names.items, self.captured_bindings.items) |name, binding| try captures.append(allocator, .{
+            .name = name,
+            .ty = binding.known.ty,
+            .mutable = binding.mutable,
+            .template = if (binding.template) |template| .{ .module = self.module, .local = &template.info } else null,
+        });
         var iterator = self.bindings.iterator();
         while (iterator.next()) |entry| try captures.append(allocator, .{
             .name = entry.key_ptr.*,
@@ -635,7 +641,7 @@ const Context = struct {
         });
     }
 
-    fn appendGlobalTypes(self: *Context, values: *std.ArrayList(TypeResolver.Binding)) Error!void {
+    fn appendGlobalTypes(self: *Context, values: *std.ArrayList(TypeResolver.ValueBinding)) Error!void {
         // Frozen semantic tables contain the actual defaulted global types.
         // Do not request values or run inference merely to answer a type query.
         for (self.module.declarations.items, 0..) |decl, index| {
@@ -648,12 +654,12 @@ const Context = struct {
                 const entry_index = tableIndex(self.module, id);
                 break :blk if (entry_index < self.types.len) self.types[entry_index] else null;
             };
-            if (ty) |known| try values.append(self.module.allocator, .{ .name = decl.name, .ty = known });
+            if (ty) |known| try values.append(self.module.allocator, .{ .name = decl.name, .ty = known, .global = id, .mutable = self.module.source.ast.decl(decl.node).ast.is_mutable });
         }
     }
 
     fn resolveType(self: *Context, node: Ast.Node.Index) Error!?Ir.TypeId {
-        var values: std.ArrayList(TypeResolver.Binding) = .empty;
+        var values: std.ArrayList(TypeResolver.ValueBinding) = .empty;
         defer values.deinit(self.module.allocator);
         try self.appendGlobalTypes(&values);
         var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
@@ -684,7 +690,7 @@ const Context = struct {
             }
         }
         for (captures.items) |capture| {
-            if (capture.template == null) try values.append(self.module.allocator, .{ .name = capture.name, .ty = capture.ty });
+            try values.append(self.module.allocator, .{ .name = capture.name, .ty = capture.ty, .mutable = capture.mutable, .template = capture.template });
         }
         return TypeResolver.resolveInScopeWithCaptures(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings, values.items, captures.items, !self.probing);
     }
@@ -711,12 +717,20 @@ const Context = struct {
         return false;
     }
 
+    fn ownBinding(self: *Context, name: []const u8) ?Binding {
+        if (self.bindings.get(name)) |binding| return binding;
+        for (self.capture_names.items, self.captured_bindings.items) |captured, binding| {
+            if (std.mem.eql(u8, captured, name)) return binding;
+        }
+        return null;
+    }
+
     fn lookupBinding(self: *Context, name: []const u8) ?Binding {
-        return self.bindings.get(name) orelse if (self.parent) |parent| parent.lookupBinding(name) else null;
+        return self.ownBinding(name) orelse if (self.parent) |parent| parent.lookupBinding(name) else null;
     }
 
     fn captureBinding(self: *Context, name: []const u8, node: Ast.Node.Index) Error!?Binding {
-        if (self.bindings.get(name)) |binding| return binding;
+        if (self.ownBinding(name)) |binding| return binding;
         const parent = self.parent orelse return null;
         const outer = (try parent.captureBinding(name, node)) orelse return null;
         if (outer.borrowed) {
@@ -755,7 +769,7 @@ const Context = struct {
                 binding.slot = try emitter.append(outer.known.ty, self.irSpan(node), .{ .local_slot = captured });
             }
         }
-        try self.bindings.put(self.module.allocator, name, binding);
+        try self.captured_bindings.append(self.module.allocator, binding);
         return binding;
     }
 
@@ -786,6 +800,60 @@ const Context = struct {
         return if (self.parent) |parent| parent.lexicalConflict(name) else null;
     }
 
+    fn parameterNamed(ast: *const Ast, proto: Ast.Node.Index, name: []const u8) bool {
+        var params = ast.fullFnProto(proto).?.iterate(ast);
+        while (params.next()) |param| {
+            if (param.name_token) |token| if (std.mem.eql(u8, ast.tokenSlice(token), name)) return true;
+        }
+        return false;
+    }
+
+    fn containsToken(ast: *const Ast, node: Ast.Node.Index, token: Ast.TokenIndex) bool {
+        return node != 0 and ast.firstToken(node) <= token and token <= ast.lastToken(node);
+    }
+
+    fn templateBindsName(ast: *const Ast, proto: Ast.Node.Index, body: Ast.Node.Index, token: Ast.TokenIndex, name: []const u8) bool {
+        if (parameterNamed(ast, proto, name)) return true;
+        for (ast.nodes.items(.tag), 0..) |tag, index| {
+            const node: Ast.Node.Index = @intCast(index);
+            if (ast.firstToken(node) < ast.firstToken(body) or !containsToken(ast, node, token)) continue;
+            switch (tag) {
+                .block, .block_two, .block_newline, .block_two_newline => {
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    for (ast.fullBlock(&buffer, node).?.ast.statements) |statement| {
+                        if (ast.nodes.items(.tag)[statement] != .decl or ast.lastToken(statement) >= token) continue;
+                        const decl = ast.decl(statement).ast;
+                        const name_token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+                        if (std.mem.eql(u8, ast.tokenSlice(name_token), name)) return true;
+                    }
+                },
+                .function_expr => {
+                    const data = ast.nodes.items(.data)[node];
+                    if (containsToken(ast, data.rhs, token) and parameterNamed(ast, data.lhs, name)) return true;
+                },
+                .decl => if (ast.declFunction(node)) |function| {
+                    if (containsToken(ast, function.body, token) and parameterNamed(ast, function.proto_node, name)) return true;
+                },
+                .loop_range => {
+                    const loop = ast.fullLoop(node).?;
+                    if (!containsToken(ast, loop.body, token) and !containsToken(ast, loop.continuation, token)) continue;
+                    for (ast.iterationBindings(node)) |binding| {
+                        const target = if (ast.nodes.items(.tag)[binding] == .ref_of) ast.nodes.items(.data)[binding].rhs else binding;
+                        if (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(target)), name)) return true;
+                    }
+                },
+                .match_case, .match_case_one => {
+                    const prong = ast.fullMatchCase(node).?.ast;
+                    if (prong.capture_token) |capture| {
+                        if (containsToken(ast, prong.target_expr, token) and std.mem.eql(u8, ast.tokenSlice(capture), name)) return true;
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn createTemplate(self: *Context, node: Ast.Node.Index, proto: Ast.Node.Index, body: Ast.Node.Index) Error!?*Template {
         const allocator = self.template_allocator orelse return error.InvalidOperation;
         const ast = &self.module.source.ast;
@@ -797,19 +865,9 @@ const Context = struct {
         defer child.captures.deinit(self.module.allocator);
         defer child.capture_names.deinit(self.module.allocator);
         defer child.capture_values.deinit(self.module.allocator);
-        // No-shadowing lets free names be discovered structurally without
-        // checking or instantiating the template body. Field labels are not
-        // identifier expression nodes; nested free uses must also be captured.
-        var params = ast.fullFnProto(proto).?.iterate(ast);
-        while (params.next()) |param| {
-            if (param.name_token) |token| {
-                const name = ast.tokenSlice(token);
-                if (self.conflict(name) != null or isPrimitive(name)) {
-                    _ = try self.fail(.unsupported_shadowing, proto, self.conflict(name));
-                    return null;
-                }
-            }
-        }
+        defer child.captured_bindings.deinit(self.module.allocator);
+        // Capture free uses only; declarations hide outer names after their
+        // initializers, and nested function parameters hide them in their bodies.
         if (!try validateClosureParameterNames(self.module, proto, &.{})) return null;
         const first = ast.firstToken(body);
         const last = ast.lastToken(body);
@@ -819,7 +877,7 @@ const Context = struct {
             const token = ast.firstToken(candidate);
             if (token < first or token > last or inTypeQuery(ast, token)) continue;
             const name = ast.tokenSlice(token);
-            if (self.lookupBinding(name) == null) continue;
+            if (self.lookupBinding(name) == null or templateBindsName(ast, proto, body, token, name)) continue;
             if (try child.captureBinding(name, candidate) == null) return null;
         }
         const template = try allocator.create(Template);
@@ -968,6 +1026,7 @@ const Context = struct {
         defer child.captures.deinit(self.module.allocator);
         defer child.capture_names.deinit(self.module.allocator);
         defer child.capture_values.deinit(self.module.allocator);
+        defer child.captured_bindings.deinit(self.module.allocator);
         const parameter_scope = if (self.specializing) |template| template.lexical_names else try self.lexicalNames(arena.allocator());
         if (!try validateClosureParameterNames(self.module, proto_node, parameter_scope)) return null;
         var iterator = function.proto.iterate(ast);
@@ -977,7 +1036,7 @@ const Context = struct {
                 return self.fail(.unsupported_local_declaration, node, null);
             };
             const name = ast.tokenSlice(token);
-            if (child.conflict(name) != null or isPrimitive(name)) return self.fail(.unsupported_shadowing, node, child.conflict(name));
+            if (child.bindings.contains(name) or isPrimitive(name)) return self.fail(.unsupported_shadowing, node, child.conflict(name));
             const param_span = self.module.tokenSpan(token);
             child.emitter = if (self.specializing != null and self.emitter != null) &emitter else null;
             try child.bindParameter(name, index, .{ .ty = signature.params[index] }, param_span);
@@ -998,7 +1057,8 @@ const Context = struct {
                         binding.slot = value;
                     } else binding.value = value;
                 }
-                try child.bindings.put(self.module.allocator, capture.name, binding);
+                try child.capture_names.append(self.module.allocator, capture.name);
+                try child.captured_bindings.append(self.module.allocator, binding);
             }
             // Only the captured lexical scope is available to a specialization.
             child.parent = null;
@@ -1012,6 +1072,7 @@ const Context = struct {
             child.locals.clearRetainingCapacity();
             child.captures.clearRetainingCapacity();
             child.capture_names.clearRetainingCapacity();
+            child.captured_bindings.clearRetainingCapacity();
             child.terminated = false;
             child.terminal = null;
             child.emitter = &emitter;
@@ -1096,13 +1157,20 @@ const Context = struct {
     }
 
     fn restoreScope(self: *Context, start: usize) void {
-        for (self.locals.items[start..]) |name| _ = self.bindings.remove(name);
+        var index = self.locals.items.len;
+        while (index > start) {
+            index -= 1;
+            const local_binding = self.locals.items[index];
+            if (local_binding.previous) |previous| {
+                self.bindings.getPtr(local_binding.name).?.* = previous;
+            } else _ = self.bindings.remove(local_binding.name);
+        }
         self.locals.shrinkRetainingCapacity(start);
     }
 
     // Decide storage at declaration time so loans in a branch never create a
-    // slot whose definition fails to dominate later identifier reads. Names
-    // cannot shadow, and this syntax scan does not change value/type policy.
+    // slot whose definition fails to dominate later identifier reads. Matching
+    // by spelling may allocate extra slots for shadowed names, but is conservative.
     fn borrowedName(self: *const Context, name: []const u8) bool {
         const ast = &self.module.source.ast;
         for (ast.nodes.items(.tag), ast.nodes.items(.data), 0..) |tag, data, node| {
@@ -1134,7 +1202,7 @@ const Context = struct {
     }
 
     fn bindLocal(self: *Context, name: []const u8, binding: Binding) Error!void {
-        try self.locals.append(self.module.allocator, name);
+        try self.locals.append(self.module.allocator, .{ .name = name, .previous = self.bindings.get(name) });
         var stored = binding;
         stored.region = self.region;
         if (self.borrowedName(name) and !stored.borrowed and stored.slot == null and stored.value != null and self.emitter != null and self.ir.getType(stored.known.ty).? != .void) {
@@ -1409,17 +1477,8 @@ const Context = struct {
     }
 
     fn conflict(self: *Context, name: []const u8) ?Module.Span {
-        if (self.lookupBinding(name)) |binding| return binding.name_span;
-        if (self.lexicalConflict(name)) |origin| return origin;
-        if (self.valueDeclaration(name)) |id| return self.getDeclaration(id).name_span;
-        if (self.concrete_type != null) {
-            const owner = self.module.getDeclaration(self.container.?).?;
-            const full = self.module.source.ast.decl(owner.node).ast;
-            var iterator = self.module.source.ast.fullFnProto(full.type_node).?.iterate(&self.module.source.ast);
-            while (iterator.next()) |param| {
-                const token = param.name_token.?;
-                if (std.mem.eql(u8, name, self.module.source.ast.tokenSlice(token))) return self.module.tokenSpan(token);
-            }
+        for (self.locals.items[self.scope_start..]) |local_binding| {
+            if (std.mem.eql(u8, local_binding.name, name)) return self.bindings.get(name).?.name_span;
         }
         return null;
     }
@@ -1526,7 +1585,9 @@ const Context = struct {
 
     fn publishBorrow(self: *Context, name: []const u8, binding: Binding) Error!void {
         const unit = try self.ir.internType(.void);
-        if (self.bindings.getPtr(name)) |existing| {
+        const previous = self.bindings.getPtr(name);
+        const rebind = if (previous) |existing| if (std.meta.eql(existing.name_span, binding.name_span)) existing else null else null;
+        if (rebind) |existing| {
             if (self.emitter) |emitter| {
                 _ = try emitter.append(unit, binding.loan_owner.?.origin, .{ .reference_rebind = .{ .slot = existing.borrow.?, .borrow = binding.borrow.? } });
             }
@@ -1593,7 +1654,7 @@ const Context = struct {
             return null;
         }
         if (name) |binding_name| if (self.bindings.get(binding_name)) |reference_binding| {
-            if (!self.ownerOutlivesReference(owner, reference_binding)) {
+            if (std.meta.eql(reference_binding.name_span, name_span) and !self.ownerOutlivesReference(owner, reference_binding)) {
                 _ = try self.fail(.unsupported_borrow, init_node, reference_binding.name_span);
                 return null;
             }
@@ -1643,6 +1704,9 @@ const Context = struct {
         const block = ast.fullBlock(&buffer, node).?;
         if (ast.firstToken(node) != block.ast.lbrace) return self.fail(.unsupported_body_expression, node, null);
         const start = self.locals.items.len;
+        const parent_scope_start = self.scope_start;
+        self.scope_start = start;
+        defer self.scope_start = parent_scope_start;
         defer self.restoreScope(start);
         for (block.ast.statements, 0..) |statement, i| {
             if (self.terminated) return self.fail(.unreachable_code, statement, null);
@@ -1697,6 +1761,9 @@ const Context = struct {
         const block = ast.fullBlock(&buffer, node) orelse return null;
         if (ast.firstToken(node) != block.ast.lbrace) return null;
         const start = self.locals.items.len;
+        const parent_scope_start = self.scope_start;
+        self.scope_start = start;
+        defer self.scope_start = parent_scope_start;
         defer self.restoreScope(start);
         const diagnostics_start = self.module.diagnostics.items.len;
         defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
@@ -1728,6 +1795,9 @@ const Context = struct {
         const block = ast.fullBlock(&buffer, node).?;
         if (ast.firstToken(node) != block.ast.lbrace) return null;
         const start = self.locals.items.len;
+        const parent_scope_start = self.scope_start;
+        self.scope_start = start;
+        defer self.scope_start = parent_scope_start;
         defer self.restoreScope(start);
         // Probing only supplies context, never emits/evaluates initializers or
         // keeps diagnostics. The actual left-to-right walk validates everything.
@@ -1774,6 +1844,9 @@ const Context = struct {
                 self.template_allocator = arena.allocator();
                 defer self.template_allocator = old_allocator;
                 const start = self.locals.items.len;
+                const parent_scope_start = self.scope_start;
+                self.scope_start = start;
+                defer self.scope_start = parent_scope_start;
                 defer self.restoreScope(start);
                 const diagnostics_start = self.module.diagnostics.items.len;
                 defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
@@ -1844,6 +1917,9 @@ const Context = struct {
         // All source queries run in the outer scope, before publishing bindings.
         for (sources, indices) |source, *index| index.* = try self.iterationElement(source, depth + 1);
         const scope = self.locals.items.len;
+        const parent_scope_start = self.scope_start;
+        self.scope_start = scope;
+        defer self.scope_start = parent_scope_start;
         defer self.restoreScope(scope);
         for (ast.iterationBindings(node), sources, indices) |binding, source, index| {
             const by_ref = ast.nodes.items(.tag)[binding] == .ref_of;
@@ -1930,6 +2006,19 @@ const Context = struct {
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) owner.tokenSpan(owner.source.ast.firstToken(full.ast.type_node)) else null };
     }
 
+    fn hasLexicalRoot(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.source.ast;
+        var root = node;
+        while (true) {
+            if (ast.nodes.items(.tag)[root] == .field_access) {
+                root = ast.nodes.items(.data)[root].lhs;
+            } else if (ast.fullCall(root)) |call| {
+                root = call.ast.fn_expr;
+            } else break;
+        }
+        return ast.nodes.items(.tag)[root] == .identifier and self.lookupBinding(ast.tokenSlice(ast.firstToken(root))) != null;
+    }
+
     fn genericTarget(self: *Context, node: Ast.Node.Index) Error!?GenericFunctions.Ref {
         const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] == .function_expr) {
@@ -1938,10 +2027,7 @@ const Context = struct {
             const template = try self.templateDescriptor(data.lhs, data.rhs);
             return .{ .module = self.module, .local = &template.info };
         }
-        if (ast.nodes.items(.tag)[node] == .field_access) {
-            const base = ast.nodes.items(.data)[node].lhs;
-            if (ast.nodes.items(.tag)[base] == .identifier and self.lookupBinding(ast.tokenSlice(ast.firstToken(base))) != null) return null;
-        }
+        if (ast.nodes.items(.tag)[node] == .field_access and self.hasLexicalRoot(node)) return null;
         if (ast.nodes.items(.tag)[node] == .identifier) {
             const name = ast.tokenSlice(ast.firstToken(node));
             if (self.lookupBinding(name)) |binding| return if (binding.template) |template| .{ .module = self.module, .local = &template.info } else null;
@@ -2156,6 +2242,9 @@ const Context = struct {
                 } else null;
             }
             const scope = c.locals.items.len;
+            const parent_scope_start = c.scope_start;
+            c.scope_start = scope;
+            defer c.scope_start = parent_scope_start;
             defer c.restoreScope(scope);
             for (ast.iterationBindings(node), sources, elements) |capture, item, element| {
                 const by_ref = ast.nodes.items(.tag)[capture] == .ref_of;
@@ -2192,6 +2281,9 @@ const Context = struct {
                 .function_expr, .fn_proto, .fn_proto_one => return .{},
                 .block, .block_two, .block_newline, .block_two_newline => {
                     const scope = c.locals.items.len;
+                    const parent_scope_start = c.scope_start;
+                    c.scope_start = scope;
+                    defer c.scope_start = parent_scope_start;
                     defer c.restoreScope(scope);
                     var buffer: [2]Ast.Node.Index = undefined;
                     const statements = ast.fullBlock(&buffer, node).?.ast.statements;
@@ -2214,6 +2306,9 @@ const Context = struct {
                     var prongs: Flow = .{ .live = false };
                     for (match.cases) |case| {
                         const scope = c.locals.items.len;
+                        const parent_scope_start = c.scope_start;
+                        c.scope_start = scope;
+                        defer c.scope_start = parent_scope_start;
                         defer c.restoreScope(scope);
                         const prong = ast.fullMatchCase(case).?.ast;
                         if (prong.capture_token) |token| {
@@ -2709,7 +2804,7 @@ const Context = struct {
         const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] != .field_access) return null;
         const data = ast.nodes.items(.data)[node];
-        if (ast.nodes.items(.tag)[data.lhs] == .identifier and self.lookupBinding(ast.tokenSlice(ast.firstToken(data.lhs))) != null) return null;
+        if (self.hasLexicalRoot(node)) return null;
         if (self.module.compilation) |comp| if (comp.reference(self.module, node)) |ref| {
             const owner = comp.getModule(ref.source).?;
             if (!self.probing) if (self.sema) |analysis| try analysis.syncEntries(owner);
@@ -2907,6 +3002,16 @@ const Context = struct {
         return Module.recordFieldIndex(record.record, name);
     }
 
+    fn bindingAtSpan(self: *Context, origin_span: Module.Span) ?Binding {
+        var bindings = self.bindings.valueIterator();
+        while (bindings.next()) |binding| if (std.meta.eql(binding.name_span, origin_span)) return binding.*;
+        for (self.locals.items) |local_binding| if (local_binding.previous) |binding| {
+            if (std.meta.eql(binding.name_span, origin_span)) return binding;
+        };
+        for (self.captured_bindings.items) |binding| if (std.meta.eql(binding.name_span, origin_span)) return binding;
+        return null;
+    }
+
     fn checkCallEffects(self: *Context, node: Ast.Node.Index) Error!bool {
         const emitter = self.emitter orelse return true;
         // Any call can invoke a closure that mutates a shared owner cell,
@@ -2916,9 +3021,7 @@ const Context = struct {
         var reservation = self.reservation;
         while (reservation) |current| : (reservation = current.parent) {
             if (!current.reads_allowed) continue;
-            var bindings = self.bindings.valueIterator();
-            while (bindings.next()) |binding| {
-                if (!std.meta.eql(binding.name_span, current.owner)) continue;
+            if (self.bindingAtSpan(current.owner)) |binding| {
                 if (binding.slot) |slot| {
                     if (emitter.instructions.items[@backingInt(slot)].boxed) {
                         _ = try self.fail(.borrow_conflict, node, current.origin);
@@ -3148,7 +3251,7 @@ const Context = struct {
 
     fn qualifiedUnion(self: *Context, base: Ast.Node.Index) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
-        if (ast.nodes.items(.tag)[base] != .field_access) return null;
+        if (ast.nodes.items(.tag)[base] != .field_access or self.hasLexicalRoot(base)) return null;
         const qualifier = ast.nodes.items(.data)[base].lhs;
         if (ast.fullCall(qualifier)) |call| {
             if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
@@ -3294,7 +3397,7 @@ const Context = struct {
     }
 
     fn diagnoseInitializer(self: *Context, node: Ast.Node.Index) Error!void {
-        var values: std.ArrayList(TypeResolver.Binding) = .empty;
+        var values: std.ArrayList(TypeResolver.ValueBinding) = .empty;
         defer values.deinit(self.module.allocator);
         try self.appendGlobalTypes(&values);
         var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
@@ -3650,6 +3753,9 @@ const Context = struct {
                 const subject = if (match.subjects.len == 1) try self.probe(match.subjects[0], depth + 1) else null;
                 for (match.cases) |case| {
                     const scope = self.locals.items.len;
+                    const parent_scope_start = self.scope_start;
+                    self.scope_start = scope;
+                    defer self.scope_start = parent_scope_start;
                     defer self.restoreScope(scope);
                     const prong = ast.fullMatchCase(case).?.ast;
                     if (prong.capture_token != null) {
@@ -3938,7 +4044,7 @@ const Context = struct {
             .in => .{ .array_contains = .{ .value = try emitter.value(data.lhs), .array = try emitter.value(data.rhs) } },
             .identifier, .container_field => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
-                if (self.bindings.get(name)) |binding| {
+                if (self.ownBinding(name)) |binding| {
                     if (binding.borrowed) return error.InvalidOperation;
                     if (binding.value) |value| {
                         try emitter.values.put(emitter.allocator, node, value);
@@ -4471,8 +4577,8 @@ const Context = struct {
             _ = try self.fail(.invalid_match_capture, prong.target_expr, null);
             return false;
         }
-        if (self.conflict(name)) |previous| {
-            try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = self.module.tokenSpan(token), .related = previous });
+        if (isPrimitive(name)) {
+            try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = self.module.tokenSpan(token) });
             return false;
         }
         const index = self.fieldIndex(subjects[0].ty, ast.tokenSlice(ast.nodes.items(.main_token)[prong.values[0]])) orelse return false;
@@ -4491,6 +4597,9 @@ const Context = struct {
         const prong = ast.fullMatchCase(cases[0]).?.ast;
         if (cases.len == 1) {
             const start = self.locals.items.len;
+            const parent_scope_start = self.scope_start;
+            self.scope_start = start;
+            defer self.scope_start = parent_scope_start;
             defer self.restoreScope(start);
             if (!try self.bindMatchCapture(prong, subjects)) return null;
             const ty = (try self.expression(prong.target_expr, hint, depth + 1)) orelse return null;
@@ -4511,6 +4620,9 @@ const Context = struct {
         }
         const then_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
         const scope = self.locals.items.len;
+        const parent_scope_start = self.scope_start;
+        self.scope_start = scope;
+        defer self.scope_start = parent_scope_start;
         if (!try self.bindMatchCapture(prong, subjects)) return null;
         const then_ty = try self.expression(prong.target_expr, hint, depth + 1);
         self.restoreScope(scope);
@@ -5003,6 +5115,9 @@ const Context = struct {
             }
         }
         const scope = self.locals.items.len;
+        const parent_scope_start = self.scope_start;
+        self.scope_start = scope;
+        defer self.scope_start = parent_scope_start;
         defer self.restoreScope(scope);
         var context: LoopContext = .{
             .allows_value = loop.else_expr != 0,
@@ -5031,7 +5146,7 @@ const Context = struct {
             const discard = std.mem.eql(u8, name, "_");
             const related = self.conflict(name);
             if (!discard and (related != null or isPrimitive(name))) {
-                try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = self.module.tokenSpan(token), .related = related });
+                try self.module.diagnostics.append(self.module.allocator, .{ .tag = if (related != null) .duplicate_name else .unsupported_shadowing, .span = self.module.tokenSpan(token), .related = related });
                 return null;
             }
             var value: ?Ir.ValueId = null;
@@ -5151,7 +5266,7 @@ const Context = struct {
             else => unreachable,
         };
         const known: ?Known = .{ .ty = element_type };
-        const owner: ?Binding = if (ast.nodes.items(.tag)[loop.source] == .identifier) self.bindings.get(ast.tokenSlice(ast.nodes.items(.main_token)[loop.source])) else null;
+        const owner: ?Binding = if (ast.nodes.items(.tag)[loop.source] == .identifier) self.ownBinding(ast.tokenSlice(ast.nodes.items(.main_token)[loop.source])) else null;
         if (by_ref and (source != .array or owner == null or owner.?.borrowed)) return self.fail(.unsupported_iteration, loop.source, null);
         if (by_ref) {
             if (self.mutationOrigin(owner.?)) |origin| return self.fail(.borrow_conflict, loop.source, origin);
@@ -5183,12 +5298,15 @@ const Context = struct {
         const name = ast.tokenSlice(binding_token);
         const discard = std.mem.eql(u8, name, "_");
         if (std.mem.startsWith(u8, name, "@\"")) return self.fail(.unsupported_name, node, null);
-        const related = self.conflict(name);
-        if (!discard and (related != null or isPrimitive(name))) {
+        const related: ?Module.Span = null;
+        if (!discard and isPrimitive(name)) {
             try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = self.module.tokenSpan(binding_token), .related = related });
             return null;
         }
         const scope = self.locals.items.len;
+        const parent_scope_start = self.scope_start;
+        self.scope_start = scope;
+        defer self.scope_start = parent_scope_start;
         defer self.restoreScope(scope);
         var context: LoopContext = .{
             .allows_value = loop.else_expr != 0,
@@ -8297,7 +8415,6 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         .{ .source = "let f: (n: int) -> str = \"{n}a\\xFF\"", .tag = .invalid_literal, .token = "\\" },
         .{ .source = "let f: (n: int) -> str = \"a\\xFF{n}\"", .tag = .invalid_literal, .token = "\\" },
         .{ .source = "let f: (n: int) -> str = \"{n}\xff\"", .tag = .invalid_literal, .token = "\xff" },
-        .{ .source = "let f: (n: int) -> str = {let n = true\n\"{n}\"}", .tag = .unsupported_shadowing, .token = "n" },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "interpolation-error.nov", case.source);
         defer module.deinit();
@@ -8696,7 +8813,7 @@ test "TypeOf validation preserves readonly lexical capabilities and converter is
         .{ .body = "@println(@TypeOf(&g))", .tag = .unsupported_borrow },
         .{ .body = "@println(@TypeOf(&s[0]))", .tag = .unsupported_borrow },
         .{ .body = "@println(@TypeOf({let q=p\nq.*}))", .tag = .unsupported_borrow },
-        .{ .body = "@println(@TypeOf((a:int)->int{a}))", .tag = .unsupported_shadowing },
+        .{ .body = "@println(@TypeOf((a:int)->int{a}))", .tag = null },
         .{ .body = "let inspect=(){@println(@TypeOf({let q=&a\nq.*}))}\ninspect()\n@println(p.*)", .tag = null },
         .{ .body = "let inspect=(){@println(@TypeOf(\"{a} {p.*} {items[999]}\"))}\ninspect()\n@println(p.*,s,items)", .tag = null },
     }) |case| {
@@ -9020,7 +9137,6 @@ test "union constructors captures and coverage diagnose exact scalar boundaries"
         .{ .source = "let f:(u:U)->int=match u{.ok=>0\n.err=>0\n.none=>0\n.flag=>0\n_=>0}", .tag = .match_covered_union_prong },
         .{ .source = "let f:(u:U)->int=match u{.ok[v] => v\n_=>v}", .tag = .unknown_name },
         .{ .source = "let f:(u:U)->void=match u{.ok[v] => {v=2}\n_=>{}}", .tag = .immutable_assignment },
-        .{ .source = "let f:(u:U)->int=match u{.ok[u] => 0\n_=>0}", .tag = .unsupported_shadowing },
         .{ .source = "let f:(u:U)->int=match u{.ok[_] => 0\n_=>0}", .tag = .invalid_match_capture },
         .{ .source = "let f:(u:U)->int=match u{.ok|.err[v] => 0\n_=>0}", .tag = .unsupported_match_pattern },
         .{ .source = "let f:(u:U)->int=match u{.bad=>0\n_=>0}", .tag = .unknown_field },
@@ -10263,9 +10379,7 @@ test "range bounds require exact integer types and immutable lexical bindings" {
         .{ .body = "loop i in 0..2 {i = 1}", .tag = .immutable_assignment },
         .{ .body = "loop i in 0..2 {i += 1}", .tag = .immutable_assignment },
         .{ .body = "{loop i in 0..2 {}\n@println(i)}", .tag = .unknown_name },
-        .{ .body = "{let i: int = 0\nloop i in 0..2 {}}", .tag = .unsupported_shadowing },
         .{ .body = "loop int in 0..2 {}", .tag = .unsupported_shadowing },
-        .{ .body = "loop i in 0..2 {let i: int = 1\n}", .tag = .unsupported_shadowing },
         .{ .body = "{let a: i8 = -1\nlet b: i16 = 2\nloop i in a..b {}}", .tag = .expression_type_mismatch },
         .{ .body = "{let a: i8 = 1\nlet b: u8 = 2\nloop i in a..b {}}", .tag = .expression_type_mismatch },
         .{ .body = "{let a: i8 = -1\nloop i in a..128 {}}", .tag = .literal_out_of_range },
@@ -10567,7 +10681,6 @@ test "assignment diagnostics identify targets mutability types and lexical scope
         .{ .body = "{let mut n: int = 1\nn[0] = 2}", .tag = .unsupported_assignment_target, .token = "[" },
         .{ .body = "{let mut n: int = n\n}", .tag = .unknown_name, .token = "n" },
         .{ .body = "{if true {let mut n: int = 1\n}\nn = 2}", .tag = .unknown_name, .token = "n" },
-        .{ .body = "{let mut n: int = 1\n{let mut n: int = 2\n}}", .tag = .unsupported_shadowing, .token = "n" },
         .{ .body = "{let mut n: int = 1\nlet x: int = {n = 2}\n}", .tag = .expression_type_mismatch, .token = "=" },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let g: int = 0\nlet f: (p: bool) -> void = {s}", .{case.body});
@@ -10678,7 +10791,6 @@ test "constructor shorthand diagnoses ordinary names exact types and field spans
         .{ .source = "let R=struct{x:int,}\nlet x=[]\nlet f:()->R=R.[x]", .tag = .array_literal_needs_type, .token = "[" },
         .{ .source = "let R=struct{x:int,}\nlet f:()->R={if true {let x:int=1\n}\nR.[x]}", .tag = .unknown_name },
         .{ .source = "let R=struct{x:int,let make:(self:@This())->R=R.[x]\n}\n", .tag = .unknown_name },
-        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R={let x:int=2\nR.[x]}", .tag = .unsupported_shadowing },
         .{ .source = "let R=struct{x:int,y:int,}\nlet f:(x:int)->R=R.[x]", .tag = .missing_field, .token = "[" },
         .{ .source = "let R=struct{x:int,}\nlet f:(a:int)->()->R={let x=&a\n()->R {R.[x]}}", .tag = .unsupported_borrow },
         .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet R=struct{x:A,}\nlet f:(x:B)->R=R.[x]", .tag = .expression_type_mismatch },
@@ -10691,6 +10803,7 @@ test "constructor shorthand diagnoses ordinary names exact types and field spans
     }) |case| {
         var module = try Module.init(std.testing.allocator, "shorthand.nov", case.source);
         defer module.deinit();
+        errdefer std.debug.print("constructor shorthand diagnostic case: {s}\n", .{case.source});
 
         var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
@@ -10860,6 +10973,43 @@ test "array inference rejects conflicts unresolved elements and scope leaks with
     }
 }
 
+test "lexical shadowing supports blocks parameters captures and locals hiding globals" {
+    for ([_][]const u8{
+        "let f: (n: int) -> str = {let n = true\n\"{n}\"}",
+        "let U=union{ok:int,err:str,none,flag:bool,}\nlet f:(u:U)->int=match u{.ok[u] => 0\n_=>0}",
+        "let f: () -> void = {let i: int = 0\nloop i in 0..2 {}}",
+        "let f: () -> void = loop i in 0..2 {let i: int = 1\n}",
+        "let f: () -> void = {let i: int = 0\nloop i in 0..=2 {}}",
+        "let f: () -> void = loop i in 0..=2 {let i: int = 1\n}",
+        "let g: int = 0\nlet f: (p: bool) -> void = {let mut n: int = 1\n{let mut n: int = 2\n}}",
+        "let R=struct{x:int,}\nlet f:(x:int)->R={let x:int=2\nR.[x]}",
+        "let f: (p: i8) -> void = {let n = p\n{let n = true\n}\n}",
+        "let f: (p: i8) -> void = {let p = true\n}",
+        "let f: (p: i32) -> i32 = {let p: i32 = 1\np}",
+        "let f: (p: i32) -> i32 = {let f: i32 = 1\nf}",
+        "let f: (p: i32) -> i32 = {let n: i32 = 1\n{let n: i32 = 2\nn}}",
+        "let first: () -> void = {let secret: i32 = 1\n{let secret: i32 = 2\n}\n}",
+        "let name: i32 = 1\nlet f: (name: i32) -> i32 = name",
+        "let f: (x: int) -> int = {let inner = (x: bool) -> bool {x}\n@println(inner(true))\nx}",
+        "let f: (x: int) -> int = {let inner: (x: bool) -> bool = x\n@println(inner(true))\nx}",
+        "let value: int = 1\nlet f: () -> bool = {let value = true\nvalue}",
+        "let f: (p: int) -> int = {let n = p\n{let n = true\n@println(n)}\nn}",
+        "let f: (i: bool) -> bool = {loop i in 0..2 {@println(i)}\ni}",
+        "let U=union{ok:int,none,}\nlet f:(u:U)->U={@println(match u{.ok[u] => u\n_=>0})\nu}",
+    }) |source| {
+        errdefer std.debug.print("lexical shadowing case: {s}\n", .{source});
+        var module = try Module.init(std.testing.allocator, "shadowing.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("shadowing diagnostics: {any}\n", .{module.diagnostics.items});
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+    }
+}
+
 test "inferred local failures preserve typing and initializer scope" {
     const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
     for ([_]Case{
@@ -10870,8 +11020,6 @@ test "inferred local failures preserve typing and initializer scope" {
         .{ .body = "let n = n", .tag = .unknown_name, .token = "n" },
         .{ .body = "let n = later\nlet later = p", .tag = .unknown_name, .token = "later" },
         .{ .body = "let n = missing + p", .tag = .unknown_name, .token = "missing" },
-        .{ .body = "let n = p\n{let n = true\n}", .tag = .unsupported_shadowing, .token = "n" },
-        .{ .body = "let p = true", .tag = .unsupported_shadowing, .token = "p" },
         .{ .body = "let int = true", .tag = .unsupported_shadowing, .token = "int" },
         .{ .body = "{let hidden = p\n}\nlet n = hidden", .tag = .unknown_name, .token = "hidden" },
         .{ .body = "let n = p\nn = 2", .tag = .immutable_assignment, .token = "n" },
@@ -10903,22 +11051,19 @@ test "local scope declaration and block result diagnostics" {
         .{ .body = "{let n: i32 = n\nn}", .tag = .unknown_name },
         .{ .body = "{let n: i32 = later\nlet later: i32 = 1\nn}", .tag = .unknown_name },
         .{ .body = "{{let inner: i32 = 1\n}\ninner}", .tag = .unknown_name },
-        .{ .body = "{let n: i32 = 1\nlet n: i32 = 2\nn}", .tag = .unsupported_shadowing },
-        .{ .body = "{let p: i32 = 1\np}", .tag = .unsupported_shadowing },
+        .{ .body = "{let n: i32 = 1\nlet n: i32 = 2\nn}", .tag = .duplicate_name },
         .{ .body = "{let i32: i32 = 1\ni32}", .tag = .unsupported_shadowing },
         .{ .body = "{let mut n: void = {}\nn}", .tag = .unsupported_local_declaration },
         .{ .body = "{let n = 1\nn}", .tag = .expression_type_mismatch },
         .{ .body = "{let n: i32\nn}", .tag = .missing_initializer },
         .{ .body = "{let n: i8 = 128\nn}", .tag = .literal_out_of_range },
         .{ .body = "{let n: missing = 1\nn}", .tag = .unknown_type },
-        .{ .body = "{let f: i32 = 1\nf}", .tag = .unsupported_shadowing },
         .{ .body = "{let n: i32 = true\nn}", .tag = .literal_type_mismatch },
         .{ .body = "{let n: int = 1\nlet u: uint = n\np}", .tag = .expression_type_mismatch },
         .{ .body = "{let n: i32 = 1\nn = 2\nn}", .tag = .immutable_assignment },
         .{ .body = "{let n: i32 = 1\n{let hidden: i32 = n\n}\nhidden} + 1", .tag = .unknown_name },
         .{ .body = "{let n: i32 = 1\n}", .tag = .expression_type_mismatch },
         .{ .body = "{p\np}", .tag = .unused_block_value },
-        .{ .body = "{let n: i32 = 1\n{let n: i32 = 2\nn}}", .tag = .unsupported_shadowing },
         .{ .body = "{let callback: (x: i32) -> i32 = callback(x)\n1}", .tag = .unknown_name },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let f: (p: i32) -> i32 = {s}", .{case.body});
@@ -10933,14 +11078,14 @@ test "local scope declaration and block result diagnostics" {
     }
 }
 
-test "local shadowing reports both declarations and locals do not leak to other functions" {
-    var module = try Module.init(std.testing.allocator, "scope.nov", "let first: () -> void = {let secret: i32 = 1\n{let secret: i32 = 2\n}\n}\nlet second: () -> i32 = secret");
+test "same block duplicates report both declarations and locals do not leak to other functions" {
+    var module = try Module.init(std.testing.allocator, "scope.nov", "let first: () -> void = {let secret: i32 = 1\nlet secret: i32 = 2\n}\nlet second: () -> i32 = secret");
     defer module.deinit();
     var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
     const diagnostic = module.diagnostics.items[0];
-    try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_shadowing, diagnostic.tag);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.duplicate_name, diagnostic.tag);
     try std.testing.expectEqualStrings("secret", module.sourceSlice(diagnostic.span).?);
     try std.testing.expectEqualStrings("secret", module.sourceSlice(diagnostic.related.?).?);
     try std.testing.expect(diagnostic.related.?.start < diagnostic.span.start);
@@ -11154,7 +11299,7 @@ test "body errors identify mismatched returns operands names and calls" {
     }
 }
 
-test "control flow and parameter shadowing stay explicitly unsupported" {
+test "labeled control flow and primitive parameter shadowing stay unsupported" {
     for ([_][]const u8{
         "let f: () -> i32 = label: {42}",
     }) |source| {
@@ -11166,7 +11311,6 @@ test "control flow and parameter shadowing stay explicitly unsupported" {
         try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_body_expression, module.diagnostics.items[0].tag);
     }
     for ([_][]const u8{
-        "let name: i32 = 1\nlet f: (name: i32) -> i32 = name",
         "let f: (true: bool) -> bool = true",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "shadow.nov", source);
@@ -13213,7 +13357,7 @@ test "zip iteration rejects unbounded only sources alias loans source effects an
         .{ .body = "loop x,y in [1],x.. {}", .tag = .unknown_name },
         .{ .body = "loop x,y in [1],[2] {} else {@println(y)}", .tag = .unknown_name },
         .{ .body = "loop x,y in [1],[2] {}\n@println(y)", .tag = .unknown_name },
-        .{ .body = "loop x,x in [1],[2] {}", .tag = .unsupported_shadowing },
+        .{ .body = "loop x,x in [1],[2] {}", .tag = .duplicate_name },
         .{ .body = "loop x,&y in [1],[2] {}", .tag = .unsupported_iteration },
         .{ .body = "let mut a=[1]\nloop &x,&y in a,a {}", .tag = .borrow_conflict },
         .{ .body = "let mut a=[1]\nloop x,&y in a,a {}", .tag = .borrow_conflict },

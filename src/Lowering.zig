@@ -649,8 +649,7 @@ test "generic methods reject inexact types leaked bindings and invalid concrete 
         .{ .source = "let f:(x:T)={}", .tag = .unknown_type },
         .{ .source = "let f:(x:Self)={}", .tag = .unknown_type },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet bad:()->T=true\n}\nlet B=Bad(int)\nlet use:()->int=B.bad()", .tag = .literal_type_mismatch },
-        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:(T:int)={}\n}\nlet B=Bad(int)\nlet use:()=B.m(0)", .tag = .unsupported_shadowing },
-        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:()={let T:int=1\n}\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .unsupported_shadowing },
+
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[noreturn]\nlet m:()->T=@panic(\"bad\")\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .noreturn_result },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[stringify]\nlet toString:(self:@This())->T=match self{.ok[v] => v}\n}\nlet B=Bad(int)\nlet f:(b:B)=@println(b)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(r:G(A,str),b:B)->A=r.unwrapOr(b)", .tag = .expression_type_mismatch },
@@ -671,6 +670,21 @@ test "generic methods reject inexact types leaked bindings and invalid concrete 
         try std.testing.expect(!result.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }
+}
+
+test "generic method parameters and locals may shadow container type parameters" {
+    for ([_][]const u8{
+        "let G:(T:type)->type=union{ok:T,\nlet m:(T:int)->int=T\n}\nlet B=G(int)\nlet use:()->int=B.m(7)",
+        "let G:(T:type)->type=union{ok:T,\nlet m:()->int={let T:int=1\nT}\n}\nlet B=G(int)\nlet use:()->int=B.m()",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "method-shadowing.nov", source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
     }
 }
 

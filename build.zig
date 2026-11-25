@@ -216,6 +216,9 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
+    const shadowing_tests = b.step("test-cli-shadowing", "Run lexical shadowing CLI regression tests");
+    addShadowingCliTests(b, exe, shadowing_tests);
+    test_step.dependOn(shadowing_tests);
     const mutable_method_tests = b.step("test-cli-mutable-methods", "Run mutable method receiver CLI tests");
     addMutableMethodCliTests(b, exe, mutable_method_tests);
     test_step.dependOn(mutable_method_tests);
@@ -7865,6 +7868,126 @@ fn addReferenceParameterCliTests(b: *std.Build, exe: *std.Build.Step.Compile, te
         for ([_]bool{ false, true }) |emit| {
             const check = b.addRunArtifact(exe);
             check.step.name = b.fmt("CLI reference parameters reject: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
+            check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
+            check.addFileArg(source);
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(b.fmt("error: {s}", .{case.diagnostic}));
+            test_step.dependOn(&check.step);
+        }
+    }
+}
+
+fn addShadowingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic", "", "--debug", "--release" }) |mode| {
+        const format = std.mem.eql(u8, mode, "fmt");
+        const semantic = std.mem.eql(u8, mode, "semantic");
+        for ([_][]const u8{ "run", "test" }) |command| {
+            if ((format or semantic) and std.mem.eql(u8, command, "test")) continue;
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI shadowing: {s} ({s})", .{ command, mode });
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            if (format) {
+                run.addArgs(&.{ "fmt", "--check" });
+            } else if (semantic) {
+                run.addArgs(&.{ "check", "--semantic" });
+            } else {
+                run.addArg(command);
+            }
+            run.addFileArg(b.path("tests/shadowing.nov"));
+            if (!format) {
+                run.addArg("--lib-dir");
+                run.addDirectoryArg(b.path("lib"));
+            }
+            if (!format and !semantic and mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (format or semantic) "" else if (std.mem.eql(u8, command, "run"))
+                "Shadowing: ok\n"
+            else
+                "PASS nearest_binding_and_initializer\nPASS parameters_and_generic_bindings\nPASS types_namespaces_and_queries\nPASS loop_and_match_bindings\nPASS closures_preserve_binding_identity\nPASS borrows_preserve_owner_identity\nPASS inferred_closure_parameter_shadowing\nPASS local_record_hides_type_alias\n8 passed; 0 failed; 8 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const fixtures = b.addWriteFiles();
+    for ([_]bool{ false, true }) |generic| {
+        const directory = if (generic) "shadowing-generic-import" else "shadowing-ordinary-import";
+        _ = fixtures.add(b.fmt("{s}/api.nov", .{directory}), "@[public]\nlet nested = @import(\"nested.nov\")\n");
+        _ = fixtures.add(b.fmt("{s}/nested.nov", .{directory}), if (generic)
+            "@[public]\nlet id:(value:`T)->`T=value\n"
+        else
+            "@[public]\nlet id:(value:int)->int=value\n");
+        const source = fixtures.add(b.fmt("{s}/main.nov", .{directory}),
+            \\let api = @import("api.nov")
+            \\let verify: () = {
+            \\    @assert(api.nested.id(7) == 7)
+            \\    {
+            \\        let api = .[nested = .[id = (value: int) -> int { value + 100 }]]
+            \\        let result = api.nested.id(7)
+            \\        @assert(result == 107)
+            \\        let inferred = (value) { api.nested.id(value) }
+            \\        let inferred_result = inferred(9)
+            \\        @assert(inferred_result == 109)
+            \\    }
+            \\    @assert(api.nested.id(7) == 7)
+            \\}
+            \\let main: () = {
+            \\    verify()
+            \\    @println("Local namespace: ok")
+            \\}
+            \\@[test]
+            \\let local_namespace_hides_import: () = verify()
+            \\
+        );
+        for ([_][]const u8{ "semantic", "", "--debug", "--release" }) |mode| {
+            const semantic = std.mem.eql(u8, mode, "semantic");
+            for ([_][]const u8{ "run", "test" }) |command| {
+                if (semantic and std.mem.eql(u8, command, "test")) continue;
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI shadowing nested import: {s} {s} ({s})", .{ directory, command, mode });
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                if (semantic) run.addArgs(&.{ "check", "--semantic" }) else run.addArg(command);
+                run.addFileArg(source);
+                if (!semantic and mode.len != 0) run.addArg(mode);
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (semantic) "" else if (std.mem.eql(u8, command, "run"))
+                    "Local namespace: ok\n"
+                else
+                    "PASS local_namespace_hides_import\n1 passed; 0 failed; 1 total\n");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    const conflict = "owner access or aliased reference arguments conflict with a live borrow";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "iteration-hidden-captured-owner", .source = "let main:()={let mut a=[1,2]\nlet change=(){@clear(a)}\nloop v in a {let a=0\nchange()\n@println(v)}}", .diagnostic = conflict },
+        .{ .name = "iteration-hidden-owner-in-closure", .source = "let main:()={let mut a=[1,2]\nlet run=(){let change=(){@clear(a)}\nloop v in a {let a=0\nchange()\n@println(v)}}\nrun()}", .diagnostic = conflict },
+        .{ .name = "iteration-hidden-late-boxed-owner", .source = "let main:()={let mut a=[1,2]\nlet noop=(){}\nloop v in a {let a=0\nnoop()\n@println(v)}\nlet change=(){@clear(a)}\nchange()}", .diagnostic = conflict },
+        .{ .name = "duplicate-local", .source = "let main:()={let x=1\nlet x=2\n}", .diagnostic = "duplicate declaration 'x'" },
+        .{ .name = "duplicate-inner-local", .source = "let main:()={let x=1\n{let x=2\nlet x=3\n}}", .diagnostic = "duplicate declaration 'x'" },
+        .{ .name = "duplicate-parameter", .source = "let f:(x:int,x:int)->int=x", .diagnostic = "duplicate parameter 'x'" },
+        .{ .name = "duplicate-module", .source = "let x=1\nlet x=2", .diagnostic = "duplicate declaration 'x'" },
+        .{ .name = "reserved-local", .source = "let main:()={let int=1\n}", .diagnostic = "primitive type names are reserved" },
+        .{ .name = "reserved-parameter", .source = "let f:(uint:int)->int=uint", .diagnostic = "primitive type names are reserved" },
+        .{ .name = "reserved-module", .source = "let uint=int", .diagnostic = "primitive type names are reserved" },
+        .{ .name = "hidden-alias", .source = "let Count=uint\nlet main:()={let Count=1\nlet x:Count=2\n}", .diagnostic = "expected a type, found a value" },
+        .{ .name = "hidden-parameter-type", .source = "let Count=uint\nlet f:(Count:int)={let x:Count=2\n}", .diagnostic = "expected a type, found a value" },
+        .{ .name = "hidden-query-type", .source = "let Count=uint\nlet main:()={let Count=1\nlet x:@TypeOf(@as(Count,2))=2\n}", .diagnostic = "expected a type, found a value" },
+        .{ .name = "self-without-outer", .source = "let main:()={let x=x\n}", .diagnostic = "unknown name 'x'" },
+        .{ .name = "scope-exit", .source = "let main:()={{let x=1\n}\n@println(x)}", .diagnostic = "unknown name 'x'" },
+        .{ .name = "shadowed-owner-still-borrowed", .source = "let main:()={let mut x=1\nlet p=&x\n{let x=2\n@println(x)}\nx=3\n@println(p.*)}", .diagnostic = "owner access or aliased reference arguments conflict with a live borrow" },
+        .{ .name = "reference-escape", .source = "let main:()={let mut x=1\nlet p=&x\n{let x=2\nlet values=[p]\n}}", .diagnostic = "local references require" },
+        .{ .name = "inner-owner-rebind", .source = "let main:()={let mut x=1\nlet mut p=&x\n{let mut x=2\np=&x}}", .diagnostic = "local references require" },
+    }) |case| {
+        const source = fixtures.add(b.fmt("shadowing-{s}.nov", .{case.name}), case.source);
+        for ([_]bool{ false, true }) |emit| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI shadowing reject: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
             check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
             check.addFileArg(source);
             check.expectExitCode(1);

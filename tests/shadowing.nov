@@ -1,0 +1,189 @@
+let std = @import("std")
+let Count = uint
+let number: int = 7
+let Record = struct {
+    items: []int,
+}
+let R = Record
+let Payload = union {
+    some: int,
+    none,
+}
+
+let parameter_names: (number: int, Count: int, std: bool) -> int = {
+    @assert(std)
+    let result = {
+        let number = number + Count
+        number
+    }
+    @assert(number == 3)
+    result
+}
+
+let generic_shadow: (number: `T) -> `T = {
+    let result = {
+        let number = number
+        number
+    }
+    result
+}
+
+let verify_nearest_binding_and_initializer: () = {
+    @assert(number == 7)
+    let number = number + 1
+    @assert(number == 8)
+    {
+        let mut number = number + 1
+        number += 1
+        {
+            let number = number + 1
+            @assert(number == 11)
+        }
+        @assert(number == 10)
+    }
+    @assert(number == 8)
+    {
+        let number = false
+        @assert(number == false)
+    }
+    @assert(number == 8)
+}
+
+let verify_parameters_and_generic_bindings: () = {
+    @assert(parameter_names(3, 4, true) == 7)
+    @assert(generic_shadow(9) == 9)
+    @assert(generic_shadow(true))
+    let number = 12
+    let closure = (number: int) -> int { number + 1 }
+    @assert(closure(2) == 3 and number == 12)
+}
+
+let verify_types_namespaces_and_queries: () = {
+    let original: Count = 2
+    {
+        let Count = true
+        let std = 4
+        let queried: @TypeOf(Count) = false
+        @assert(Count and queried == false and std == 4)
+    }
+    let restored: Count = original + 1
+    let option: std.Option(Count) = .some[restored]
+    @assert(option == std.Option(Count).some[3])
+}
+
+let verify_loop_and_match_bindings: () = {
+    let number = 20
+    let mut total = 0
+    loop number in [1, 2] {
+        total += number
+        {
+            let number = number + 10
+            total += number
+        }
+    }
+    @assert(total == 26 and number == 20)
+    let payload: Payload = .some[4]
+    let selected = match payload {
+        .some[number] => {
+            let inner = {
+                let number = number + 1
+                number
+            }
+            @assert(number == 4)
+            inner
+        }
+        .none => number
+    }
+    @assert(selected == 5 and number == 20)
+}
+
+let verify_closures_preserve_binding_identity: () = {
+    let mut number = 1
+    let outer = () -> int { number }
+    {
+        let mut number = 10
+        let inner = () -> int { number }
+        number += 1
+        @assert(inner() == 11 and outer() == 1)
+    }
+    number += 1
+    @assert(outer() == 2)
+}
+
+let verify_borrows_preserve_owner_identity: () = {
+    let mut number = 1
+    let view = &number
+    {
+        let mut number = 10
+        number += 1
+        view.* += 2
+        @assert(number == 11 and view.* == 3)
+    }
+    @assert(number == 3)
+    let mut items = [4, 5]
+    loop &number in items {
+        {
+            let number = 100
+            @assert(number == 100)
+        }
+        number.* += 1
+    }
+    @assert(items == [5, 6] and number == 3)
+}
+
+let verify_inferred_closure_parameter_shadowing: () = {
+    let x = false
+    let f = (x: int) { x }
+    let result = f(7)
+    let checked: int = result
+    @assert(checked == 7 and x == false)
+    let nested = (x: int) {
+        let get = () { x }
+        get()
+    }
+    let nested_result = nested(9)
+    let nested_checked: int = nested_result
+    @assert(nested_checked == 9 and x == false)
+}
+
+let verify_local_record_hides_type_alias: () = {
+    let original: R = R.[ items = [1] ]
+    {
+        let R = .[ items = [42, 43] ]
+        let first = R.items[0]
+        let queried: @TypeOf(R.items[0]) = first
+        @assert(first == 42 and queried == 42 and R.items[1] == 43)
+    }
+    let restored: R = original
+    @assert(restored.items[0] == 1)
+}
+
+@[test]
+let nearest_binding_and_initializer: () = verify_nearest_binding_and_initializer()
+@[test]
+let parameters_and_generic_bindings: () = verify_parameters_and_generic_bindings()
+@[test]
+let types_namespaces_and_queries: () = verify_types_namespaces_and_queries()
+@[test]
+let loop_and_match_bindings: () = verify_loop_and_match_bindings()
+@[test]
+let closures_preserve_binding_identity: () = verify_closures_preserve_binding_identity()
+@[test]
+let borrows_preserve_owner_identity: () = verify_borrows_preserve_owner_identity()
+
+@[test]
+let inferred_closure_parameter_shadowing: () = verify_inferred_closure_parameter_shadowing()
+@[test]
+let local_record_hides_type_alias: () = verify_local_record_hides_type_alias()
+
+let main: () = {
+    verify_inferred_closure_parameter_shadowing()
+    verify_local_record_hides_type_alias()
+    verify_nearest_binding_and_initializer()
+    verify_parameters_and_generic_bindings()
+    verify_types_namespaces_and_queries()
+    verify_loop_and_match_bindings()
+    verify_closures_preserve_binding_identity()
+    verify_borrows_preserve_owner_identity()
+    @println("Shadowing: ok")
+}
